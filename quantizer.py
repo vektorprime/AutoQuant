@@ -54,7 +54,7 @@ class Quantizer:
             xmax = torch.maximum(xmin.abs(), xmax.abs())
             scale = xmax / (self.maxq / 2)
             scale[scale == 0] = 1.0
-            zero = torch.full_like(self.scale, (self.maxq + 1) / 2)
+            zero = torch.full_like(scale, (self.maxq + 1) / 2)
         else:
             scale = (xmax - xmin) / self.maxq
             scale[scale == 0] = 1.0
