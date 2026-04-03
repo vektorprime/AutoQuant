@@ -163,9 +163,6 @@ class GPTQLayer:
             if i2 < self.cols:
                 W[:, i2:] -= Err_blk.matmul(Hinv[i1:i2, i2:])
 
-        # Undo act-order permutation so weights are in original column order
-        Q = Q[:, invperm]
-
         # Final params from fully quantised W
         quantizer.find_params(self.layer.weight.data.float())
 
