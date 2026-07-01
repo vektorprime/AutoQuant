@@ -27,6 +27,52 @@ VRAM_LIMIT_MB = 8192
 
 
 # ---------------------------------------------------------------------------
+# Activation statistics collection (calibration data)
+# ---------------------------------------------------------------------------
+
+def _collect_input_stats(
+    model: nn.Module,
+    model_name: str,
+    nsamples: int = 16,
+    seqlen: int = 1024,
+) -> dict:
+    from data_utils import get_wikitext2
+    device = next(model.parameters()).device
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    samples = get_wikitext2(nsamples, seqlen, tokenizer, split="train")
+
+    stats = {}
+    handles = []
+
+    def _hook(name):
+        def fn(_module, _input, _output):
+            x = _input[0].detach().float()
+            sq = (x * x).sum(dim=(0, 1)).cpu()
+            cnt = x.size(0) * x.size(1)
+            if name in stats:
+                stats[name][0] += sq
+                stats[name][1] += cnt
+            else:
+                stats[name] = [sq, cnt]
+        return fn
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            handles.append(mod.register_forward_hook(_hook(name)))
+
+    try:
+        with torch.no_grad():
+            for sample in tqdm(samples, desc="Calibrating"):
+                model(sample.to(device))
+    finally:
+        for h in handles:
+            h.remove()
+
+    return {name: s[0] / max(s[1], 1) for name, s in stats.items()}
+
+
+# ---------------------------------------------------------------------------
 # Per-layer 2-bit symmetric quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
 
@@ -34,6 +80,7 @@ def _quantize_one_layer(
     layer: nn.Linear,
     bits: int,
     groupsize: int,
+    act_stats: torch.Tensor | None = None,
 ) -> dict:
     W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
@@ -61,8 +108,13 @@ def _quantize_one_layer(
             q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
                             0, maxq)
             q_centered = q - zero_pt
-            num = (W_g * q_centered).sum(dim=-1)
-            den = (q_centered * q_centered).sum(dim=-1)
+            if act_stats is not None:
+                h_g = act_stats[start:end]
+                num = (W_g * q_centered * h_g).sum(dim=-1)
+                den = (q_centered * q_centered * h_g).sum(dim=-1)
+            else:
+                num = (W_g * q_centered).sum(dim=-1)
+                den = (q_centered * q_centered).sum(dim=-1)
             den[den == 0] = 1.0
             scale = num / den
             scale[scale <= 0] = 1.0
@@ -146,6 +198,7 @@ def quantize_model(
     bits: int = 2,
     groupsize: int = DEFAULT_GROUPSIZE,
     save_compressed_dir: str | None = None,
+    act_stats: dict | None = None,
 ) -> dict:
     model.eval()
     model.cpu()                                     # everything happens on CPU
@@ -159,7 +212,9 @@ def quantize_model(
             logger.warning("Skipping %s: in_features %d not divisible by %d",
                            name, layer.weight.shape[1], groupsize)
             continue
-        meta[name] = _quantize_one_layer(layer, bits, groupsize)
+        layer_act = act_stats.get(name) if act_stats is not None else None
+        meta[name] = _quantize_one_layer(layer, bits, groupsize,
+                                         act_stats=layer_act)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
@@ -204,6 +259,15 @@ def main():
         low_cpu_mem_usage=True,
     )
 
+    act_stats = None
+    if torch.cuda.is_available():
+        logger.info("Collecting calibration activation stats on GPU")
+        torch.cuda.reset_peak_memory_stats()
+        model.to("cuda")
+        act_stats = _collect_input_stats(model, args.model,
+                                         nsamples=16, seqlen=1024)
+        logger.info("Collected stats for %d layers", len(act_stats))
+
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
     logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=True",
@@ -213,6 +277,7 @@ def main():
         bits=args.bits,
         groupsize=args.groupsize,
         save_compressed_dir=compressed_dir,
+        act_stats=act_stats,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
