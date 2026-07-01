@@ -62,22 +62,16 @@ is no `--symmetric` flag and no asymmetric mode.
 
 ### Why `quantizer.py` is off-limits
 
-The `Quantizer` class and `quantize_tensor` function are the **trusted primitives**
-that define what "2-bit symmetric group quantization" means.  They guarantee:
+The `Quantizer` class and `quantize_tensor` function are the **default primitives**
+that define affine 2-bit symmetric group quantization.  The restriction means you
+cannot *edit* these specific primitives — you can, however, write your own
+quantization logic from scratch inside `quantize.py`.  A lookup-table quantizer,
+a k-means-based centroid approach, or any other 2-bit scheme is fair game as long
+as you implement it in `quantize.py` and the weights remain at exactly 2 bits per value.
 
-* `maxq = 2^bits − 1`  (e.g., 3 for 2-bit — exactly 4 representable levels).
-* Scale is computed from the actual weight values (no fabricated scales).
-* The quantize-then-dequantize formula is fixed and non-negotiable.
-
-If the agent could modify these primitives it could trivially cheat — for example,
-change `maxq` to 15 (4-bit while claiming 2-bit), fabricate near-zero scales to
-make quantization near-lossless, or store weights at higher precision internally.
-The `Quantizer` is the referee; the agent's job is to find the best way to *apply*
-it (rounding order, group partitioning, error compensation, etc.), not to redefine
-the quantization operation itself.
-
-**Verdict: the restriction stays.**  The Quantizer is the fixed ground truth for
-2-bit behavior, and all experiments are judged against it.
+What the restriction *prevents* is cheating the default primitives — e.g., changing
+`maxq` to 15 so the existing `Quantizer` silently does 4-bit work.  You may replace
+these primitives entirely with your own, but you may not "adjust" them.
 
 ### Performance guidance
 
