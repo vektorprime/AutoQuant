@@ -49,6 +49,11 @@ All experiments MUST be run with the following arguments for quantize.py:
 - Install new packages or add dependencies beyond those already in the environment.
 - Add modifications that increase the size of the compressed model (e.g., low-rank
   corrections, extra stored tensors, or storing weights at > 2 bits per value).
+- **Increase VRAM usage.**  GPU memory consumption must stay at or below the current
+  baseline.  Extra computation (FLOPs) is acceptable, but VRAM is strictly capped.
+  No caching intermediate activations, no allocating auxiliary tensors that persist
+  across layers, no doubling the working set.  If it makes `nvidia-smi` climb, it's
+  forbidden.
 - Use more than one GPU. All experiments run on a single GPU.
 
 **The goal is simple: get the lowest KL divergence as provided by eval_perplexity.py evaluation script.**
@@ -83,6 +88,9 @@ them invalidates the experiment.
   `--dtype bfloat16` must always be passed.  Only `--groupsize` may vary.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
   function are off-limits.
+- **Do not increase VRAM.**  GPU memory usage must not exceed the current baseline.
+  Extra compute is fine; extra memory allocations that persist across the
+  quantization loop are forbidden.
 
 ### Git and record-keeping integrity
 - **Do not edit `results.tsv` directly** except to append a new row after a completed
