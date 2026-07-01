@@ -89,6 +89,14 @@ Keep these rules in mind:
 * **Avoid trial-by-error grid searches** (e.g., trying 9 scale factors for each
   layer).  This multiplies per-layer work and adds 1683 extra CUDA syncs.
   Design a closed-form solution instead.
+* **Avoid operations that allocate full-sized tensor copies.**  `torch.sort`
+  returns a sorted copy plus indices — it doubles the memory footprint of the
+  tensor being sorted.  Similarly, `torch.clone()`, `repeat_interleave` on large
+  tensors, and any `.abs()` on a non-view all silently blow up VRAM.  Prefer
+  views, in-place ops (`torch.abs` not `.abs()`, `amin`/`amax` which don't copy),
+  and broadcasting over allocation.
+* **`eval_perplexity.py` automatically prints `Tokens/sec`** in its output.
+  You do not need to compute it manually — just read it from the eval result.
 
 ## Integrity Rules — what the agent MUST NOT do
 
@@ -202,10 +210,14 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
    Use actual values from the eval output and `ls -l` on the compressed directory.
    Tab-separated, no commas in the description.
 8. **Git decision**:
-   - `git add quantize.py results.tsv`
-   - `git commit -m "<description> (KL=<value>)"`
-   - Compare new KL to the previous best:
-     - **Lower KL**: advance — keep the commit.  This is now the new best.
-     - **Equal or higher KL**: `git reset --hard HEAD~1` — revert to the previous
-       best commit exactly.  Never reset further back than one commit.
+    - `git add quantize.py results.tsv`
+    - `git commit -m "<description> (KL=<value>)"`
+    - Find the **best KL for the current groupsize** in results.tsv (lowest value
+      in the `kl_divergence` column where `groupsize` matches the hardcoded 32).
+    - **If no matching baseline exists**: this run IS the baseline.  Keep the commit
+      and continue — you now have a target to beat.
+    - **Lower KL than the previous best**: advance — keep the commit.  This is now
+      the new best.
+    - **Equal or higher KL**: `git reset --hard HEAD~1` — revert quantize.py to
+      the previous best.  Never reset further back than one commit.
 9. Go to step 2.
