@@ -27,9 +27,10 @@ Each experiment runs on a single GPU. The workflow is:
 3. Delete the quantized model from `quantized_models/<tag>`.
 
 All experiments MUST be run with the following arguments for quantize.py:
-* `--bits 4` — quantize to 4 bits
+* `--bits 2` — quantize to 2 bits
 * `--groupsize 128` — quantize weights in a groups of 128
 * `--symmetric` — use symmetric quantization (zero-point = 0)
+* `--dtype bfloat16` — load the base model in BF16 precision
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit. 

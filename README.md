@@ -16,14 +16,15 @@ The repo is deliberately kept small and only really has five files that matter:
 - **eval_perplexity.py** — KL divergence evaluation script
 - **program.md** — the experiment description for the agent
 
-The starting point is q4_k (4-bit symmetric group quantization with GPTQ-style
-optimal rounding). The agent is free to explore other quantization algorithms — it
-is not limited to GPTQ. The model is quantized using the `quantize.py` script and saved.
+The starting point is q2_k (2-bit symmetric group quantization) — a simple per-group
+min/max approach without calibration data or iterative optimisation. The agent is free
+to explore other quantization algorithms — it is not limited to a specific method.
+The model is quantized using the `quantize.py` script and saved.
 After quantization, KL divergence (lower = better) is evaluated against the reference
 model using `eval_perplexity.py`.
 
 The goal of the agent is to achieve the lowest possible KL divergence for a fixed
-quantization configuration — 4-bit, groupsize 128, symmetric.
+quantization configuration — 2-bit, groupsize 128, symmetric.
 
 ## Quick start
 

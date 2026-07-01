@@ -6,11 +6,10 @@
 - The auto loop must not delete the cache directory.
 
 ## 2. Repeated model metadata checks on every run
-- `quantize.py` does ~13 HTTP HEAD requests to HuggingFace on every invocation
-  (config.json, tokenizer_config.json, model.safetensors.index.json, etc.).
-- The actual weights ARE cached locally; these are just version/availability checks.
-- This adds ~5-10 seconds of overhead per experiment — negligible vs quantization time,
-  but still wasteful. Could be mitigated by setting `HF_HUB_OFFLINE=1` after first run.
+- `quantize.py` does ~13 HTTP HEAD requests to HuggingFace on every invocation.
+- **Mitigation**: Use `HF_HUB_OFFLINE=1` environment variable — verified working
+  (eval ran without any HTTP requests).
+- Must set this in the auto loop's shell environment.
 
 ## 3. Quantization speed
 - With 4 calib samples × seqlen=1024: **~5 min** for 24 blocks (~12s/block) on an RTX 3080.
@@ -20,21 +19,14 @@
   - GPTQ column-wise error propagation on large MLP layers (in_features=6144)
 - The auto loop needs fast iterations. Suggestion: use fewer calib samples initially,
   then run best candidate with more samples.
+- Groupsize can be as low as 16 (must divide in_features). Smaller groupsize = finer
+  quantization = better accuracy but larger scale/zero overhead in compressed storage.
 
-## 4. Quantize from BF16 base and store compressed weights to disk
-- Currently `quantize.py` loads the model in float16, quantizes in-place (simulated
-  quantization), and saves dequantized float16 weights via `model.save_pretrained()` —
-  file size stays at ~3.6GB, no compression on disk.
-- This is a consequence of the current approach: GPTQ stores dequantized values
-  (e.g., "0.0342" instead of int code "3"). The eval script loads the float16
-  safetensors back, so no actual 4-bit storage is achieved.
-- We need to:
-  1. Load the base model in BF16 (preserve full precision before quantization).
-  2. Apply quantization and store the actual compressed representation — integer
-     codes + scales + zeros — so the file size reflects real 4-bit compression
-     (~0.9GB for 4-bit instead of ~3.6GB).
-  3. The eval script must be able to load and reconstruct (dequantize) these
-     compressed weights for inference.
+## 4. Quantize from BF16 base and store compressed weights to disk ✅
+- **Done**: Load model in `bfloat16`, quantize all nn.Linear layers using per-group
+  min/max, save packed 2-bit codes + scales + zeros to `compressed/` subdirectory.
+- Compressed size for Qwen3.5-2B: **328 MB** (vs 3.6 GB float16 dequantised).
+- Eval compatibility: dequantised weights saved via `model.save_pretrained()`.
 
 ## 5. No `.gitignore` — git tries to stage large cache files
 - Without `.gitignore`, `git add -A` tried to stage `cache/ref_logits.mmap` (238MB),
@@ -42,20 +34,33 @@
 - **Fix**: Created `.gitignore` with `cache/`, `__pycache__/`, `quantized_models/`, `*.mmap`.
 - Must verify `.gitignore` exists at experiment setup time.
 
-## 6. README.md outdated
-- Still references "perplexity" as the metric — should say KL divergence.
-- Still frames the project as purely GPTQ — the agent can explore any quantization
-  approach (q4_k, AWQ-style, etc.) as long as it fits `quantize.py`.
-- Starting point is q4_k (4-bit symmetric group quantization), not vanilla GPTQ.
+## 6. README.md outdated ✅
+- **Fixed**: Updated to reference KL divergence (not perplexity), q2_k (not GPTQ).
 
-## 7. Replace GPTQ with q4_k
-- The current `quantize.py` implements vanilla GPTQ with optimal rounding.
-- The goal is to replace it with q4_k — a simpler, faster 4-bit quantization that
-  uses per-block (group) min/max scaling without iterative error propagation.
-- q4_k should be significantly faster (no Cholesky, no column-wise updates) and
-  provides a clean baseline before exploring more sophisticated algorithms.
+## 7. Replace GPTQ with q2_k ✅
+- **Done**: Rewrote `quantize.py` — removed GPTQLayer, Hessian accumulation, Cholesky,
+  calibration data, and block-wise error propagation.
+- New algorithm: simple per-layer Quantizer.find_params() + Quantizer.quantize()
+  for all nn.Linear layers. No calibration data needed.
+- Quantization time: ~4 min for 187 layers on RTX 3080 (single-threaded Python loop).
 
 ## 8. Pipeline verified end-to-end
+
+## 9. Quantization speed — single-threaded bottleneck
+- The per-layer Python loop over 187 linear layers runs sequentially on one CPU core.
+- Each iteration does GPU ops (find_params, quantize, code extraction) followed by
+  blocking GPU→CPU copies for codes/scales/zeros.
+- Total: ~4 min for q2_k on Qwen3.5-2B (187 layers, comparable to GPTQ's ~5 min
+  for 24 blocks × ~8 layers each).
+- Potential optimisations: accumulate all metadata on GPU and do a single bulk
+  CPU transfer at the end, or batch-process small layers together.
+
+## 10. Track size, KLD, and inference speed — decide on KLD
+- Each experiment should record: compressed model size (MB), KL divergence, and
+  inference speed (tokens/sec during eval).
+- **Decision criterion**: keep changes only if KLD improves (lower). Size and speed
+  are tracked for visibility but do not determine whether to advance.
+- The `results.tsv` header and recording logic should include these additional columns.
 - Reference cache creation: works, ~28s for 5000 tokens
 - Quantization: works, ~5 min for 4 calib samples
 - Eval with cache hit: works, ~28s (no reference model loaded)
