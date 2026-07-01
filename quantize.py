@@ -2,8 +2,8 @@
 """
 q2_k post-training quantization for AutoModelForCausalLM.
 
-Per-group min/max quantization — no calibration data, no iterative optimisation.
-Fast, simple, and orthogonal to any future algorithmic improvements.
+Per-group min/max symmetric quantization — no calibration data, no iterative
+optimisation.  Symmetric is hardcoded (always on).
 """
 
 import argparse
@@ -20,6 +20,9 @@ from quantizer import Quantizer
 
 logger = logging.getLogger(__name__)
 
+# Quantization is always symmetric — no asymmetric support.
+SYMMETRIC = True
+
 
 # ---------------------------------------------------------------------------
 # q2_k per-layer quantization
@@ -29,10 +32,9 @@ def _quantize_one_layer(
     layer: nn.Linear,
     bits: int,
     groupsize: int,
-    symmetric: bool,
 ) -> dict:
     """
-    Quantize a single nn.Linear layer.
+    Quantize a single nn.Linear layer with symmetric per-group min/max.
 
     Returns dict with integer codes, scales, and zeros for compressed storage.
     The layer's weight is updated in-place with the dequantised values.
@@ -42,12 +44,11 @@ def _quantize_one_layer(
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
 
-    qz = Quantizer(bits=bits, symmetric=symmetric, groupsize=groupsize)
+    qz = Quantizer(bits=bits, symmetric=SYMMETRIC, groupsize=groupsize)
     qz.find_params(W)
     W_q = qz.quantize(W)  # dequantised float32
 
     # Integer codes via reshape-based broadcasting (no repeat_interleave).
-    # W.reshape(out, n_groups, g) / scale[:, :, 1] broadcasts correctly.
     W_r = W.reshape(out_features, n_groups, g)
     codes = torch.clamp(
         torch.round(W_r / qz.scale.unsqueeze(-1)) + qz.zero.unsqueeze(-1),
@@ -118,7 +119,6 @@ def quantize_model(
     model: nn.Module,
     bits: int = 2,
     groupsize: int = 128,
-    symmetric: bool = True,
     save_compressed_dir: str | None = None,
 ) -> dict:
     """
@@ -137,7 +137,7 @@ def quantize_model(
                            name, layer.weight.shape[1], groupsize)
             continue
 
-        meta[name] = _quantize_one_layer(layer, bits, groupsize, symmetric)
+        meta[name] = _quantize_one_layer(layer, bits, groupsize)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
@@ -151,13 +151,13 @@ def quantize_model(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="q2_k quantization for causal LMs",
+        description="q2_k quantization for causal LMs (symmetric, always on)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
     parser.add_argument("--bits", type=int, default=2, choices=[2, 3, 4, 8])
-    parser.add_argument("--groupsize", type=int, default=128)
-    parser.add_argument("--symmetric", action="store_true")
+    parser.add_argument("--groupsize", type=int, default=128,
+                        help="Group size (min 16, must divide in_features)")
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["float16", "bfloat16", "float32"],
                         help="Precision for loading the base model")
@@ -189,12 +189,11 @@ def main():
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
     logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=%s",
-                args.bits, args.groupsize, args.symmetric)
+                args.bits, args.groupsize, SYMMETRIC)
     meta = quantize_model(
         model,
         bits=args.bits,
         groupsize=args.groupsize,
-        symmetric=args.symmetric,
         save_compressed_dir=compressed_dir,
     )
     logger.info("Quantized %d linear layers.", len(meta))

@@ -28,9 +28,11 @@ Each experiment runs on a single GPU. The workflow is:
 
 All experiments MUST be run with the following arguments for quantize.py:
 * `--bits 2` — quantize to 2 bits (fixed, never change)
-* `--groupsize 128` — quantize weights in groups of 128 (min 16, must divide `in_features`)
-* `--symmetric` — use symmetric quantization (fixed, MUST always be passed, never omit)
+* `--groupsize <N>` — group size (≥ 16, must divide `in_features`; may vary between experiments)
 * `--dtype bfloat16` — load the base model in BF16 precision (fixed, never change)
+
+Quantization is **always symmetric**.  Symmetric is hardcoded in `quantize.py` — there
+is no `--symmetric` flag and no asymmetric mode.
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
@@ -38,7 +40,7 @@ All experiments MUST be run with the following arguments for quantize.py:
   group partitioning, scale computation, error compensation, etc.) as long as it produces
   a valid quantized model via `Quantizer` or equivalent logic applied to `nn.Linear` weights.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
-- Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16), `--symmetric`.
+- Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16).
 - Choose calibration data or design the quantization to not require it.
 
 **What you CANNOT do:**
@@ -57,6 +59,43 @@ All experiments MUST be run with the following arguments for quantize.py:
 - Use more than one GPU. All experiments run on a single GPU.
 
 **The goal is simple: get the lowest KL divergence as provided by eval_perplexity.py evaluation script.**
+
+### Why `quantizer.py` is off-limits
+
+The `Quantizer` class and `quantize_tensor` function are the **trusted primitives**
+that define what "2-bit symmetric group quantization" means.  They guarantee:
+
+* `maxq = 2^bits − 1`  (e.g., 3 for 2-bit — exactly 4 representable levels).
+* Scale is computed from the actual weight values (no fabricated scales).
+* The quantize-then-dequantize formula is fixed and non-negotiable.
+
+If the agent could modify these primitives it could trivially cheat — for example,
+change `maxq` to 15 (4-bit while claiming 2-bit), fabricate near-zero scales to
+make quantization near-lossless, or store weights at higher precision internally.
+The `Quantizer` is the referee; the agent's job is to find the best way to *apply*
+it (rounding order, group partitioning, error compensation, etc.), not to redefine
+the quantization operation itself.
+
+**Verdict: the restriction stays.**  The Quantizer is the fixed ground truth for
+2-bit behavior, and all experiments are judged against it.
+
+### Performance guidance
+
+The quantization loop iterates over ~187 `nn.Linear` layers in a Python `for` loop.
+Keep these rules in mind:
+
+* **Use vectorised PyTorch operations** — `reshape`, broadcasting, `torch.clamp`,
+  `torch.round`.  One GPU kernel handles millions of weights.
+* **NEVER iterate over individual weights, rows, or columns in Python.**  A Python
+  for-loop over 2048 columns × 187 layers = 383K iterations, each launching a
+  tiny GPU kernel.  This is 100× slower than a single vectorised call.
+* **Avoid `.item()` calls inside loops over layers.**  `.item()` synchronises the
+  CUDA stream (blocks CPU until GPU finishes).  If you call it inside the layer
+  loop, you force a GPU→CPU round-trip for every single layer, serialising work
+  that could otherwise overlap.
+* **Avoid trial-by-error grid searches** (e.g., trying 9 scale factors for each
+  layer).  This multiplies per-layer work and adds 1683 extra CUDA syncs.
+  Design a closed-form solution instead.
 
 ## Integrity Rules — what the agent MUST NOT do
 
@@ -84,8 +123,8 @@ them invalidates the experiment.
   eval.  The next experiment must produce a new quantization from scratch.
 - **Do not partially quantize.**  All `nn.Linear` layers must be quantized (no skipping
   layers to cheat on KL).
-- **Do not change the fixed CLI arguments.**  `--bits 2`, `--symmetric`, and
-  `--dtype bfloat16` must always be passed.  Only `--groupsize` may vary.
+- **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
+  must always be passed.  Only `--groupsize` may vary.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
   function are off-limits.
 - **Do not increase VRAM.**  GPU memory usage must not exceed the current baseline.
@@ -141,18 +180,18 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 4. **Modify `quantize.py`** with that single change.  Avoid shotgun diffs — change
    one thing so the effect is clearly attributable.
 5. **Run the experiment** (all commands from the repo root):
-   ```
-   HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
-       --model Qwen/Qwen3.5-2B --bits 2 --groupsize <N> --symmetric \
-       --dtype bfloat16 --save quantized_models/<tag>
-   HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
-       --model quantized_models/<tag> \
-       --reference Qwen/Qwen3.5-2B \
-       --context-length 1024 --max-tokens 5000 \
-       --reference-cache cache/ref_logits.mmap
-   rm -rf quantized_models/<tag>
-   ```
-   `--symmetric` is mandatory.  `--groupsize` may vary.  All other args are fixed.
+    ```
+    HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
+        --model Qwen/Qwen3.5-2B --bits 2 --groupsize <N> \
+        --dtype bfloat16 --save quantized_models/<tag>
+    HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
+        --model quantized_models/<tag> \
+        --reference Qwen/Qwen3.5-2B \
+        --context-length 1024 --max-tokens 5000 \
+        --reference-cache cache/ref_logits.mmap
+    rm -rf quantized_models/<tag>
+    ```
+    `--groupsize` may vary (≥ 16).  All other args are fixed.
 6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
    to revert.  Do NOT record the result.  Go back to step 2.
 7. **On success**: append one TSV row to `results.tsv`:
