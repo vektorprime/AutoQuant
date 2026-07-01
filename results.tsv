@@ -1,3 +1,4 @@
 timestamp	commit	description	kl_divergence	bits	groupsize	symmetric	dataset	nsamples	seqlen	context_length	max_tokens	size_mb	tokens_per_sec
 2026-07-01T21:08:48	32c46c72c21b64a8c74f499f4587fb7533592a3d	baseline GPTQ 4-bit groupsize=128 symmetric, nsamples=4, seqlen=1024	0.077061	4	128	true	wikitext2	4	1024	1024	5000
 2026-07-01T21:39:30	0a3cfe74b62363e0c5b92a81ff4109a2a6790356	q2_k baseline 2-bit symmetric groupsize=128, BF16, compressed=328MB	10.483577	2	128	true	q2_k	0	0	1024	5000	328	1.31
+2026-07-01T22:19:40	74d36c4e980f888aeef01ddcf617b2eae6d4dd74	q2_k baseline groupsize=16, CPU-vectorized, compressed=1411MB	13.951112	2	16	true	q2_k	0	0	1024	5000	1411	1.74
