@@ -220,20 +220,36 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
    to revert.  Do NOT record the result.  Go back to step 2.
 7. **On success**: append one TSV row to `results.tsv`:
-   ```
-    <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t32\ttrue\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
-   ```
-   Use actual values from the eval output and `ls -l` on the compressed directory.
-   Tab-separated, no commas in the description.
-8. **Git decision**:
-    - `git add quantize.py results.tsv`
-    - `git commit -m "<description> (KL=<value>)"`
+    ```
+     <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t<groupsize>\ttrue\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
+    ```
+    Use actual values from the eval output and `ls -l` on the compressed directory.
+    Tab-separated, no commas in the description.
+
+8. **Record the result permanently** (before deciding whether to keep the code):
+    ```bash
+    git add results.tsv
+    git commit -m "record: <description> (KL=<value>)"
+    ```
+    This commit preserves the experiment record in git history **forever** —
+    even if the code change is reverted.
+
+9. **Commit the code change**:
+    ```bash
+    git add quantize.py
+    git commit -m "<description> (KL=<value>)"
+    ```
+
+10. **Decide whether to keep the code**:
     - Find the **best KL for the current groupsize** in results.tsv (lowest value
       in the `kl_divergence` column where `groupsize` matches your experiment's value).
     - **If no matching baseline exists**: this run IS the baseline.  Keep the commit
       and continue — you now have a target to beat.
     - **Lower KL than the previous best**: advance — keep the commit.  This is now
       the new best.
-    - **Equal or higher KL**: `git reset --hard HEAD~1` — revert quantize.py to
-      the previous best.  Never reset further back than one commit.
-9. Go to step 2.
+    - **Equal or higher KL**: `git reset --hard HEAD~1` — reverts the code commit
+      but the results.tsv commit above is safe (it was the one before).  The failed
+      experiment is still recorded in git log and results.tsv.
+      Never reset further back than one commit.
+
+11. Go to step 2.
