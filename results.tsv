@@ -1,0 +1,2 @@
+timestamp	commit	description	kl_divergence	bits	groupsize	symmetric	dataset	nsamples	seqlen	context_length	max_tokens
+2026-07-01T21:08:48	32c46c72c21b64a8c74f499f4587fb7533592a3d	baseline GPTQ 4-bit groupsize=128 symmetric, nsamples=4, seqlen=1024	0.077061	4	128	true	wikitext2	4	1024	1024	5000
