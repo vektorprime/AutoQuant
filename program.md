@@ -28,7 +28,7 @@ Each experiment runs on a single GPU. The workflow is:
 
 All experiments MUST be run with the following arguments for quantize.py:
 * `--bits 2` — quantize to 2 bits
-* `--groupsize 128` — quantize weights in a groups of 128
+* `--groupsize 128` — quantize weights in groups of 128 (min 16, must divide `in_features`)
 * `--symmetric` — use symmetric quantization (zero-point = 0)
 * `--dtype bfloat16` — load the base model in BF16 precision
 

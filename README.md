@@ -24,7 +24,9 @@ After quantization, KL divergence (lower = better) is evaluated against the refe
 model using `eval_perplexity.py`.
 
 The goal of the agent is to achieve the lowest possible KL divergence for a fixed
-quantization configuration — 2-bit, groupsize 128, symmetric.
+quantization configuration — 2-bit, groupsize 128, symmetric.  Groupsize can be as low
+as 16 (must divide `in_features`).  Smaller groups yield finer quantization at the cost
+of larger scale/zero overhead in the compressed representation.
 
 ## Quick start
 
