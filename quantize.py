@@ -25,6 +25,14 @@ DEFAULT_GROUPSIZE = 32
 MAX_COMPRESSED_MB = 1575  # 1500 + 5% tolerance
 VRAM_LIMIT_MB = 8192
 
+# Modules that must NEVER be quantized (SSM projections, norms, small params).
+# Norms and Conv1d are already excluded by the nn.Linear filter — this list
+# catches nn.Linear sub-modules that should stay at native precision.
+_NEVER_QUANTIZE = frozenset([
+    "linear_attn.in_proj_a",
+    "linear_attn.in_proj_b",
+])
+
 
 # ---------------------------------------------------------------------------
 # Activation statistics collection (calibration data)
@@ -207,10 +215,14 @@ def quantize_model(
     layers = [(n, m) for n, m in model.named_modules()
               if isinstance(m, nn.Linear)]
 
+    skipped_small = 0
     for name, layer in tqdm(layers, desc="Quantizing"):
         if groupsize != -1 and layer.weight.shape[1] % groupsize != 0:
             logger.warning("Skipping %s: in_features %d not divisible by %d",
                            name, layer.weight.shape[1], groupsize)
+            continue
+        if any(pattern in name for pattern in _NEVER_QUANTIZE):
+            skipped_small += 1
             continue
         layer_act = act_stats.get(name) if act_stats is not None else None
         meta[name] = _quantize_one_layer(layer, bits, groupsize,
@@ -218,6 +230,9 @@ def quantize_model(
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
+
+    if skipped_small:
+        logger.info("Skipped %d small/SSM layers (never quantize)", skipped_small)
 
     return meta
 
