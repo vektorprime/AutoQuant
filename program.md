@@ -23,7 +23,7 @@ Once you get confirmation, kick off the experimentation.
 Each experiment runs on a single GPU. The workflow is:
 
 1. Run `quantize.py` to quantize the model and save it to `quantized_models/<tag>`
-2. Load the quantized model from `quantized_models/<tag>` and run `eval_perplexity.py` to evaluate perplexity on the calibration dataset. Save the results to `results.tsv`.
+2. Load the quantized model from `quantized_models/<tag>` and run `eval_perplexity.py` to evaluate KL divergence against the reference model. Save the results to `results.tsv`.
 3. Delete the quantized model from `quantized_models/<tag>`.
 
 All experiments MUST be run with the following arguments for quantize.py:
@@ -45,7 +45,7 @@ All experiments MUST be run with the following arguments for quantize.py:
 - Modify `main` in `quantize.py`.
 - Add any modifications that increase the size of the compressed model. For instance, low-rank corrections incur additional memory and compute overhead.
 
-**The goal is simple: get the lowest perplexity as provided by eval_perplexity.py evaluation script.**
+**The goal is simple: get the lowest KL divergence as provided by eval_perplexity.py evaluation script.**
 
 ## Logging results
 
@@ -61,5 +61,5 @@ LOOP FOREVER:
 3. Run an experiment.
 4. git commit
 5. Record the experiment result in `results.tsv`
-6. If perplexity improved (lower), you "advance" the branch, keeping the git commit
-7. If perplexity is equal or worse, you git reset back to where you started
+6. If KL divergence improved (lower), you "advance" the branch, keeping the git commit
+7. If KL divergence is equal or worse, you git reset back to where you started

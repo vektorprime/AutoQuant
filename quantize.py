@@ -377,7 +377,8 @@ def parse_args():
         description="GPTQ post-training quantization for causal LMs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("model", help="HuggingFace model name or local path")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-2B",
+                        help="HuggingFace model name or local path")
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 8],
                         help="Quantization bit-width")
     parser.add_argument("--groupsize", type=int, default=128,
