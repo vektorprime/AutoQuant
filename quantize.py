@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Quantization is always symmetric — hardcoded.
 MAXQ = {2: 3, 3: 7, 4: 15, 8: 255}
-GROUPSIZE = 32
+DEFAULT_GROUPSIZE = 32
+MAX_COMPRESSED_MB = 1500
+VRAM_LIMIT_MB = 8192
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
 def quantize_model(
     model: nn.Module,
     bits: int = 2,
-    groupsize: int = GROUPSIZE,
+    groupsize: int = DEFAULT_GROUPSIZE,
     save_compressed_dir: str | None = None,
 ) -> dict:
     model.eval()
@@ -151,6 +153,8 @@ def parse_args():
     )
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
     parser.add_argument("--bits", type=int, default=2, choices=[2, 3, 4, 8])
+    parser.add_argument("--groupsize", type=int, default=DEFAULT_GROUPSIZE,
+                        help="Group size (min 16, must divide in_features)")
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["float16", "bfloat16", "float32"],
                         help="Precision for loading the base model")
@@ -178,14 +182,35 @@ def main():
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
     logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=True",
-                args.bits, GROUPSIZE)
+                args.bits, args.groupsize)
     meta = quantize_model(
         model,
         bits=args.bits,
-        groupsize=GROUPSIZE,
+        groupsize=args.groupsize,
         save_compressed_dir=compressed_dir,
     )
     logger.info("Quantized %d linear layers.", len(meta))
+
+    # ---- resource limit enforcement ----
+    peak_vram = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+    if peak_vram > VRAM_LIMIT_MB:
+        logger.error(
+            "Peak VRAM %.1f MB exceeds limit of %d MB.",
+            peak_vram, VRAM_LIMIT_MB)
+        raise SystemExit(1)
+    logger.info("Peak VRAM: %.1f MB (limit %d MB)", peak_vram, VRAM_LIMIT_MB)
+
+    if compressed_dir and meta:
+        total_mb = round(
+            sum(os.path.getsize(os.path.join(compressed_dir, f))
+                for f in os.listdir(compressed_dir) if f.endswith(".npz"))
+            / 1e6, 2)
+        if total_mb > MAX_COMPRESSED_MB:
+            logger.error(
+                "Compressed size %.1f MB exceeds limit of %d MB. "
+                "Increase --groupsize to reduce overhead.",
+                total_mb, MAX_COMPRESSED_MB)
+            raise SystemExit(1)
 
     if args.save:
         os.makedirs(args.save, exist_ok=True)

@@ -28,11 +28,19 @@ Each experiment runs on a single GPU. The workflow is:
 
 All experiments MUST be run with the following arguments for quantize.py:
 * `--bits 2` — quantize to 2 bits (fixed, never change)
+* `--groupsize <N>` — group size (min 16, must divide `in_features`; default 32)
 * `--dtype bfloat16` — load the base model in BF16 precision (fixed, never change)
 
-Groupsize is **hardcoded to 32** in `quantize.py` — there is no `--groupsize` CLI
-flag and it must not be added or changed.  Symmetric quantization is also hardcoded
-(always on).
+Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` flag.
+
+### Resource limits (enforced)
+
+* **Compressed model size**: max **1500 MB**.  `quantize.py` will exit with an error
+  if the compressed `.npz` files exceed this.  Smaller groupsize = more metadata =
+  larger output.  Use `--groupsize` to stay under the limit.
+* **VRAM**: max **8 GB** during quantization (checked via `nvidia-smi`).  No
+  allocating auxiliary tensors that persist across layers.  Views, in-place ops,
+  and broadcasting are fine — copies and sorts are not.
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
@@ -40,6 +48,7 @@ flag and it must not be added or changed.  Symmetric quantization is also hardco
   group partitioning, scale computation, error compensation, etc.) as long as it produces
   a valid quantized model via `Quantizer` or equivalent logic applied to `nn.Linear` weights.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
+- Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16).
 - Choose calibration data or design the quantization to not require it.
 
 **What you CANNOT do:**
@@ -50,11 +59,10 @@ flag and it must not be added or changed.  Symmetric quantization is also hardco
 - Install new packages or add dependencies beyond those already in the environment.
 - Add modifications that increase the size of the compressed model (e.g., low-rank
   corrections, extra stored tensors, or storing weights at > 2 bits per value).
-- **Increase VRAM usage.**  GPU memory consumption must stay at or below the current
-  baseline.  Extra computation (FLOPs) is acceptable, but VRAM is strictly capped.
-  No caching intermediate activations, no allocating auxiliary tensors that persist
-  across layers, no doubling the working set.  If it makes `nvidia-smi` climb, it's
-  forbidden.
+- **Increase VRAM usage beyond 8 GB.**  GPU memory consumption must stay at or
+  below 8 GB peak.  Extra computation (FLOPs) is acceptable, but VRAM is strictly
+  capped.  No caching intermediate activations, no allocating auxiliary tensors
+  that persist across layers, no doubling the working set.
 - Use more than one GPU. All experiments run on a single GPU.
 
 **The goal is simple: get the lowest KL divergence as provided by eval_perplexity.py evaluation script.**
@@ -125,8 +133,11 @@ them invalidates the experiment.
 - **Do not partially quantize.**  All `nn.Linear` layers must be quantized (no skipping
   layers to cheat on KL).
 - **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
-  must always be passed.  Groupsize and symmetric are hardcoded — there are no
-  flags for them and they must not be added.
+  must always be passed.  Groupsize may vary (via `--groupsize`, ≥ 16).
+  Symmetric is hardcoded — there is no flag for it and it must not be added.
+- **Do not exceed the compressed size limit of 1500 MB.**  `quantize.py` enforces
+  this — if your experiment hits the limit, increase `--groupsize` to reduce
+  scale/zero overhead.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
   function are off-limits.
 - **Do not increase VRAM.**  GPU memory usage must not exceed the current baseline.
@@ -200,7 +211,7 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
         --reference-cache cache/ref_logits.mmap
     rm -rf quantized_models/<tag>
     ```
-    All args are fixed.  Groupsize (32) and symmetric are hardcoded.
+    `--groupsize` may vary (≥ 16, default 32).  `--bits 2` and `--dtype bfloat16` are fixed.  Symmetric is hardcoded.
 6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
    to revert.  Do NOT record the result.  Go back to step 2.
 7. **On success**: append one TSV row to `results.tsv`:
@@ -213,7 +224,7 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
     - `git add quantize.py results.tsv`
     - `git commit -m "<description> (KL=<value>)"`
     - Find the **best KL for the current groupsize** in results.tsv (lowest value
-      in the `kl_divergence` column where `groupsize` matches the hardcoded 32).
+      in the `kl_divergence` column where `groupsize` matches your experiment's value).
     - **If no matching baseline exists**: this run IS the baseline.  Keep the commit
       and continue — you now have a target to beat.
     - **Lower KL than the previous best**: advance — keep the commit.  This is now
