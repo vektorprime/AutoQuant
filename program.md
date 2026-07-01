@@ -28,11 +28,11 @@ Each experiment runs on a single GPU. The workflow is:
 
 All experiments MUST be run with the following arguments for quantize.py:
 * `--bits 2` — quantize to 2 bits (fixed, never change)
-* `--groupsize <N>` — group size (≥ 16, must divide `in_features`; may vary between experiments)
 * `--dtype bfloat16` — load the base model in BF16 precision (fixed, never change)
 
-Quantization is **always symmetric**.  Symmetric is hardcoded in `quantize.py` — there
-is no `--symmetric` flag and no asymmetric mode.
+Groupsize is **hardcoded to 32** in `quantize.py` — there is no `--groupsize` CLI
+flag and it must not be added or changed.  Symmetric quantization is also hardcoded
+(always on).
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
@@ -40,7 +40,6 @@ is no `--symmetric` flag and no asymmetric mode.
   group partitioning, scale computation, error compensation, etc.) as long as it produces
   a valid quantized model via `Quantizer` or equivalent logic applied to `nn.Linear` weights.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
-- Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16).
 - Choose calibration data or design the quantization to not require it.
 
 **What you CANNOT do:**
@@ -118,7 +117,8 @@ them invalidates the experiment.
 - **Do not partially quantize.**  All `nn.Linear` layers must be quantized (no skipping
   layers to cheat on KL).
 - **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
-  must always be passed.  Only `--groupsize` may vary.
+  must always be passed.  Groupsize and symmetric are hardcoded — there are no
+  flags for them and they must not be added.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
   function are off-limits.
 - **Do not increase VRAM.**  GPU memory usage must not exceed the current baseline.
@@ -183,7 +183,7 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
 5. **Run the experiment** (all commands from the repo root):
     ```
     HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
-        --model Qwen/Qwen3.5-2B --bits 2 --groupsize <N> \
+        --model Qwen/Qwen3.5-2B --bits 2 \
         --dtype bfloat16 --save quantized_models/<tag>
     HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
         --model quantized_models/<tag> \
@@ -192,12 +192,12 @@ The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autorese
         --reference-cache cache/ref_logits.mmap
     rm -rf quantized_models/<tag>
     ```
-    `--groupsize` may vary (≥ 16).  All other args are fixed.
+    All args are fixed.  Groupsize (32) and symmetric are hardcoded.
 6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
    to revert.  Do NOT record the result.  Go back to step 2.
 7. **On success**: append one TSV row to `results.tsv`:
    ```
-   <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t<groupsize>\t<symmetric>\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
+    <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t32\ttrue\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
    ```
    Use actual values from the eval output and `ls -l` on the compressed directory.
    Tab-separated, no commas in the description.
