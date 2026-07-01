@@ -40,10 +40,12 @@ def _quantize_one_layer(
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
-    # ---------- per-group scale (reshape → amin/amax, zero-copy view) -----
+    # ---------- per-group scale (90th-percentile, robust to outliers) ----
     W_r = W.reshape(out_features, n_groups, g)     # view
-    xmax = torch.maximum(W_r.amin(dim=-1).abs(),
-                         W_r.amax(dim=-1))          # (out, n_groups)
+    W_abs = W_r.abs()
+    W_abs_sorted = torch.sort(W_abs, dim=-1)[0]
+    quantile_idx = int(g * 0.90)                    # 90th percentile (idx ~28/32)
+    xmax = W_abs_sorted[..., quantile_idx]          # (out, n_groups)
     scale = xmax / (maxq / 2)
     scale[scale == 0] = 1.0
 
