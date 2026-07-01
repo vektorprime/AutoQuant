@@ -65,6 +65,10 @@ without altering the stored representation:
 - Clipped-scale variants (closed-form or small grid search, avoiding `.item()` loops).
 - Layer-type-specific scale rules (different policy for attention vs MLP).
 - Per-layer effective groupsize if the format supports it.
+- **Cross-channel grouping** — currently groups partition `in_features`
+  independently per output channel.  What if scales are shared across nearby
+  output channels (e.g. 2×2 blocks of `(out, in)` groups)?  This reduces
+  scale storage overhead without changing group granularity.
 
 ### Phase 2 — Activation-aware methods
 
@@ -80,7 +84,10 @@ Try AWQ/GPTQ-inspired approximations within the constraints:
 
 Only after proving the eval loader supports them:
 
-- Non-uniform 2-bit codebooks (e.g. per-group lookup tables).
+- Non-uniform 2-bit codebooks (e.g. per-group lookup tables).  For example,
+  instead of the hardcoded `{-2s, -s, 0, s}`, store four learned values per group
+  such as `{-1.5s, -0.8s, 0.3s, 1.2s}`.  Only feasible if the eval loader's
+  dequantization path can consume per-group codebooks.
 - Layer-level codebooks (shared across groups).
 - Per-group asymmetric offsets or learned levels.
 - Outlier-preserving transforms that do not exceed the 1575 MB size limit.
