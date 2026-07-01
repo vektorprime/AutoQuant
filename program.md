@@ -45,14 +45,16 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
-- Modify the quantization algorithm: change how weights are quantized (rounding strategy,
-  group partitioning, scale computation, error compensation, etc.) as long as it produces
-  a valid quantized model via `Quantizer` or equivalent logic applied to `nn.Linear` weights.
+- Change the quantization algorithm **completely**.  You are not limited to tweaking
+  the existing formula — replace the entire `_quantize_one_layer` function, invent
+  a new quantization scheme, use iterative optimisation, implement error-diffusion
+  across layers, try non-uniform quantization, or anything else that maps float
+  weights to 2-bit representations.  The only hard requirements are the bit-width
+  and the size/VRAM limits.
 - Make multiple passes over the weights (iterative refinement, error feedback) —
   extra compute is fine as long as VRAM stays under 8 GB.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
-- Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16).
-- Choose calibration data or design the quantization to not require it.
+- Vary `--groupsize` (≥ 16) to trade off between finer quantization and compressed size.
 
 **What you CANNOT do:**
 - Modify `eval_perplexity.py`. It is read-only. It contains the fixed evaluation.
@@ -86,6 +88,23 @@ What the restriction *prevents* is cheating the default primitives — e.g., cha
 these primitives entirely with your own, but you may not "adjust" them.
 
 ### Performance guidance
+
+**Tips for good experimental ideas.**  The best results come from changes that
+fundamentally rethink the quantization, not from small formula tweaks.  Good
+directions include:
+
+* **Error compensation** — quantize weights sequentially and feed the error
+  forward into the next weights (like Floyd-Steinberg dithering, but for weights).
+* **Non-uniform quantization levels** — the 2-bit representation `{-2s, -s, 0, s}`
+  is fixed; what if the levels were `{-1.5s, -0.8s, 0.3s, 1.2s}` learned per group?
+* **Grouping across output channels** — currently groups are along `in_features`;
+  what about sharing scales across nearby output channels?
+* **MSE-optimal scales** — the current `max(abs)/1.5` scale minimises clipping but
+  not MSE.  A closed-form or iterative MSE-minimising scale could help.
+* **Leveraging weight structure** — attention weights, MLP weights, and lm_head
+  have very different distributions.  Different strategies per layer type.
+
+### Performance rules
 
 The quantization loop iterates over ~187 `nn.Linear` layers in a Python `for` loop.
 Keep these rules in mind:
