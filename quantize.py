@@ -41,27 +41,42 @@ def _quantize_one_layer(
     n_groups = in_features // g
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
+    diffusion = 0.5
 
-    # ---------- per-group scale (reshape → amin/amax, zero-copy view) -----
-    W_r = W.reshape(out_features, n_groups, g)     # view
-    xmax = torch.maximum(W_r.amin(dim=-1).abs(),
-                         W_r.amax(dim=-1))          # (out, n_groups)
-    scale = xmax / (maxq / 2)
-    scale[scale == 0] = 1.0
+    codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
+    scales = torch.zeros(out_features, n_groups)
+    W_q_full = torch.zeros(out_features, in_features)
 
-    # ---------- quantise + dequantise in one broadcast pass --------------
-    # scale.unsqueeze(-1) broadcasts with W_r via (out, n_groups, 1) → (out, n_groups, g)
-    q = torch.clamp(torch.round(W_r / scale.unsqueeze(-1)) + zero_pt,
-                    0, maxq)
-    W_q = (scale.unsqueeze(-1) * (q - zero_pt)).reshape(out_features,
-                                                         in_features)
+    for i in range(n_groups):
+        start = i * g
+        end = start + g
+        W_g = W[:, start:end]                      # view
 
-    layer.weight.data = W_q.to(layer.weight.dtype)
+        xmax = torch.maximum(W_g.amin(dim=-1).abs(),
+                             W_g.amax(dim=-1))
+        scale = xmax / (maxq / 2)
+        scale[scale == 0] = 1.0
+
+        q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
+                        0, maxq)
+        W_q = scale.unsqueeze(-1) * (q - zero_pt)
+
+        error = W_g - W_q
+        codes[:, start:end] = q.to(torch.uint8)
+        scales[:, i] = scale
+        W_q_full[:, start:end] = W_q
+
+        if i + 1 < n_groups:
+            ns = (i + 1) * g
+            ne = ns + g
+            W[:, ns:ne] += diffusion * error
+
+    layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":  q.reshape(out_features, in_features).to(torch.uint8).numpy(),
-        "scales": scale.numpy().astype(np.float32),
-        "zeros":  np.full(scale.shape, zero_pt, dtype=np.float32),
+        "codes":  codes.numpy(),
+        "scales": scales.numpy().astype(np.float32),
+        "zeros":  np.full(scales.shape, zero_pt, dtype=np.float32),
         "shape":  [out_features, in_features],
     }
 
