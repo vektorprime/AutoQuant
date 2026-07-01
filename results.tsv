@@ -3,3 +3,4 @@ timestamp	commit	description	kl_divergence	bits	groupsize	symmetric	dataset	nsam
 2026-07-01T21:39:30	0a3cfe74b62363e0c5b92a81ff4109a2a6790356	q2_k baseline 2-bit symmetric groupsize=128, BF16, compressed=328MB	10.483577	2	128	true	q2_k	0	0	1024	5000	328	1.31
 2026-07-01T22:19:40	74d36c4e980f888aeef01ddcf617b2eae6d4dd74	q2_k baseline groupsize=16, CPU-vectorized, compressed=1411MB	13.951112	2	16	true	q2_k	0	0	1024	5000	1411	1.74
 2026-07-01T22:42:00	0e8a4b175abf154bda46a0b9b209e24036345cf4	90th-percentile scale (idx 28/32) instead of amax for outlier robustness	13.550042	2	32	true	q2_k	0	0	1024	5000	898	170
+2026-07-01T22:35:14	f475f7d8a9b6b033d4a2f0538b88ce24cc84c47f	q2_k baseline groupsize=32, CPU-vectorized, compressed=941MB	8.525097	2	32	true	q2_k	0	0	1024	5000	941	150
