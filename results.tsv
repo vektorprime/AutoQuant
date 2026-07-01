@@ -1,8 +1,8 @@
-timestamp	commit	description	kl_divergence	bits	groupsize	symmetric	dataset	nsamples	seqlen	context_length	max_tokens	size_mb	tokens_per_sec
-2026-07-01T21:08:48	32c46c72c21b64a8c74f499f4587fb7533592a3d	baseline GPTQ 4-bit groupsize=128 symmetric, nsamples=4, seqlen=1024	0.077061	4	128	true	wikitext2	4	1024	1024	5000
-2026-07-01T21:39:30	0a3cfe74b62363e0c5b92a81ff4109a2a6790356	q2_k baseline 2-bit symmetric groupsize=128, BF16, compressed=328MB	10.483577	2	128	true	q2_k	0	0	1024	5000	328	1.31
-2026-07-01T22:19:40	74d36c4e980f888aeef01ddcf617b2eae6d4dd74	q2_k baseline groupsize=16, CPU-vectorized, compressed=1411MB	13.951112	2	16	true	q2_k	0	0	1024	5000	1411	1.74
-2026-07-01T22:42:00	0e8a4b175abf154bda46a0b9b209e24036345cf4	90th-percentile scale (idx 28/32) instead of amax for outlier robustness	13.550042	2	32	true	q2_k	0	0	1024	5000	898	170
-2026-07-01T22:35:14	f475f7d8a9b6b033d4a2f0538b88ce24cc84c47f	q2_k baseline groupsize=32, CPU-vectorized, compressed=941MB	8.525097	2	32	true	q2_k	0	0	1024	5000	941	150
-2026-07-01T23:01:19	a997cf4b604ee633c5a4bff8c6930eb0a5e9c2cf	no-clipping scale: s = max(amax, |amin|/2) ensures 2-bit rep range [-2s s] covers [amin amax] exactly	11.709466	2	32	true	q2_k	0	0	1024	5000	941	169.3
-2026-07-01T23:14:10	480a9fd2d727b7374aa9bf81ed3b179e72156d82	error-diffusion quantization: Floyd-Steinberg residual propagation across groups with coefficient 0.5	8.433538	2	32	true	q2_k	0	0	1024	5000	941	167.8
+timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+2026-07-01T21:08:48	exp-20260701-000	32c46c72c21b64a8c74f499f4587fb7533592a3d	8de71fabf89edaa84e28c14c5644a02ead04ff4a	baseline GPTQ 4-bit groupsize=128 symmetric	success	0.077061	4	128	true	gptq_k	1024	5000		0	
+2026-07-01T21:39:30	exp-20260701-001	0a3cfe74b62363e0c5b92a81ff4109a2a6790356	f075ed8df0fded892d92300ef0200b500087a6c1	q2_k baseline groupsize=128	success	10.483577	2	128	true	q2_k	1024	5000	328	0	1.31
+2026-07-01T22:19:40	exp-20260701-002	74d36c4e980f888aeef01ddcf617b2eae6d4dd74	d7990cc5490471e54055cb8546893b36f50a5922	q2_k baseline groupsize=16	success	13.951112	2	16	true	q2_k	1024	5000	1411	0	1.74
+2026-07-01T22:42:00	exp-20260701-003	0e8a4b175abf154bda46a0b9b209e24036345cf4	a193a51bcce431cec7e1c5852dd07598ebb145d9	90th-percentile scale outlier robustness	success	13.550042	2	32	true	q2_k	1024	5000	898	0	170
+2026-07-01T22:35:14	exp-20260701-004	f475f7d8a9b6b033d4a2f0538b88ce24cc84c47f	c4cc3ff5fdfea36ec63f38e45a29e79d21fca6d6	q2_k baseline groupsize=32	success	8.525097	2	32	true	q2_k	1024	5000	941	0	150
+2026-07-01T23:01:19	exp-20260701-005	a997cf4b604ee633c5a4bff8c6930eb0a5e9c2cf	cae6c6e0e6616d196ddbee7e7667e8afbaf9d688	no-clipping scale: max(amax abs(amin)/2)	success	11.709466	2	32	true	q2_k	1024	5000	941	0	169.3
+2026-07-01T23:14:10	exp-20260701-006	480a9fd2d727b7374aa9bf81ed3b179e72156d82	7d8743f626a837be01eb29dbf59317d04cf92a16	error-diffusion: Floyd-Steinberg residual propagation across groups	success	8.433538	2	32	true	err_diff	1024	5000	941	0	167.8

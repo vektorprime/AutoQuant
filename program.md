@@ -6,17 +6,87 @@ This is an experiment to have the LLM do its own research.
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
+1. **Agree on a run tag**: propose a tag based on today's date (e.g. `jul1`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
-   - `eval_perplexity.py` — fixed evaluation, that you cannot modify.
-   - `quantize.py` — the file containing the quantization algorithm.
-   - `data_utils.py` — data preparation utilities.
-4. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-5. **Confirm and go**: Confirm setup looks good.
+   - `eval_perplexity.py` — fixed evaluation, read-only.
+   - `quantizer.py` — **read-only** reference.  Understand the packed format,
+     dequantization path, supported metadata, and what custom schemes are
+     actually representable before inventing a new format.
+   - `quantize.py` — the file containing the quantization algorithm (**you edit this**).
+   - `data_utils.py` — data preparation utilities (read-only).
+4. **Initialize results.tsv**: Create `results.tsv` with just the header row.
+   The baseline will be recorded after the first run.
+5. **Initialize experiments/**: Create `experiments/idea_ledger.md` and
+   `experiments/failures.tsv` (header row only).
+6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
+
+---
+
+## Research phases
+
+The search follows a phased plan.  Start at Phase 0 and move forward as each
+phase is exhausted or hits diminishing returns.  You may revisit earlier phases
+after discoveries in later phases.
+
+### Phase 0 — Baseline sweep and format audit
+
+Run the default implementation at feasible groupsizes:
+
+| groupsize | expected size | notes |
+|---|---|---|
+| 16 | ~1411 MB | finest granularity |
+| 32 | ~941 MB  | default |
+| 64 | ~500 MB  | coarser |
+| 128| ~328 MB  | coarsest |
+| 256| ~200 MB  | may be too coarse |
+
+Stop any groupsize that exceeds the 1575 MB size limit or 8 GB VRAM limit.
+This establishes the size/KL frontier.  **No algorithm changes** during Phase 0
+— these runs are pure baselines.
+
+Also inspect (reading `quantizer.py` and `eval_perplexity.py`):
+- How weights are packed, decompressed, and mapped back to tensors.
+- How scales/zeros are stored per group.
+- Whether per-layer groupsize is possible.
+- Whether non-uniform codebooks can be stored.
+- Whether layer-specific metadata is supported by the save/load round-trip.
+
+### Phase 1 — No-format-change improvements
+
+These are the safest first experiments — they change only the scale/computation
+without altering the stored representation:
+
+- MSE-optimal scale instead of maxabs scale.
+- Activation-weighted MSE scale (see Calibration data rules).
+- Clipped-scale variants (closed-form or small grid search, avoiding `.item()` loops).
+- Layer-type-specific scale rules (different policy for attention vs MLP).
+- Per-layer effective groupsize if the format supports it.
+
+### Phase 2 — Activation-aware methods
+
+Try AWQ/GPTQ-inspired approximations within the constraints:
+
+- Stream calibration data (do not store full activations).
+- Store only diagonal activation statistics per linear layer (e.g. `E[x²]`).
+- Optimize per-group quantization using weighted reconstruction error.
+- The weighted objective `loss = Σⱼ E[xⱼ²] · (Wᵢⱼ - Wqᵢⱼ)²` is **far more aligned
+  with KL** than plain weight MSE, while fitting the VRAM rule.
+
+### Phase 3 — Representation changes
+
+Only after proving the eval loader supports them:
+
+- Non-uniform 2-bit codebooks (e.g. per-group lookup tables).
+- Layer-level codebooks (shared across groups).
+- Per-group asymmetric offsets or learned levels.
+- Outlier-preserving transforms that do not exceed the 1575 MB size limit.
+- Error-feedback schemes spanning multiple layers (not just within one layer).
+
+---
 
 ## Experimentation
 
@@ -55,11 +125,13 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
   extra compute is fine as long as VRAM stays under 8 GB.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
 - Vary `--groupsize` (≥ 16) to trade off between finer quantization and compressed size.
+- **Extend `main()`** to add optional quantization-internal arguments or structured
+  logging, provided all official runs still pass `--bits 2`, `--dtype bfloat16`, and a
+  valid `--groupsize`, and eval integrity is unchanged.
 
 **What you CANNOT do:**
 - Modify `eval_perplexity.py`. It is read-only. It contains the fixed evaluation.
 - Modify `quantizer.py` (the `Quantizer` class and `quantize_tensor` function).
-- Modify `main()` in `quantize.py` — the entry point structure is fixed.
 - Modify `data_utils.py`.
 - Install new packages or add dependencies beyond those already in the environment.
 - Add modifications that increase the size of the compressed model beyond 1575 MB
@@ -87,22 +159,94 @@ What the restriction *prevents* is cheating the default primitives — e.g., cha
 `maxq` to 15 so the existing `Quantizer` silently does 4-bit work.  You may replace
 these primitives entirely with your own, but you may not "adjust" them.
 
+---
+
+### Calibration data rules
+
+Quantization **may** use calibration data from a **non-test** split.
+Do **not** use Wikitext-2 test split (`eval_perplexity.py --split test`) or the
+eval reference logits (`cache/ref_logits.mmap`) during quantization.
+
+**Allowed calibration statistics:**
+- Per-layer input activation second moments `E[xⱼ²]` (one scalar per input channel).
+- Per-channel activation scales.
+- Small streaming diagonal Hessian approximations.
+- Wikitext-2 **train** or **validation** split.
+
+**Forbidden calibration state:**
+- Cached full activation tensors across layers (violates VRAM limit and rules).
+- Test-set activations.
+- Reference logits from `eval_perplexity.py`.
+
+Weighted reconstruction objectives using calibration statistics are strongly
+encouraged.  For example:
+
+```
+weighted_MSE = Σⱼ E[xⱼ²] · (Wᵢⱼ - Wqᵢⱼ)²
+```
+
+This is much more aligned with KL than plain weight MSE and fits the VRAM rule
+(storing only one scalar per input channel).
+
+---
+
+### Diagnostics
+
+Diagnostic runs are **allowed** if:
+- They are **not** written to `results.tsv`.
+- They do **not** use the Wikitext-2 test split.
+- They do **not** modify `eval_perplexity.py`.
+- They are clearly logged under `runs/<exp_id>/diagnostics/`.
+
+Allowed diagnostics:
+- Synthetic tensor roundtrip tests (verify your quantize/dequantize is correct).
+- Per-layer quantization error summaries (MSE, max abs error per layer).
+- Calibration-split proxy KL or loss (use Wikitext-2 **train** split).
+- Layer sensitivity experiments on non-test data.
+- Size and VRAM estimates before full runs.
+
+Use diagnostics to reject obviously bad ideas before paying for the full official eval.
+
+---
+
 ### Performance guidance
 
-**Tips for good experimental ideas.**  The best results come from changes that
-fundamentally rethink the quantization, not from small formula tweaks.  Good
-directions include:
+**Ranked idea queue.**  Try these in order — early ideas are higher-probability
+improvements:
 
-* **Error compensation** — quantize weights sequentially and feed the error
-  forward into the next weights (like Floyd-Steinberg dithering, but for weights).
-* **Non-uniform quantization levels** — the 2-bit representation `{-2s, -s, 0, s}`
-  is fixed; what if the levels were `{-1.5s, -0.8s, 0.3s, 1.2s}` learned per group?
-* **Grouping across output channels** — currently groups are along `in_features`;
-  what about sharing scales across nearby output channels?
-* **MSE-optimal scales** — the current `max(abs)/1.5` scale minimises clipping but
-  not MSE.  A closed-form or iterative MSE-minimising scale could help.
-* **Leveraging weight structure** — attention weights, MLP weights, and lm_head
-  have very different distributions.  Different strategies per layer type.
+1. **MSE-optimal per-group scale** — Replace `max(abs)/1.5` with an iterative
+   least-squares scale.  For each group:
+   ```
+   q = clamp(round(w / s), qmin, qmax)
+   s = sum(w * q) / sum(q * q)
+   repeat 2–3 times
+   ```
+   Keeps the same 2-bit representation and nearly the same storage.
+
+2. **Activation-weighted MSE scale** — Use calibration activations to estimate
+   input-channel importance.  If `hⱼ = E[xⱼ²]`, then optimize:
+   ```
+   loss = Σⱼ hⱼ · (wⱼ - s·qⱼ)²
+   s = Σ(h · w · q) / Σ(h · q · q)
+   ```
+   Much more useful than raw weight MSE.
+
+3. **Layer-type policies** — Different linear layers should not necessarily use
+   the same clipping or scale rule.  Classify layer names:
+   - Attention: `q_proj`, `k_proj`, `v_proj`, `o_proj`
+   - MLP: `gate_proj`, `up_proj`, `down_proj`
+   - Output: `lm_head`
+   Then test one layer-policy change at a time.
+
+4. **Sensitivity-aware groupsize** — If the format supports it, spend metadata
+   budget where it matters: sensitive layers get smaller groupsize, less sensitive
+   layers get larger groupsize.
+
+5. **Error feedback within a layer** — Quantize groups sequentially and carry a
+   bounded residual into the next group or block.  Useful at 2 bits, but should
+   come after scale optimization and activation weighting.
+
+---
 
 ### Performance rules
 
@@ -129,6 +273,8 @@ Keep these rules in mind:
   and broadcasting over allocation.
 * **`eval_perplexity.py` automatically prints `Tokens/sec`** in its output.
   You do not need to compute it manually — just read it from the eval result.
+
+---
 
 ## Integrity Rules — what the agent MUST NOT do
 
@@ -159,14 +305,17 @@ them invalidates the experiment.
 - **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
   must always be passed.  Groupsize may vary (via `--groupsize`, ≥ 16).
   Symmetric is hardcoded — there is no flag for it and it must not be added.
-- **Do not exceed the compressed size limit of 1500 MB.**  `quantize.py` enforces
+- **Do not exceed the compressed size limit of 1575 MB.**  `quantize.py` enforces
   this — if your experiment hits the limit, increase `--groupsize` to reduce
   scale/zero overhead.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
   function are off-limits.
-- **Do not increase VRAM.**  GPU memory usage must not exceed the current baseline.
-  Extra compute is fine; extra memory allocations that persist across the
-  quantization loop are forbidden.
+- **Do not increase VRAM.**  GPU memory usage must not exceed 8 GB.  Extra compute
+  is fine; extra memory allocations that persist across the quantization loop
+  are forbidden.
+- **Do not consume the test set during quantization.**  Calibration data and evaluation
+  data must be disjoint.  `eval_perplexity.py` uses Wikitext-2 test split — do not use
+  that split for calibration.  The Wikitext-2 **train** split is available.
 
 ### Git and record-keeping integrity
 - **Do not edit `results.tsv` directly** except to append a new row after a completed
@@ -174,22 +323,98 @@ them invalidates the experiment.
 - **Do not skip recording bad results.**  Every experiment must be recorded, even
   (especially) the ones that regress.  Selective recording is cheating.
 - **Do not `git commit --amend` or rewrite history** after the fact.
-- **Do not `git reset` to a commit that was not an experiment boundary.**  The loop is:
-  commit → eval → keep-or-reset.  You may only reset to the commit you started from.
 - **Do not delete or force-push branches.**  The git history is the experiment log.
-
-### Process integrity
 - **Do not run concurrent experiments.**  One experiment at a time on one GPU.
 - **Do not skip the cleanup step.**  After each eval, delete `quantized_models/<tag>`.
 - **Do not change the Python environment** (no `pip install`, no version bumps) between
   experiments in the same branch.
-- **Do not consume the test set during quantization.**  Calibration data and evaluation
-  data must be disjoint.  `eval_perplexity.py` uses Wikitext-2 test split — do not use
-  that split for calibration.
+
+---
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+Each experiment records into **three** files:
+
+### results.tsv (tab-separated header + rows)
+
+Header:
+```
+timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+```
+
+Fields:
+| field | source |
+|---|---|
+| `timestamp` | ISO-8601 time of eval completion |
+| `exp_id` | Unique experiment ID (e.g. `exp-20260701-001`) |
+| `code_sha` | `git rev-parse HEAD` **of the code commit** (not the result commit) |
+| `parent_sha` | `git rev-parse HEAD~1` from before the code change |
+| `description` | One-line idea description (no tabs, no commas) |
+| `status` | `success` or the error type |
+| `kl_divergence` | Mean KL from eval output |
+| `bits` | Always `2` |
+| `groupsize` | Groupsize used |
+| `symmetric` | Always `true` |
+| `format` | Quantization scheme tag (e.g. `q2_k`, `err_diff`, `mse_opt`) |
+| `context_length` | Always `1024` |
+| `max_tokens` | Always `5000` |
+| `size_mb` | `du -sm quantized_models/<tag>/compressed` |
+| `peak_vram_mb` | Peak VRAM from `nvidia-smi` or `torch.cuda.max_memory_allocated()` |
+| `tokens_per_sec` | Tokens/sec from eval output |
+
+### idea_ledger.md (experiments/)
+
+For each completed experiment, add a structured entry:
+
+```markdown
+## <exp_id>
+
+Hypothesis: <one-sentence hypothesis>
+Algorithm family: <tag>
+Changed code: <function/region>
+Representation change: <none | what changed>
+Storage risk: <none | size increase estimate>
+VRAM risk: <none | what extra is allocated>
+Expected win: <lower KL / faster / same>
+Outcome: <KL improved/regressed/failed>
+```
+
+### failures.tsv (experiments/)
+
+Log crashes, OOMs, NaNs, size-limit failures, and invalid-format attempts here
+(**not** in `results.tsv`).
+
+Header:
+```
+timestamp	exp_id	code_sha	description	status	error_signature	groupsize	size_mb	peak_vram_mb	notes
+```
+
+---
+
+## Synthesis checkpoints
+
+**Every 5 completed official experiments**, pause and write a synthesis to
+`experiments/synthesis.md`:
+
+```markdown
+# Synthesis checkpoint — <date>
+
+- Current global best KL: <value>
+- Best code sha: <sha>
+- Best groupsize: <N>
+- Ideas that improved: <list>
+- Ideas that regressed: <list>
+- Failure patterns: <list>
+- Next three highest-priority hypotheses:
+  1. <hypothesis>
+  2. <hypothesis>
+  3. <hypothesis>
+- Current phase: <phase number and name>
+```
+
+This prevents random-walk drift and ensures the search stays goal-oriented.
+
+---
 
 ## Operational notes
 
@@ -198,77 +423,128 @@ When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-se
   yet, avoid killing processes — just delete the output directory
   (`rm -rf quantized_models/<tag>`) and the next run will overwrite cleanly.
 
+- **Peak VRAM** can be read from the last line of quantize.py output
+  (`Peak VRAM: <N> MB`), or via `nvidia-smi --query-gpu=memory.used --format=csv,noheader`
+  after the quantization completes.
+
+---
+
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The active `quantize.py` at the branch tip should **always** be the global best
+KL implementation.  The search must not drift into worse code because of
+groupsize-specific baselines.
 
 ### Pre-loop checks (do these ONCE at the start)
 
 1. **Verify the branch**: `git branch --show-current` — must match `autoresearch/<tag>`.
-2. **Read current best KL**: `tail -1 results.tsv` and note the `kl_divergence` column.
-   This is your target to beat.
+2. **Read current global best**: `cut -f6 results.tsv | sort -n | head -1`
+   (KL is column 6).  This is your target to beat.
 3. **Confirm reference cache exists**: `ls cache/ref_logits.mmap` — must be present.
    Do NOT delete or regenerate it.
 4. **Confirm environment**: `HF_HUB_OFFLINE=1` is set in the shell for all commands.
 
-### Loop iteration — repeat forever
+### Loop iteration
 
-1. **Read state**: `git log --oneline -1` and `tail -1 results.tsv` to know where you stand.
-2. **Read all past descriptions** in `results.tsv` (`cut -f3 results.tsv`).  Use these
-   to avoid repeating ideas.  Your next idea must be novel — check that no prior row
-   describes the same approach.  If an idea was already tried (even with a worse KL),
-   skip it and think of something else.
-3. **Come up with ONE experimental idea** to improve the quantization algorithm.
-   This is entirely your choice — do not wait for human suggestions.  The idea should
-   modify how weights are quantized in `_quantize_one_layer()` or `quantize_model()`.
-4. **Modify `quantize.py`** with that single change.  Avoid shotgun diffs — change
-   one thing so the effect is clearly attributable.
-5. **Run the experiment** (all commands from the repo root):
-    ```
-    HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
-        --model Qwen/Qwen3.5-2B --bits 2 \
-        --dtype bfloat16 --save quantized_models/<tag>
-    HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
-        --model quantized_models/<tag> \
-        --reference Qwen/Qwen3.5-2B \
-        --context-length 1024 --max-tokens 5000 \
-        --reference-cache cache/ref_logits.mmap
-    rm -rf quantized_models/<tag>
-    ```
-    `--groupsize` may vary (≥ 16, default 32).  `--bits 2` and `--dtype bfloat16` are fixed.  Symmetric is hardcoded.
-6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
-   to revert.  Do NOT record the result.  Go back to step 2.
-7. **On success**: append one TSV row to `results.tsv`:
-    ```
-     <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t<groupsize>\ttrue\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
-    ```
-    Use actual values from the eval output and `ls -l` on the compressed directory.
-    Tab-separated, no commas in the description.
+1. **Read state**:
+   ```
+   git log --oneline -3
+   tail -5 results.tsv
+   cat experiments/idea_ledger.md | head -80
+   cat experiments/failures.tsv  # avoid repeating crashes
+   ```
 
-8. **Record the result permanently** (before deciding whether to keep the code):
-    ```bash
-    git add results.tsv
-    git commit -m "record: <description> (KL=<value>)"
-    ```
-    This commit preserves the experiment record in git history **forever** —
-    even if the code change is reverted.
+2. **Propose one experiment**:
+   - Hypothesis (one sentence).
+   - Algorithm family tag (e.g. `scale_optimization`, `error_compensation`,
+     `activation_weighted`, `codebook`, `layer_policy`).
+   - Expected storage impact (none / +X MB).
+   - Expected VRAM impact (none / +X MB for Y tensors).
+   - Why it is novel versus prior runs (check idea_ledger.md).
 
-9. **Commit the code change**:
-    ```bash
-    git add quantize.py
-    git commit -m "<description> (KL=<value>)"
-    ```
+3. **Modify only `quantize.py`**.
+
+4. **Run smoke checks** (optional, recommended):
+   ```
+   python -m py_compile quantize.py
+   ```
+   If your change introduces new metadata or format, verify the save/load round-trip
+   works with a minimal test (logged under `runs/<exp_id>/diagnostics/`).
+
+5. **Commit the code BEFORE eval** (so `code_sha` points to the actual tested code):
+   ```bash
+   git add quantize.py
+   git commit -m "exp: <description>"
+   CODE_SHA=$(git rev-parse HEAD)
+   PARENT_SHA=$(git rev-parse HEAD~1)
+   EXP_ID="exp-$(date +%Y%m%d)-$(printf '%03d' $(wc -l < results.tsv))"
+   mkdir -p runs/$EXP_ID
+   ```
+
+6. **Run quantization and eval** (from repo root):
+   ```bash
+   # Quantize
+   HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
+       --model Qwen/Qwen3.5-2B --bits 2 \
+       --dtype bfloat16 --groupsize <N> \
+       --save quantized_models/<tag> 2>&1 | tee runs/$EXP_ID/quantize.log
+
+   # Record size BEFORE deleting
+   du -sm quantized_models/<tag>/compressed | tee runs/$EXP_ID/size_mb.txt
+
+   # Evaluate
+   HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
+       --model quantized_models/<tag> \
+       --reference Qwen/Qwen3.5-2B \
+       --context-length 1024 --max-tokens 5000 \
+       --reference-cache cache/ref_logits.mmap 2>&1 | tee runs/$EXP_ID/eval.log
+
+   # Cleanup
+   rm -rf quantized_models/<tag>
+   ```
+   Extract `SIZE_MB`, `KL`, and `TOK_PER_SEC` from the log files.
+
+7. **On crash / OOM / NaN / size-limit failure**:
+   - Append one row to `experiments/failures.tsv`.
+   - Commit the failure log:
+     ```bash
+     git add experiments/failures.tsv runs/$EXP_ID/
+     git commit -m "fail: <description>"
+     ```
+   - Revert the code commit:
+     ```bash
+     git revert --no-edit $CODE_SHA
+     ```
+   - Continue to next iteration.
+
+8. **On valid eval** — append one TSV row to `results.tsv` using actual values:
+   ```
+   <timestamp>	<EXP_ID>	<CODE_SHA>	<PARENT_SHA>	<description>	success	<KL>	2	<groupsize>	true	<format>	1024	5000	<SIZE_MB>	<VRAM_MB>	<TOK_PER_SEC>
+   ```
+   Tab-separated, no commas in description.
+
+   Update `experiments/idea_ledger.md` with the structured experiment entry.
+
+9. **Record the result permanently**:
+   ```bash
+   git add results.tsv experiments/idea_ledger.md runs/$EXP_ID/
+   git commit -m "record: <description> (KL=<value>)"
+   ```
 
 10. **Decide whether to keep the code**:
-    - Find the **best KL for the current groupsize** in results.tsv (lowest value
-      in the `kl_divergence` column where `groupsize` matches your experiment's value).
-    - **If no matching baseline exists**: this run IS the baseline.  Keep the commit
-      and continue — you now have a target to beat.
-    - **Lower KL than the previous best**: advance — keep the commit.  This is now
-      the new best.
-    - **Equal or higher KL**: `git reset --hard HEAD~1` — reverts the code commit
-      but the results.tsv commit above is safe (it was the one before).  The failed
-      experiment is still recorded in git log and results.tsv.
-      Never reset further back than one commit.
+    - **If this KL is the new global best** (lower than every other row in results.tsv):
+      keep the code — the branch tip is now the best implementation.
+    - **If KL is NOT a new global best**:
+      ```bash
+      git revert --no-edit $CODE_SHA
+      ```
+      The result remains recorded forever.  The branch tip returns to the
+      previous-best code.  Do NOT reset — `git revert` preserves history.
 
-11. Go to step 2.
+    Exception: during **Phase 0 baseline sweeps**, no algorithm changes are made
+    and results are only used to choose the default groupsize.  Code does not change.
+
+11. **Every 5 valid official runs**, write a synthesis checkpoint to
+    `experiments/synthesis.md` and commit it.
+
+12. Go to step 1.
