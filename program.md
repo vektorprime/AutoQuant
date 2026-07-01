@@ -27,10 +27,10 @@ Each experiment runs on a single GPU. The workflow is:
 3. Delete the quantized model from `quantized_models/<tag>`.
 
 All experiments MUST be run with the following arguments for quantize.py:
-* `--bits 2` — quantize to 2 bits
+* `--bits 2` — quantize to 2 bits (fixed, never change)
 * `--groupsize 128` — quantize weights in groups of 128 (min 16, must divide `in_features`)
-* `--symmetric` — use symmetric quantization (zero-point = 0)
-* `--dtype bfloat16` — load the base model in BF16 precision
+* `--symmetric` — use symmetric quantization (fixed, MUST always be passed, never omit)
+* `--dtype bfloat16` — load the base model in BF16 precision (fixed, never change)
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
@@ -119,24 +119,53 @@ When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-se
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
 
-LOOP FOREVER:
-1. Inspect `git log --oneline -1` and `tail -1 results.tsv` to see the current state.
-2. Modify `quantize.py` with a single experimental change.  Avoid shotgun diffs —
-   change one thing so the effect is attributable.
-3. Run the experiment:
+### Pre-loop checks (do these ONCE at the start)
+
+1. **Verify the branch**: `git branch --show-current` — must match `autoresearch/<tag>`.
+2. **Read current best KL**: `tail -1 results.tsv` and note the `kl_divergence` column.
+   This is your target to beat.
+3. **Confirm reference cache exists**: `ls cache/ref_logits.mmap` — must be present.
+   Do NOT delete or regenerate it.
+4. **Confirm environment**: `HF_HUB_OFFLINE=1` is set in the shell for all commands.
+
+### Loop iteration — repeat forever
+
+1. **Read state**: `git log --oneline -1` and `tail -1 results.tsv` to know where you stand.
+2. **Read all past descriptions** in `results.tsv` (`cut -f3 results.tsv`).  Use these
+   to avoid repeating ideas.  Your next idea must be novel — check that no prior row
+   describes the same approach.  If an idea was already tried (even with a worse KL),
+   skip it and think of something else.
+3. **Come up with ONE experimental idea** to improve the quantization algorithm.
+   This is entirely your choice — do not wait for human suggestions.  The idea should
+   modify how weights are quantized in `_quantize_one_layer()` or `quantize_model()`.
+4. **Modify `quantize.py`** with that single change.  Avoid shotgun diffs — change
+   one thing so the effect is clearly attributable.
+5. **Run the experiment** (all commands from the repo root):
    ```
-   HF_HUB_OFFLINE=1 python quantize.py --model <MODEL> --bits 2 --groupsize <N> \
-       --symmetric --dtype bfloat16 --save quantized_models/<tag>
-   HF_HUB_OFFLINE=1 python eval_perplexity.py --model quantized_models/<tag> \
-       --reference <MODEL> --context-length 1024 --reference-cache cache/ref_logits.mmap
+   HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
+       --model Qwen/Qwen3.5-2B --bits 2 --groupsize <N> --symmetric \
+       --dtype bfloat16 --save quantized_models/<tag>
+   HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
+       --model quantized_models/<tag> \
+       --reference Qwen/Qwen3.5-2B \
+       --context-length 1024 --max-tokens 5000 \
+       --reference-cache cache/ref_logits.mmap
    rm -rf quantized_models/<tag>
    ```
-4. **If the command failed** (non-zero exit, OOM, crash): `git checkout -- quantize.py`
-   to revert and try something else.  Do NOT record the result.
-5. **If the command succeeded**: record the KL divergence in `results.tsv`.
-6. `git add quantize.py results.tsv && git commit -m "<description> (KL=X.XXX)"`
-7. Compare the new KL to the previous best (from `results.tsv`):
-   - **Lower KL**: advance — keep the commit, continue from here.
-   - **Equal or higher KL**: `git reset --hard HEAD~1` — revert to the previous
-     best commit exactly.  Never reset further back.
-8. Start a fresh idea.
+   `--symmetric` is mandatory.  `--groupsize` may vary.  All other args are fixed.
+6. **On failure** (non-zero exit, OOM, crash, NaN KL): `git checkout -- quantize.py`
+   to revert.  Do NOT record the result.  Go back to step 2.
+7. **On success**: append one TSV row to `results.tsv`:
+   ```
+   <ISO-timestamp>\t<git rev-parse HEAD>\t<description of the idea>\t<KL value>\t2\t<groupsize>\t<symmetric>\tq2_k\t0\t0\t1024\t5000\t<size_mb>\t<tokens_per_sec>
+   ```
+   Use actual values from the eval output and `ls -l` on the compressed directory.
+   Tab-separated, no commas in the description.
+8. **Git decision**:
+   - `git add quantize.py results.tsv`
+   - `git commit -m "<description> (KL=<value>)"`
+   - Compare new KL to the previous best:
+     - **Lower KL**: advance — keep the commit.  This is now the new best.
+     - **Equal or higher KL**: `git reset --hard HEAD~1` — revert to the previous
+       best commit exactly.  Never reset further back than one commit.
+9. Go to step 2.
