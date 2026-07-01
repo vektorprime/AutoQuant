@@ -148,6 +148,13 @@ them invalidates the experiment.
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
+## Operational notes
+
+- **Never use `pkill`.**  It hangs the session.  If a process needs to be killed,
+  use `kill <PID>` by finding the PID with `ps aux | grep <process>`.  Better
+  yet, avoid killing processes — just delete the output directory
+  (`rm -rf quantized_models/<tag>`) and the next run will overwrite cleanly.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).

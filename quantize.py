@@ -2,8 +2,8 @@
 """
 q2_k post-training quantization for AutoModelForCausalLM.
 
-Per-group min/max symmetric quantization — no calibration data, no iterative
-optimisation.  Symmetric is hardcoded (always on).
+CPU-based, vectorised per-group min/max symmetric quantization.
+No GPU sync per layer — the entire model is quantised on CPU in one pass.
 """
 
 import argparse
@@ -14,18 +14,17 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from quantizer import Quantizer
 
 logger = logging.getLogger(__name__)
 
-# Quantization is always symmetric — no asymmetric support.
-SYMMETRIC = True
+# Quantization is always symmetric — hardcoded.
+MAXQ = {2: 3, 3: 7, 4: 15, 8: 255}
 
 
 # ---------------------------------------------------------------------------
-# q2_k per-layer quantization
+# Per-layer 2-bit symmetric quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
 
 def _quantize_one_layer(
@@ -33,40 +32,43 @@ def _quantize_one_layer(
     bits: int,
     groupsize: int,
 ) -> dict:
-    """
-    Quantize a single nn.Linear layer with symmetric per-group min/max.
-
-    Returns dict with integer codes, scales, and zeros for compressed storage.
-    The layer's weight is updated in-place with the dequantised values.
-    """
-    W = layer.weight.data.float()
+    W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
+    maxq = MAXQ[bits]
+    zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
-    qz = Quantizer(bits=bits, symmetric=SYMMETRIC, groupsize=groupsize)
-    qz.find_params(W)
-    W_q = qz.quantize(W)  # dequantised float32
+    # ---------- per-group scale (reshape → amin/amax, zero-copy view) -----
+    W_r = W.reshape(out_features, n_groups, g)     # view
+    xmax = torch.maximum(W_r.amin(dim=-1).abs(),
+                         W_r.amax(dim=-1))          # (out, n_groups)
+    scale = xmax / (maxq / 2)
+    scale[scale == 0] = 1.0
 
-    # Integer codes via reshape-based broadcasting (no repeat_interleave).
-    W_r = W.reshape(out_features, n_groups, g)
-    codes = torch.clamp(
-        torch.round(W_r / qz.scale.unsqueeze(-1)) + qz.zero.unsqueeze(-1),
-        0, qz.maxq,
-    ).to(torch.uint8).reshape(out_features, in_features)
+    # ---------- quantise + dequantise in one broadcast pass --------------
+    # scale.unsqueeze(-1) broadcasts with W_r via (out, n_groups, 1) → (out, n_groups, g)
+    q = torch.clamp(torch.round(W_r / scale.unsqueeze(-1)) + zero_pt,
+                    0, maxq)
+    W_q = (scale.unsqueeze(-1) * (q - zero_pt)).reshape(out_features,
+                                                         in_features)
 
     layer.weight.data = W_q.to(layer.weight.dtype)
 
     return {
-        "codes": codes.cpu().numpy(),
-        "scales": qz.scale.cpu().numpy().astype(np.float32),
-        "zeros": qz.zero.cpu().numpy().astype(np.float32),
-        "shape": [out_features, in_features],
+        "codes":  q.reshape(out_features, in_features).to(torch.uint8).numpy(),
+        "scales": scale.numpy().astype(np.float32),
+        "zeros":  np.full(scale.shape, zero_pt, dtype=np.float32),
+        "shape":  [out_features, in_features],
     }
 
 
+# ---------------------------------------------------------------------------
+# Compressed storage
+# ---------------------------------------------------------------------------
+
 def _pack_2bit(codes: np.ndarray) -> np.ndarray:
-    """Pack 4 × 2-bit values into one uint8 (in_features must be multiple of 4)."""
+    """Pack 4 × 2-bit values into one uint8."""
     out, inp = codes.shape
     assert inp % 4 == 0
     codes = codes.reshape(out, inp // 4, 4)
@@ -78,24 +80,20 @@ def _pack_2bit(codes: np.ndarray) -> np.ndarray:
 
 
 def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
-    """Save integer codes (packed), scales, and zeros to disk. Returns total bytes."""
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
     layer_info = {}
 
-    for name, data in meta.items():
+    for name, data in tqdm(meta.items(), desc="Saving compressed"):
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
-
-        if bits == 2 and data["shape"][1] % 4 == 0:
-            codes_out = _pack_2bit(data["codes"])
-        else:
-            codes_out = data["codes"]
-
-        np.savez_compressed(fname,
-                            codes=codes_out,
-                            scales=data["scales"],
-                            zeros=data["zeros"])
+        codes_out = (_pack_2bit(data["codes"])
+                     if bits == 2 and data["shape"][1] % 4 == 0
+                     else data["codes"])
+        np.savez(fname,
+                 codes=codes_out,
+                 scales=data["scales"],
+                 zeros=data["zeros"])
         total_bytes += os.path.getsize(fname)
         layer_info[name] = data["shape"]
 
@@ -118,25 +116,21 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
 def quantize_model(
     model: nn.Module,
     bits: int = 2,
-    groupsize: int = 128,
+    groupsize: int = 16,
     save_compressed_dir: str | None = None,
 ) -> dict:
-    """
-    Quantize all nn.Linear layers in *model*.
-
-    Weights are updated in-place.  Returns per-layer code/scale/zero metadata.
-    """
     model.eval()
+    model.cpu()                                     # everything happens on CPU
     meta: dict = {}
 
-    for name, layer in model.named_modules():
-        if not isinstance(layer, nn.Linear):
-            continue
+    layers = [(n, m) for n, m in model.named_modules()
+              if isinstance(m, nn.Linear)]
+
+    for name, layer in tqdm(layers, desc="Quantizing"):
         if groupsize != -1 and layer.weight.shape[1] % groupsize != 0:
             logger.warning("Skipping %s: in_features %d not divisible by %d",
                            name, layer.weight.shape[1], groupsize)
             continue
-
         meta[name] = _quantize_one_layer(layer, bits, groupsize)
 
     if save_compressed_dir:
@@ -156,12 +150,11 @@ def parse_args():
     )
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
     parser.add_argument("--bits", type=int, default=2, choices=[2, 3, 4, 8])
-    parser.add_argument("--groupsize", type=int, default=128,
-                        help="Group size (min 16, must divide in_features)")
+    parser.add_argument("--groupsize", type=int, default=16,
+                        help="Group size (>= 16, must divide in_features)")
     parser.add_argument("--dtype", default="bfloat16",
                         choices=["float16", "bfloat16", "float32"],
                         help="Precision for loading the base model")
-    parser.add_argument("--device", default=None)
     parser.add_argument("--save", default=None,
                         help="Directory to save quantized model")
     return parser.parse_args()
@@ -174,8 +167,6 @@ def main():
         datefmt="%H:%M:%S",
     )
     args = parse_args()
-
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     dtype = getattr(torch, args.dtype)
 
     logger.info("Loading model: %s (dtype=%s)", args.model, args.dtype)
@@ -184,12 +175,11 @@ def main():
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
     )
-    model.eval()
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=%s",
-                args.bits, args.groupsize, SYMMETRIC)
+    logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=True",
+                args.bits, args.groupsize)
     meta = quantize_model(
         model,
         bits=args.bits,
