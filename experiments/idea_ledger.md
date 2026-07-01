@@ -80,3 +80,30 @@ lower KL at same groupsize
 
 Outcome:
 KL improved (8.53 → 8.43, groupsize=32).  Best current result.
+
+## exp-20260701-008
+
+Hypothesis:
+Iterative least-squares scale refinement (3 EM-like iterations per group) on top of
+error-diffusion further reduces per-group weight MSE, lowering KL.
+
+Algorithm family:
+mse_opt
+
+Changed code:
+_quantize_one_layer — added 3-iteration scale refinement loop after initial maxabs scale
+
+Representation change:
+none (still 2-bit symmetric `{-2s, -s, 0, s}`)
+
+Storage risk:
+none (no extra metadata)
+
+VRAM risk:
+none (in-place tensor reuse)
+
+Expected win:
+lower KL at same groupsize
+
+Outcome:
+KL improved (8.43 → 6.69, groupsize=32).  New global best.
