@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -46,10 +47,11 @@ def _compute_kl_divergence(
     ref_logits_mmap_fill=False,
     quant_model=None,
 ):
-    """Core KL computation that works with either a live ref model or cached logits."""
+    """Core KL computation. Returns (total_kl, n_tokens, elapsed_seconds)."""
     total_kl = 0.0
     n_tokens = 0
     memmap_offset = 0
+    t_start = time.time()
 
     for begin, end, target_len in tqdm(windows, desc="Evaluating KL"):
         chunk = input_ids[begin:end].unsqueeze(0).to(device)
@@ -76,7 +78,8 @@ def _compute_kl_divergence(
         n_tokens += target_len
         memmap_offset += target_len
 
-    return total_kl, n_tokens
+    elapsed = time.time() - t_start if n_tokens > 0 else 0.0
+    return total_kl, n_tokens, elapsed
 
 
 def evaluate_kl_divergence(
@@ -129,7 +132,7 @@ def evaluate_kl_divergence(
         quant_model.eval()
         quant_model.to(device)
 
-        total_kl, n_tokens = _compute_kl_divergence(
+        total_kl, n_tokens, elapsed = _compute_kl_divergence(
             input_ids, windows, device,
             ref_logits_mmap=ref_logits_mmap,
             ref_logits_mmap_fill=False,
@@ -137,7 +140,9 @@ def evaluate_kl_divergence(
         )
 
         mean_kl = total_kl / n_tokens if n_tokens > 0 else float("inf")
+        tok_s = n_tokens / elapsed if elapsed > 0 else 0
         print(f"\nMean KL divergence (ref → quant): {mean_kl:.6f}")
+        print(f"Tokens/sec: {tok_s:.1f}")
         return mean_kl
 
     # ------------------------------------------------------------------
@@ -191,7 +196,7 @@ def evaluate_kl_divergence(
 
     print(f"Tokens: {input_ids.size(0):,} | Context length: {context_length} | Stride: {stride}")
 
-    total_kl, n_tokens = _compute_kl_divergence(
+    total_kl, n_tokens, elapsed = _compute_kl_divergence(
         input_ids, windows, device,
         ref_model=ref_model,
         ref_logits_mmap=ref_logits_mmap,
@@ -204,7 +209,9 @@ def evaluate_kl_divergence(
         print(f"Reference logits cached ({total_tokens:,} tokens, {vocab_size:,} vocab)")
 
     mean_kl = total_kl / n_tokens if n_tokens > 0 else float("inf")
+    tok_s = n_tokens / elapsed if elapsed > 0 else 0
     print(f"\nMean KL divergence (ref → quant): {mean_kl:.6f}")
+    print(f"Tokens/sec: {tok_s:.1f}")
     return mean_kl
 
 
