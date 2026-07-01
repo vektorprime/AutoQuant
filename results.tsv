@@ -5,3 +5,4 @@ timestamp	commit	description	kl_divergence	bits	groupsize	symmetric	dataset	nsam
 2026-07-01T22:42:00	0e8a4b175abf154bda46a0b9b209e24036345cf4	90th-percentile scale (idx 28/32) instead of amax for outlier robustness	13.550042	2	32	true	q2_k	0	0	1024	5000	898	170
 2026-07-01T22:35:14	f475f7d8a9b6b033d4a2f0538b88ce24cc84c47f	q2_k baseline groupsize=32, CPU-vectorized, compressed=941MB	8.525097	2	32	true	q2_k	0	0	1024	5000	941	150
 2026-07-01T23:01:19	a997cf4b604ee633c5a4bff8c6930eb0a5e9c2cf	no-clipping scale: s = max(amax, |amin|/2) ensures 2-bit rep range [-2s s] covers [amin amax] exactly	11.709466	2	32	true	q2_k	0	0	1024	5000	941	169.3
+2026-07-01T23:14:10	480a9fd2d727b7374aa9bf81ed3b179e72156d82	error-diffusion quantization: Floyd-Steinberg residual propagation across groups with coefficient 0.5	8.433538	2	32	true	q2_k	0	0	1024	5000	941	167.8
