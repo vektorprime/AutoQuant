@@ -107,3 +107,31 @@ lower KL at same groupsize
 
 Outcome:
 KL improved (8.43 → 6.69, groupsize=32).  New global best.
+
+## exp-20260701-009
+
+Hypothesis:
+Using activation-weighted MSE (E[x^2] per input channel from Wikitext-2 train split)
+in the scale refinement loop produces scales better aligned with output KL than
+plain weight MSE.
+
+Algorithm family:
+activation_weighted
+
+Changed code:
+_quantize_one_layer (weighted scale update), _collect_input_stats (new), main/quantize_model (plumbing)
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk:
+none (no extra metadata)
+
+VRAM risk:
+transient during calibration (16 forward passes on GPU), well under 8 GB
+
+Expected win:
+lower KL at same groupsize
+
+Outcome:
+KL improved (6.69 -> 6.34, groupsize=32). New global best.
