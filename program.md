@@ -35,9 +35,10 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 
 ### Resource limits (enforced)
 
-* **Compressed model size**: max **1500 MB**.  `quantize.py` will exit with an error
-  if the compressed `.npz` files exceed this.  Smaller groupsize = more metadata =
-  larger output.  Use `--groupsize` to stay under the limit.
+* **Compressed model size**: max **1575 MB** (1500 MB + 5% tolerance).
+  `quantize.py` will exit with an error if the compressed `.npz` files exceed this.
+  Smaller groupsize = more metadata = larger output.  Use `--groupsize` to stay
+  under the limit.
 * **VRAM**: max **8 GB** during quantization (checked via `nvidia-smi`).  No
   allocating auxiliary tensors that persist across layers.  Views, in-place ops,
   and broadcasting are fine — copies and sorts are not.
@@ -47,6 +48,8 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 - Modify the quantization algorithm: change how weights are quantized (rounding strategy,
   group partitioning, scale computation, error compensation, etc.) as long as it produces
   a valid quantized model via `Quantizer` or equivalent logic applied to `nn.Linear` weights.
+- Make multiple passes over the weights (iterative refinement, error feedback) —
+  extra compute is fine as long as VRAM stays under 8 GB.
 - Add new functions, classes, or imports within `quantize.py` (no external packages).
 - Tune hyperparameters exposed by the CLI: `--groupsize` (≥ 16).
 - Choose calibration data or design the quantization to not require it.
@@ -57,8 +60,10 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 - Modify `main()` in `quantize.py` — the entry point structure is fixed.
 - Modify `data_utils.py`.
 - Install new packages or add dependencies beyond those already in the environment.
-- Add modifications that increase the size of the compressed model (e.g., low-rank
-  corrections, extra stored tensors, or storing weights at > 2 bits per value).
+- Add modifications that increase the size of the compressed model beyond 1575 MB
+  (1500 MB + 5% tolerance).  Low-rank corrections, extra stored tensors, or storing
+  weights at > 2 bits per value are all forbidden if they push the final compressed
+  `.npz` total above the limit.
 - **Increase VRAM usage beyond 8 GB.**  GPU memory consumption must stay at or
   below 8 GB peak.  Extra computation (FLOPs) is acceptable, but VRAM is strictly
   capped.  No caching intermediate activations, no allocating auxiliary tensors
