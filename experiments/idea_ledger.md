@@ -190,3 +190,32 @@ lower KL at same groupsize
 
 Outcome:
 KL improved (6.69 -> 6.34, groupsize=32). New global best.
+
+## exp-20260702-012
+
+Hypothesis:
+Attention projection layers (q/k/v/o_proj) and lm_head directly shape model outputs and are
+more sensitive to quantization error. Using finer groupsize=16 for them gives better scale
+resolution, while MLP layers (gate/up/down_proj) tolerate coarser groupsize=32.
+
+Algorithm family:
+layer_policy
+
+Changed code:
+quantize_model — added _get_layer_groupsize() per-layer policy, integration in layer loop
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk:
+moderate (1089 MB vs 898 MB baseline; well under 1575 MB limit)
+
+VRAM risk:
+none (same calibration + CPU quantization pattern)
+
+Expected win:
+lower KL from finer quantization of sensitive layers
+
+Outcome:
+KL improved (5.94 -> 5.24, groupsize=32 with gs=16 for attention+lm_head). New global best.
+
