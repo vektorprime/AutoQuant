@@ -294,7 +294,7 @@ them invalidates the experiment.
   `--stride`, `--max-tokens`, `--reference-cache`, `--split`, and `--device` must be
   identical for every run in the same experiment branch.
 - **Do not change the reference model.**  The `--reference` argument must always point
-  to the same base model (e.g. `Qwen/Qwen3.5-2B`).  Running against a degraded or
+  to the same base model (e.g. `Qwen/Qwen3.5-0.8B`).  Running against a degraded or
   different reference makes results incomparable.
 - **Do not corrupt or replace the reference cache.**  Once created, the `.mmap` cache
   must not be modified, truncated, or regenerated with different parameters.
@@ -447,7 +447,7 @@ groupsize-specific baselines.
 1. **Verify the branch**: `git branch --show-current` — must match `autoresearch/<tag>`.
 2. **Read current global best**: `cut -f6 results.tsv | sort -n | head -1`
    (KL is column 6).  This is your target to beat.
-3. **Confirm reference cache exists**: `ls cache/ref_logits.mmap` — must be present.
+3. **Confirm reference cache exists**: `ls cache/ref_logits_0.8B.mmap` — must be present.
    Do NOT delete or regenerate it.
 4. **Confirm environment**: `HF_HUB_OFFLINE=1` is set in the shell for all commands.
 
@@ -492,7 +492,7 @@ groupsize-specific baselines.
    ```bash
    # Quantize
    HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
-       --model Qwen/Qwen3.5-2B --bits 2 \
+       --model Qwen/Qwen3.5-0.8B --bits 2 \
        --dtype bfloat16 --groupsize <N> \
        --save quantized_models/<tag> 2>&1 | tee runs/$EXP_ID/quantize.log
 
@@ -502,9 +502,9 @@ groupsize-specific baselines.
    # Evaluate
    HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
        --model quantized_models/<tag> \
-       --reference Qwen/Qwen3.5-2B \
+       --reference Qwen/Qwen3.5-0.8B \
        --context-length 1024 --max-tokens 5000 \
-       --reference-cache cache/ref_logits.mmap 2>&1 | tee runs/$EXP_ID/eval.log
+       --reference-cache cache/ref_logits_0.8B.mmap 2>&1 | tee runs/$EXP_ID/eval.log
 
    # Cleanup
    rm -rf quantized_models/<tag>
