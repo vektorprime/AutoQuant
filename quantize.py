@@ -109,6 +109,17 @@ def _quantize_one_layer(
     scales = torch.zeros(out_features, n_groups)
     W_q_full = torch.zeros(out_features, in_features)
 
+    sorted_indices = None
+    unsort_indices = None
+    if act_stats is not None:
+        act_view = act_stats.view(n_groups, g)
+        group_sensitivity = act_view.mean(dim=-1)
+        sorted_indices = torch.argsort(group_sensitivity, descending=True)
+        unsort_indices = torch.argsort(sorted_indices)
+        W_view = W.view(out_features, n_groups, g)
+        W = W_view[:, sorted_indices, :].contiguous().view(out_features, in_features)
+        act_stats = act_view[sorted_indices, :].contiguous().view(-1)
+
     for i in range(n_groups):
         start = i * g
         end = start + g
@@ -154,6 +165,14 @@ def _quantize_one_layer(
                 W[:, ns:ne] += diffusion * error * eps_w
             else:
                 W[:, ns:ne] += diffusion * error
+
+    if sorted_indices is not None:
+        c_view = codes.view(out_features, n_groups, g)
+        codes = c_view[:, unsort_indices, :].contiguous().view(out_features, in_features)
+        s_view = scales.view(out_features, n_groups)
+        scales = s_view[:, unsort_indices].contiguous()
+        wq_view = W_q_full.view(out_features, n_groups, g)
+        W_q_full = wq_view[:, unsort_indices, :].contiguous().view(out_features, in_features)
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
