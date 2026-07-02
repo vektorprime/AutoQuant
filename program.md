@@ -44,7 +44,7 @@ Run the default implementation at feasible groupsizes:
 | 128| ~328 MB  | coarsest |
 | 256| ~200 MB  | may be too coarse |
 
-Stop any groupsize that exceeds the 1575 MB size limit or 8 GB VRAM limit.
+Stop any groupsize that exceeds the 260 MB size limit or 8 GB VRAM limit.
 This establishes the size/KL frontier.  **No algorithm changes** during Phase 0
 — these runs are pure baselines.
 
@@ -90,7 +90,7 @@ Only after proving the eval loader supports them:
   dequantization path can consume per-group codebooks.
 - Layer-level codebooks (shared across groups).
 - Per-group asymmetric offsets or learned levels.
-- Outlier-preserving transforms that do not exceed the 1575 MB size limit.
+- Outlier-preserving transforms that do not exceed the 260 MB size limit.
 - Error-feedback schemes spanning multiple layers (not just within one layer).
 
 ---
@@ -112,7 +112,7 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 
 ### Resource limits (enforced)
 
-* **Compressed model size**: max **1575 MB** (1500 MB + 5% tolerance).
+* **Compressed model size**: max **260 MB** (1500 MB + 5% tolerance).
   `quantize.py` will exit with an error if the compressed `.npz` files exceed this.
   Smaller groupsize = more metadata = larger output.  Use `--groupsize` to stay
   under the limit.
@@ -141,7 +141,7 @@ Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` 
 - Modify `quantizer.py` (the `Quantizer` class and `quantize_tensor` function).
 - Modify `data_utils.py`.
 - Install new packages or add dependencies beyond those already in the environment.
-- Add modifications that increase the size of the compressed model beyond 1575 MB
+- Add modifications that increase the size of the compressed model beyond 260 MB
   (1500 MB + 5% tolerance).  Low-rank corrections, extra stored tensors, or storing
   weights at > 2 bits per value are all forbidden if they push the final compressed
   `.npz` total above the limit.
@@ -312,7 +312,7 @@ them invalidates the experiment.
 - **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
   must always be passed.  Groupsize may vary (via `--groupsize`, ≥ 16).
   Symmetric is hardcoded — there is no flag for it and it must not be added.
-- **Do not exceed the compressed size limit of 1575 MB.**  `quantize.py` enforces
+- **Do not exceed the compressed size limit of 260 MB.**  `quantize.py` enforces
   this — if your experiment hits the limit, increase `--groupsize` to reduce
   scale/zero overhead.
 - **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
