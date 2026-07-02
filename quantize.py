@@ -114,6 +114,8 @@ def _quantize_one_layer(
         W = W[:, sort_idx]
         act_stats = act_stats[sort_idx]
 
+    W_orig = W.clone()
+
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
     codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
@@ -229,6 +231,9 @@ def _quantize_one_layer(
         W_q_full[:, start:end] = torch.gather(
             cb_deq[:, i, :], 1, codes[:, start:end].long(),
         )
+
+    bias = (W_orig - W_q_full).mean(dim=-1)
+    W_q_full += bias.unsqueeze(-1)
 
     if did_sort:
         W_q_full = W_q_full[:, unsort_idx]
