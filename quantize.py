@@ -182,6 +182,15 @@ def _pack_2bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
+def _pack_4bit(codes: np.ndarray) -> np.ndarray:
+    """Pack 2 × 4-bit values into one uint8."""
+    out, inp = codes.shape
+    assert inp % 2 == 0
+    codes = codes.reshape(out, inp // 2, 2)
+    packed = (codes[..., 0] | (codes[..., 1] << 4))
+    return packed.astype(np.uint8)
+
+
 def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
@@ -190,9 +199,12 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
     for name, data in tqdm(meta.items(), desc="Saving compressed"):
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
-        codes_out = (_pack_2bit(data["codes"])
-                     if bits == 2 and data["shape"][1] % 4 == 0
-                     else data["codes"])
+        if bits == 4 and data["shape"][1] % 2 == 0:
+            codes_out = _pack_4bit(data["codes"])
+        elif bits == 2 and data["shape"][1] % 4 == 0:
+            codes_out = _pack_2bit(data["codes"])
+        else:
+            codes_out = data["codes"]
         np.savez(fname,
                  codes=codes_out,
                  scales=data["scales"],
