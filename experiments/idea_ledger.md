@@ -219,3 +219,32 @@ lower KL from finer quantization of sensitive layers
 Outcome:
 KL improved (5.94 -> 5.24, groupsize=32 with gs=16 for attention+lm_head). New global best.
 
+## exp-20260702-013
+
+Hypothesis:
+Sharing scales across K=2 adjacent output channels halves scale storage, enabling
+finer groupsizes at zero net size cost (gs=8 for attention+lm_head, gs=16 for MLP).
+
+Algorithm family:
+scale_optimization
+
+Changed code:
+_quantize_one_layer (K=2 block-wise scale sharing), _get_layer_groupsize (8/16)
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s}; scales stored with (out//K, n_groups) shape)
+
+Storage risk:
+none (1040 MB same as previous best)
+
+VRAM risk:
+none (same calibration + CPU quantization pattern)
+
+Expected win:
+lower KL from finer quantization enabled by cross-channel scale sharing
+
+Outcome:
+KL regressed (5.24 -> 5.72). Sharing scales across output channels loses more
+per-output-channel fidelity than the finer groupsize gains. Adjacent output
+channels have different magnitude ranges; forcing a single scale hurts.
+

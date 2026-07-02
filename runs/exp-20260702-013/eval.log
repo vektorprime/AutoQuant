@@ -1,0 +1,14 @@
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/user/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Wed Jul  1 18:40:14 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (297193 > 262144). Running this sequence through the model will result in indexing errors
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Using cached reference logits: cache/ref_logits.mmap
+Loading Wikitext-2 (test split)
+Loading quantized model: quantized_models/jul1
+[ERROR] `loss` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+[ERROR] `logits` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:   0%|          | 1/320 [00:00<02:04,  2.57it/s]Loading weights:  33%|███▎      | 106/320 [00:00<00:00, 282.63it/s]Loading weights:  52%|█████▏    | 167/320 [00:00<00:00, 273.70it/s]Loading weights:  67%|██████▋   | 213/320 [00:00<00:00, 274.45it/s]Loading weights:  79%|███████▉  | 252/320 [00:01<00:00, 281.22it/s]Loading weights:  90%|█████████ | 288/320 [00:01<00:00, 283.53it/s]Loading weights: 100%|██████████| 320/320 [00:01<00:00, 256.35it/s]
+Evaluating KL:   0%|          | 0/9 [00:00<?, ?it/s]Evaluating KL:  11%|█         | 1/9 [00:09<01:18,  9.87s/it]Evaluating KL:  22%|██▏       | 2/9 [00:12<00:38,  5.54s/it]Evaluating KL:  33%|███▎      | 3/9 [00:14<00:24,  4.14s/it]Evaluating KL:  44%|████▍     | 4/9 [00:17<00:17,  3.48s/it]Evaluating KL:  56%|█████▌    | 5/9 [00:19<00:12,  3.12s/it]Evaluating KL:  67%|██████▋   | 6/9 [00:22<00:08,  2.89s/it]Evaluating KL:  78%|███████▊  | 7/9 [00:24<00:05,  2.76s/it]Evaluating KL:  89%|████████▉ | 8/9 [00:27<00:02,  2.68s/it]Evaluating KL: 100%|██████████| 9/9 [00:29<00:00,  2.46s/it]Evaluating KL: 100%|██████████| 9/9 [00:29<00:00,  3.25s/it]
+
+Mean KL divergence (ref → quant): 5.718502
+Tokens/sec: 171.0
