@@ -279,3 +279,33 @@ scales that push moderate weights to q_centered=0, starving them from the scale
 refinement. 5 iterations insufficient to escape this. The maxabs/1.5 initialization
 with 3 iterations strikes a better balance.
 
+## exp-20260702-015
+
+Hypothesis:
+Weighing error diffusion inversely to per-channel activation importance (E[x²])
+protects important input channels from accumulating quantization error from
+previous groups, reducing downstream KL.
+
+Algorithm family:
+activation_weighted
+
+Changed code:
+_quantize_one_layer — error diffusion line scales residual by 1/h_next per channel
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk:
+none (no extra metadata)
+
+VRAM risk:
+none (same compute pattern)
+
+Expected win:
+lower KL from protecting high-importance channels from error propagation
+
+Outcome:
+KL improved (5.24 -> 4.82). New global best. Inverse-activation weighting of
+error diffusion successfully routes quantization residuals to less important
+input channels where they cause less output distortion.
+
