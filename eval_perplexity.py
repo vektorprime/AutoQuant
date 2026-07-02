@@ -219,9 +219,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate KL divergence between reference and quantized model on Wikitext-2"
     )
-    parser.add_argument("--model", default="Qwen/Qwen3.5-2B",
+    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B",
                         help="Path to the quantized model to evaluate")
-    parser.add_argument("--reference", default="Qwen/Qwen3.5-2B",
+    parser.add_argument("--reference", default="Qwen/Qwen3.5-0.8B",
                         help="Path to the reference (original) model")
     parser.add_argument("--context-length", type=int, required=True,
                         help="Context window size (number of tokens)")

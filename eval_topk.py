@@ -61,7 +61,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Same-top-P: argmax overlap between quantized model and reference cache")
     parser.add_argument("--model", required=True, help="Path to quantized model")
-    parser.add_argument("--reference", default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--reference", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--reference-cache", default="cache/ref_logits.mmap")
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--max-tokens", type=int, default=5000)

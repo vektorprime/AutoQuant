@@ -1,2 +1,2 @@
-# Idea Ledger (q4_k)
+# Idea Ledger (0.8B)
 

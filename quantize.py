@@ -275,7 +275,7 @@ def parse_args():
         description="q2_k quantization for causal LMs (symmetric, always on)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model", default="Qwen/Qwen3.5-2B")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     parser.add_argument("--bits", type=int, default=2, choices=[2, 3, 4, 8])
     parser.add_argument("--groupsize", type=int, default=DEFAULT_GROUPSIZE,
                         help="Group size (min 16, must divide in_features)")
