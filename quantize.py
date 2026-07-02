@@ -109,8 +109,6 @@ def _quantize_one_layer(
     scales = torch.zeros(out_features, n_groups)
     W_q_full = torch.zeros(out_features, in_features)
 
-    W_orig = W.clone()
-
     for i in range(n_groups):
         start = i * g
         end = start + g
@@ -156,21 +154,6 @@ def _quantize_one_layer(
                 W[:, ns:ne] += diffusion * error * eps_w
             else:
                 W[:, ns:ne] += diffusion * error
-
-    W_orig_r = W_orig.reshape(out_features, n_groups, g)
-    codes_c = codes.float().reshape(out_features, n_groups, g) - zero_pt
-
-    if act_stats is not None:
-        h_r = act_stats.reshape(n_groups, g).unsqueeze(0)
-        num = (W_orig_r * codes_c * h_r).sum(dim=-1)
-        den = (codes_c * codes_c * h_r).sum(dim=-1)
-    else:
-        num = (W_orig_r * codes_c).sum(dim=-1)
-        den = (codes_c * codes_c).sum(dim=-1)
-    den[den == 0] = 1.0
-    scales = num / den
-    scales[scales <= 0] = 1.0
-    W_q_full = (scales.unsqueeze(-1) * codes_c).reshape(out_features, in_features)
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
