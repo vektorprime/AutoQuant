@@ -165,12 +165,17 @@ def _quantize_one_layer(
             for _ in range(20):
                 dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).pow(2)
                 if h_g is not None:
-                    dists = dists * h_g.unsqueeze(0).unsqueeze(-1)
+                    dists = (dists * h_g.unsqueeze(0).unsqueeze(-1)).sqrt()
                 assign = dists.argmin(dim=-1)
                 for j in range(4):
                     mask_j = (assign == j).float()
-                    summed = (W_g * mask_j).sum(dim=-1)
-                    count = mask_j.sum(dim=-1).clamp(min=1)
+                    if h_g is not None:
+                        weighted_W = W_g * h_g.unsqueeze(0)
+                        summed = (weighted_W * mask_j).sum(dim=-1)
+                        count = (h_g.unsqueeze(0) * mask_j).sum(dim=-1).clamp(min=1e-8)
+                    else:
+                        summed = (W_g * mask_j).sum(dim=-1)
+                        count = mask_j.sum(dim=-1).clamp(min=1)
                     cb[:, j] = summed / count
 
             final_dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).pow(2)
