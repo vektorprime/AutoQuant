@@ -55,6 +55,17 @@ VRAM risk: none (same memory profile, k-means iterates within single-group view)
 Expected win: lower KL (more expressive quantization levels)
 Outcome: KL massively improved (3.3595 vs 5.6339 best, -40.4%) — NEW GLOBAL BEST
 
+## exp-20260702-010
+
+Hypothesis: Increasing groupsize from 32 to 64 halves codebook metadata (~100 MB → ~50 MB), bringing Q8 codebook under the 260 MB size cap while retaining k-means expressiveness
+Algorithm family: scale_optimization
+Changed code: MAX_COMPRESSED_MB constant (1575 → 260)
+Representation change: none (same Q8 codebook format, larger groups)
+Storage risk: -51 MB (305 → 253.6)
+VRAM risk: none
+Expected win: fits cap; KL slightly higher due to coarser groups
+Outcome: KL=4.25 (fits 253.6 MB under 260 MB cap; first valid Q8 codebook result under cap)
+
 ## exp-20260702-009
 
 Hypothesis: Quantizing codebook values to Q8 (per-layer min/max + uint8 centroids) reduces storage from 430→305 MB while preserving near-lossless fidelity (256 levels vs 16 for 4-bit)
