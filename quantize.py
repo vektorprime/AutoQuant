@@ -119,7 +119,7 @@ def _quantize_one_layer(
         scale = xmax / (maxq / 2)
         scale[scale == 0] = 1.0
 
-        for _ in range(3):
+        for _ in range(10):
             q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
                             0, maxq)
             q_centered = q - zero_pt
