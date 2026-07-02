@@ -33,3 +33,14 @@ VRAM risk: none
 Expected win: lower KL
 Outcome: KL regressed (5.91 vs 5.63 best, +4.9%)
 
+## exp-20260702-007
+
+Hypothesis: Learning explicit per-group 4-value codebooks via k-means gives more expressive quantization levels than the hardcoded {-2s, -s, 0, s} formula, reducing reconstruction error
+Algorithm family: codebook
+Changed code: _quantize_one_layer — replaced scale-based levels with k-means learned 4-value codebook per (out_channel, group); _save_compressed — stores codebook instead of scales
+Representation change: scales replaced by 4 bf16 codebook values per group (8 bytes/group vs 2 bytes/group)
+Storage risk: +206 MB (scales 2→8 bytes/group); total 430 MB, well under 1575 MB limit
+VRAM risk: none (same memory profile, k-means iterates within single-group view)
+Expected win: lower KL (more expressive quantization levels)
+Outcome: KL massively improved (3.3595 vs 5.6339 best, -40.4%) — NEW GLOBAL BEST
+
