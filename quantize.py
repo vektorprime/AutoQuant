@@ -106,7 +106,7 @@ def _quantize_one_layer(
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    scales = torch.zeros(out_features, n_groups)
+    codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
@@ -134,13 +134,26 @@ def _quantize_one_layer(
             scale = num / den
             scale[scale <= 0] = 1.0
 
-        q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
-                        0, maxq)
-        W_q = scale.unsqueeze(-1) * (q - zero_pt)
+        cb = scale.unsqueeze(-1) * torch.tensor(
+            [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
+        )
+
+        for _ in range(5):
+            dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+            assign = dists.argmin(dim=-1)
+            for j in range(4):
+                mask_j = (assign == j).float()
+                summed = (W_g * mask_j).sum(dim=-1)
+                count = mask_j.sum(dim=-1).clamp(min=1)
+                cb[:, j] = summed / count
+
+        dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+        q_idx = dists.argmin(dim=-1)
+        W_q = torch.gather(cb, 1, q_idx)
 
         error = W_g - W_q
-        codes[:, start:end] = q.to(torch.uint8)
-        scales[:, i] = scale
+        codes[:, start:end] = q_idx.to(torch.uint8)
+        codebooks[:, i, :] = cb.to(torch.bfloat16)
         W_q_full[:, start:end] = W_q
 
         if i + 1 < n_groups:
@@ -158,11 +171,11 @@ def _quantize_one_layer(
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":  codes.numpy(),
-        "scales": scales.to(torch.bfloat16).view(torch.int16).numpy(),
-        "scale_dtype": "bfloat16",
-        "zero_pt": zero_pt,
-        "shape":  [out_features, in_features],
+        "codes":     codes.numpy(),
+        "codebook":  codebooks.view(torch.int16).numpy(),
+        "codebook_dtype": "bfloat16_4codebook",
+        "shape":     [out_features, in_features],
+        "n_groups":  n_groups,
     }
 
 
@@ -205,11 +218,17 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
             codes_out = _pack_2bit(data["codes"])
         else:
             codes_out = data["codes"]
-        np.savez(fname,
-                 codes=codes_out,
-                 scales=data["scales"],
-                 scale_dtype=data["scale_dtype"],
-                 zero_pt=data["zero_pt"])
+        if "codebook" in data:
+            np.savez(fname,
+                     codes=codes_out,
+                     codebook=data["codebook"],
+                     codebook_dtype=data["codebook_dtype"])
+        else:
+            np.savez(fname,
+                     codes=codes_out,
+                     scales=data["scales"],
+                     scale_dtype=data["scale_dtype"],
+                     zero_pt=data["zero_pt"])
         total_bytes += os.path.getsize(fname)
         layer_info[name] = data["shape"]
 
