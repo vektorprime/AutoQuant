@@ -97,7 +97,7 @@ def _quantize_one_layer(
     groupsize: int,
     act_stats: torch.Tensor | None = None,
 ) -> dict:
-    W = layer.weight.data.float()
+    W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
@@ -105,12 +105,9 @@ def _quantize_one_layer(
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
     diffusion = 0.5
 
-    codes = torch.zeros(out_features, in_features, dtype=torch.uint8, device=W.device)
-    scales = torch.zeros(out_features, n_groups, device=W.device)
-    W_q_full = torch.zeros(out_features, in_features, device=W.device)
-
-    if act_stats is not None:
-        act_stats = act_stats.to(W.device)
+    codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
+    scales = torch.zeros(out_features, n_groups)
+    W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
         start = i * g
@@ -119,8 +116,8 @@ def _quantize_one_layer(
 
         xmax = torch.maximum(W_g.amin(dim=-1).abs(),
                              W_g.amax(dim=-1))
-        xmax = torch.clamp(xmax, min=1e-8)
         scale = xmax / (maxq / 2)
+        scale[scale == 0] = 1.0
 
         for _ in range(3):
             q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
@@ -133,9 +130,9 @@ def _quantize_one_layer(
             else:
                 num = (W_g * q_centered).sum(dim=-1)
                 den = (q_centered * q_centered).sum(dim=-1)
-            den = torch.clamp(den, min=1e-8)
+            den[den == 0] = 1.0
             scale = num / den
-            scale = torch.clamp(scale, min=1e-8)
+            scale[scale <= 0] = 1.0
 
         q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
                         0, maxq)
@@ -149,13 +146,20 @@ def _quantize_one_layer(
         if i + 1 < n_groups:
             ns = (i + 1) * g
             ne = ns + g
-            W[:, ns:ne] += diffusion * error
+            if act_stats is not None:
+                h_next = act_stats[ns:ne]
+                eps_w = (1.0 / h_next.clamp(min=1e-8))
+                eps_w = eps_w / eps_w.mean()
+                eps_w = eps_w.clamp(max=3.0)
+                W[:, ns:ne] += diffusion * error * eps_w
+            else:
+                W[:, ns:ne] += diffusion * error
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":  codes.cpu().numpy(),
-        "scales": scales.to(torch.bfloat16).cpu().view(torch.int16).numpy(),
+        "codes":  codes.numpy(),
+        "scales": scales.to(torch.bfloat16).view(torch.int16).numpy(),
         "scale_dtype": "bfloat16",
         "zero_pt": zero_pt,
         "shape":  [out_features, in_features],
@@ -232,7 +236,8 @@ def quantize_model(
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
 ) -> dict:
-    model.eval()                                    # keep on GPU if already there
+    model.eval()
+    model.cpu()                                     # CPU for deterministic results
     meta: dict = {}
 
     layers = [(n, m) for n, m in model.named_modules()

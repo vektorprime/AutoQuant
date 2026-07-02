@@ -323,6 +323,11 @@ them invalidates the experiment.
 - **Do not consume the test set during quantization.**  Calibration data and evaluation
   data must be disjoint.  `eval_perplexity.py` uses Wikitext-2 test split — do not use
   that split for calibration.  The Wikitext-2 **train** split is available.
+- **KL divergence regression is not acceptable by any means.**  Any change that
+  increases KL divergence (even by small numerical margins) is a regression.
+  The quantization must produce *identical* results regardless of the device
+  (CPU/GPU) or caching strategy used.  If a change causes KL to increase, it
+  must be fully reverted — no partial regressions are tolerated.
 
 ### Git and record-keeping integrity
 - **Do not edit `results.tsv` directly** except to append a new row after a completed
