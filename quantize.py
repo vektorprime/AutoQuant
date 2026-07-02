@@ -106,7 +106,7 @@ def _quantize_one_layer(
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    scales = torch.zeros(out_features, n_groups)
+    codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
@@ -134,13 +134,26 @@ def _quantize_one_layer(
             scale = num / den
             scale[scale <= 0] = 1.0
 
-        q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
-                        0, maxq)
-        W_q = scale.unsqueeze(-1) * (q - zero_pt)
+        cb = scale.unsqueeze(-1) * torch.tensor(
+            [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
+        )
+
+        for _ in range(5):
+            dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+            assign = dists.argmin(dim=-1)
+            for j in range(4):
+                mask_j = (assign == j).float()
+                summed = (W_g * mask_j).sum(dim=-1)
+                count = mask_j.sum(dim=-1).clamp(min=1)
+                cb[:, j] = summed / count
+
+        dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+        q_idx = dists.argmin(dim=-1)
+        W_q = torch.gather(cb, 1, q_idx)
 
         error = W_g - W_q
-        codes[:, start:end] = q.to(torch.uint8)
-        scales[:, i] = scale
+        codes[:, start:end] = q_idx.to(torch.uint8)
+        codebooks[:, i, :] = cb.to(torch.bfloat16)
         W_q_full[:, start:end] = W_q
 
         if i + 1 < n_groups:
@@ -155,14 +168,38 @@ def _quantize_one_layer(
             else:
                 W[:, ns:ne] += diffusion * error
 
+    cb_flat = codebooks.float().reshape(-1)
+    cb_min = cb_flat.min()
+    cb_max = cb_flat.max()
+    range_val = cb_max - cb_min
+    if range_val < 1e-8:
+        cb_q = torch.zeros(cb_flat.shape, dtype=torch.uint8)
+        cb_deq_flat = cb_flat
+    else:
+        cb_q = torch.clamp(
+            torch.round((cb_flat - cb_min) / range_val * 255.0),
+            0, 255,
+        ).to(torch.uint8)
+        cb_deq_flat = cb_min + cb_q.float() * (range_val / 255.0)
+    cb_deq = cb_deq_flat.reshape(out_features, n_groups, 4).to(torch.bfloat16)
+
+    for i in range(n_groups):
+        start = i * g
+        end = start + g
+        W_q_full[:, start:end] = torch.gather(
+            cb_deq[:, i, :], 1, codes[:, start:end].long(),
+        )
+
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":  codes.numpy(),
-        "scales": scales.to(torch.bfloat16).view(torch.int16).numpy(),
-        "scale_dtype": "bfloat16",
-        "zero_pt": zero_pt,
-        "shape":  [out_features, in_features],
+        "codes":     codes.numpy(),
+        "codebook_q": cb_q.numpy().astype(np.uint8),
+        "cb_min":    float(cb_min),
+        "cb_max":    float(cb_max),
+        "codebook_dtype": "q8_codebook",
+        "shape":     [out_features, in_features],
+        "n_groups":  n_groups,
     }
 
 
@@ -205,11 +242,24 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
             codes_out = _pack_2bit(data["codes"])
         else:
             codes_out = data["codes"]
-        np.savez(fname,
-                 codes=codes_out,
-                 scales=data["scales"],
-                 scale_dtype=data["scale_dtype"],
-                 zero_pt=data["zero_pt"])
+        if "codebook_q" in data:
+            np.savez(fname,
+                     codes=codes_out,
+                     codebook_q=data["codebook_q"],
+                     cb_min=data["cb_min"],
+                     cb_max=data["cb_max"],
+                     codebook_dtype=data["codebook_dtype"])
+        elif "codebook" in data:
+            np.savez(fname,
+                     codes=codes_out,
+                     codebook=data["codebook"],
+                     codebook_dtype=data["codebook_dtype"])
+        else:
+            np.savez(fname,
+                     codes=codes_out,
+                     scales=data["scales"],
+                     scale_dtype=data["scale_dtype"],
+                     zero_pt=data["zero_pt"])
         total_bytes += os.path.getsize(fname)
         layer_info[name] = data["shape"]
 
