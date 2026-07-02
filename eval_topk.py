@@ -92,20 +92,10 @@ def main():
     print("Loading Wikitext-2 (test split)")
     tokenizer = AutoTokenizer.from_pretrained(args.reference)
     input_ids = _tokenize_wikitext(tokenizer, "test")
-    print(f"  {input_ids.size(0):,} tokens in test set")
+    input_ids = input_ids[:args.max_tokens]
 
     windows = _build_window_index(input_ids, args.context_length, args.stride)
-    # Trim windows to match reference cache size
-    total = 0
-    trimmed = []
-    for w in windows:
-        if total >= n_cached:
-            break
-        taken = min(w[2], n_cached - total)
-        trimmed.append((w[0], w[0] + taken + 1, taken))
-        total += taken
-    windows = trimmed
-    print(f"  {len(windows)} windows, {total} eval tokens")
+    print(f"  {len(windows)} windows, {sum(w[2] for w in windows)} eval tokens")
 
     overlap, n_tokens, elapsed = same_top_p(
         input_ids, windows, device, ref_mmap, quant_model, vocab_size,
