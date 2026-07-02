@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Quantization is always symmetric — hardcoded.
 MAXQ = {2: 3, 3: 7, 4: 15, 8: 255}
 DEFAULT_GROUPSIZE = 32
-MAX_COMPRESSED_MB = 1575  # 1500 + 5% tolerance
+MAX_COMPRESSED_MB = 260
 VRAM_LIMIT_MB = 8192
 
 # Modules that must NEVER be quantized (SSM projections, norms, small params).
