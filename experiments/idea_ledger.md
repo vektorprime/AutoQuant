@@ -21,3 +21,15 @@ Storage risk: none
 VRAM risk: none
 Expected win: lower KL
 Outcome: KL improved (6.02 → 5.65, -6.1%)
+
+## exp-20260702-006
+
+Hypothesis: Removing activation-weighted error diffusion (inverse eps_w) would improve KL by avoiding biased over-amplification of low-importance channels during error propagation
+Algorithm family: error_compensation
+Changed code: _quantize_one_layer — removed eps_w weighting in error diffusion block
+Representation change: none
+Storage risk: none
+VRAM risk: none
+Expected win: lower KL
+Outcome: KL regressed (5.91 vs 5.63 best, +4.9%)
+
