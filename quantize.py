@@ -97,7 +97,6 @@ def _quantize_one_layer(
     groupsize: int,
     act_stats: torch.Tensor | None = None,
     diffusion: float = 0.5,
-    K: int = 1,
 ) -> dict:
     W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
@@ -105,80 +104,52 @@ def _quantize_one_layer(
     n_groups = in_features // g
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
-    if K > 1 and out_features % K != 0:
-        K = 1                                       # fallback
 
-    chunk_out = out_features // K
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    codebooks = torch.zeros(chunk_out, n_groups, 4, dtype=torch.bfloat16)
+    codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
-    if K > 1:
-        chunk_idx = torch.arange(out_features, device=W.device) // K
 
     for i in range(n_groups):
         start = i * g
         end = start + g
         W_g = W[:, start:end]                      # view
 
-        if K == 1:
-            xmax = torch.maximum(W_g.amin(dim=-1).abs(),
-                                 W_g.amax(dim=-1))
-            scale = xmax / (maxq / 2)
-            scale[scale == 0] = 1.0
+        xmax = torch.maximum(W_g.amin(dim=-1).abs(),
+                             W_g.amax(dim=-1))
+        scale = xmax / (maxq / 2)
+        scale[scale == 0] = 1.0
 
-            for _ in range(3):
-                q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
-                                0, maxq)
-                q_centered = q - zero_pt
-                if act_stats is not None:
-                    h_g = act_stats[start:end]
-                    num = (W_g * q_centered * h_g).sum(dim=-1)
-                    den = (q_centered * q_centered * h_g).sum(dim=-1)
-                else:
-                    num = (W_g * q_centered).sum(dim=-1)
-                    den = (q_centered * q_centered).sum(dim=-1)
-                den[den == 0] = 1.0
-                scale = num / den
-                scale[scale <= 0] = 1.0
+        for _ in range(3):
+            q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
+                            0, maxq)
+            q_centered = q - zero_pt
+            if act_stats is not None:
+                h_g = act_stats[start:end]
+                num = (W_g * q_centered * h_g).sum(dim=-1)
+                den = (q_centered * q_centered * h_g).sum(dim=-1)
+            else:
+                num = (W_g * q_centered).sum(dim=-1)
+                den = (q_centered * q_centered).sum(dim=-1)
+            den[den == 0] = 1.0
+            scale = num / den
+            scale[scale <= 0] = 1.0
 
-            cb = scale.unsqueeze(-1) * torch.tensor(
-                [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
-            )
-        else:
-            W_g_flat = W_g.reshape(chunk_out, K, g).reshape(chunk_out, K * g)
-            xmax = torch.amax(W_g_flat.abs(), dim=-1)
-            xmax[xmax == 0] = 1.0
-            cb = xmax.unsqueeze(-1) / (maxq / 2) * torch.tensor(
-                [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
-            )
+        cb = scale.unsqueeze(-1) * torch.tensor(
+            [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
+        )
 
-        if K == 1:
-            for _ in range(5):
-                dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
-                assign = dists.argmin(dim=-1)
-                for j in range(4):
-                    mask_j = (assign == j).float()
-                    summed = (W_g * mask_j).sum(dim=-1)
-                    count = mask_j.sum(dim=-1).clamp(min=1)
-                    cb[:, j] = summed / count
-        else:
-            W_g_flat = W_g.reshape(chunk_out, K, g).reshape(chunk_out, K * g)
-            for _ in range(8):
-                dists = (W_g_flat.unsqueeze(-1) - cb.unsqueeze(1)).abs()
-                assign = dists.argmin(dim=-1)
-                for j in range(4):
-                    mask_j = (assign == j).float()
-                    summed = (W_g_flat * mask_j).sum(dim=-1)
-                    count = mask_j.sum(dim=-1).clamp(min=1)
-                    cb[:, j] = summed / count
+        for _ in range(5):
+            dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+            assign = dists.argmin(dim=-1)
+            for j in range(4):
+                mask_j = (assign == j).float()
+                summed = (W_g * mask_j).sum(dim=-1)
+                count = mask_j.sum(dim=-1).clamp(min=1)
+                cb[:, j] = summed / count
 
-        if K == 1:
-            cb_exp = cb
-        else:
-            cb_exp = cb[chunk_idx]
-        dists = (W_g.unsqueeze(-1) - cb_exp.unsqueeze(1)).abs()
+        dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
         q_idx = dists.argmin(dim=-1)
-        W_q = torch.gather(cb_exp, 1, q_idx)
+        W_q = torch.gather(cb, 1, q_idx)
 
         error = W_g - W_q
         codes[:, start:end] = q_idx.to(torch.uint8)
@@ -210,20 +181,14 @@ def _quantize_one_layer(
             0, 255,
         ).to(torch.uint8)
         cb_deq_flat = cb_min + cb_q.float() * (range_val / 255.0)
-    cb_deq = cb_deq_flat.reshape(chunk_out, n_groups, 4).to(torch.bfloat16)
+    cb_deq = cb_deq_flat.reshape(out_features, n_groups, 4).to(torch.bfloat16)
 
     for i in range(n_groups):
         start = i * g
         end = start + g
-        if K == 1:
-            W_q_full[:, start:end] = torch.gather(
-                cb_deq[:, i, :], 1, codes[:, start:end].long(),
-            )
-        else:
-            cb_full = cb_deq[:, i, :][chunk_idx]
-            W_q_full[:, start:end] = torch.gather(
-                cb_full, 1, codes[:, start:end].long(),
-            )
+        W_q_full[:, start:end] = torch.gather(
+            cb_deq[:, i, :], 1, codes[:, start:end].long(),
+        )
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
@@ -235,7 +200,6 @@ def _quantize_one_layer(
         "codebook_dtype": "q8_codebook",
         "shape":     [out_features, in_features],
         "n_groups":  n_groups,
-        "K":         K,
     }
 
 
@@ -321,7 +285,6 @@ def quantize_model(
     groupsize: int = DEFAULT_GROUPSIZE,
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
-    K: int = 1,
 ) -> dict:
     model.eval()
     model.cpu()                                     # CPU for deterministic results
@@ -351,8 +314,7 @@ def quantize_model(
             layer_diffusion = 0.5
         meta[name] = _quantize_one_layer(layer, bits, layer_gs,
                                          act_stats=layer_act,
-                                         diffusion=layer_diffusion,
-                                         K=K)
+                                         diffusion=layer_diffusion)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
@@ -383,9 +345,6 @@ def parse_args():
                         help="Directory to save quantized model")
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
-    parser.add_argument("--K", type=int, default=1,
-                        help="Channel-sharing factor: codebooks shared across "
-                             "groups of K output channels (1 = per-channel)")
     return parser.parse_args()
 
 
@@ -434,7 +393,6 @@ def main():
         groupsize=args.groupsize,
         save_compressed_dir=compressed_dir,
         act_stats=act_stats,
-        K=args.K,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
