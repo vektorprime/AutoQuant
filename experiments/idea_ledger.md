@@ -1,5 +1,16 @@
 # Idea Ledger (0.8B)
 
+## exp-20260702-011
+
+Hypothesis: Sharing codebooks across K=2 output channels at gs=32 halves metadata (~117→58 MB), getting total under 260 MB while preserving Q8 expressiveness (KL expected near ~3.0)
+Algorithm family: codebook
+Changed code: _quantize_one_layer — K parameter for channel-shared codebook blocks; _save_compressed — unchanged
+Representation change: codebook_q shape from [out, n_groups, 4] to [out/K, n_groups, 4]; codes unchanged
+Storage risk: -52 MB (305→253 at gs=32 K=2)
+VRAM risk: none (same memory profile)
+Expected win: KL near 3.04 (Q8 expressiveness preserved, slight loss from sharing)
+Outcome: KL regressed (4.40 vs 4.25 best under cap) — channel sharing loses too much per-channel specificity; different K values may help
+
 ## exp-20260702-003
 
 Hypothesis: Different layer types benefit from different error diffusion coefficients — attention layers need stronger diffusion to compensate for structured weight patterns
