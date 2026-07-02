@@ -55,3 +55,14 @@ VRAM risk: none (same memory profile, k-means iterates within single-group view)
 Expected win: lower KL (more expressive quantization levels)
 Outcome: KL massively improved (3.3595 vs 5.6339 best, -40.4%) — NEW GLOBAL BEST
 
+## exp-20260702-009
+
+Hypothesis: Quantizing codebook values to Q8 (per-layer min/max + uint8 centroids) reduces storage from 430→305 MB while preserving near-lossless fidelity (256 levels vs 16 for 4-bit)
+Algorithm family: codebook_compression
+Changed code: _quantize_one_layer — add Q8 per-layer codebook quantization + re-gather; _save_compressed — new q8_codebook format
+Representation change: codebook stored as uint8 per layer with per-layer float32 cb_min/cb_max (1 byte/centroid vs 2 bytes for bf16)
+Storage risk: -125 MB (430→305)
+VRAM risk: none (same memory profile)
+Expected win: KL very close to 3.36 (256 levels near-lossless for bf16 centroids)
+Outcome: KL 3.4775 — slight regression vs bf16 (3.36, +3.5%) but far better than 4-bit (7.23). The re-gather from Q8-perturbed centroids introduces minor extra error; recomputing assignments against dequantized codebook may close the gap.
+
