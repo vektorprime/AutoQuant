@@ -114,8 +114,8 @@ def _quantize_one_layer(
         end = start + g
         W_g = W[:, start:end]                      # view
 
-        xmax = torch.maximum(W_g.amin(dim=-1).abs(),
-                             W_g.amax(dim=-1))
+        xmax = torch.quantile(W_g.abs(), q=0.99, dim=1)
+        xmax = torch.maximum(xmax, torch.tensor(1e-8, device=xmax.device))
         scale = xmax / (maxq / 2)
         scale[scale == 0] = 1.0
 
