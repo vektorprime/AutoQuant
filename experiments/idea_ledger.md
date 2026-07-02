@@ -111,6 +111,61 @@ KL improved (8.43 → 6.69, groupsize=32).  New global best.
 ## exp-20260701-009
 
 Hypothesis:
+Activation-weighted MSE scale using calibration-computed E[x²] per input channel
+better aligns quantization error with downstream KL than plain weight MSE.
+
+Algorithm family:
+activation_weighted
+
+Changed code:
+_quantize_one_layer — added calibration pass, weighted scale refinement loop
+
+Representation change:
+none (still 2-bit symmetric `{-2s, -s, 0, s}`)
+
+Storage risk:
+none
+
+VRAM risk:
+none (in-place reuse, calibration stats are 1 scalar per input channel)
+
+Expected win:
+lower KL at same groupsize
+
+Outcome:
+KL improved (6.69 → 6.34, groupsize=32).  New global best.
+
+## exp-20260701-010
+
+Hypothesis:
+The tiny SSM projections `linear_attn.in_proj_a` and `linear_attn.in_proj_b`
+(32K elements each) have negligible storage impact but quantizing them at 2-bit
+may hurt quality disproportionately.  Skipping them entirely should improve KL.
+
+Algorithm family:
+layer_policy
+
+Changed code:
+quantize_model — added `_NEVER_QUANTIZE` skip list
+
+Representation change:
+none (skipped layers stay at BF16; quantized layers unchanged)
+
+Storage risk:
+trivial (36 skipped layers × 32K elements × 2 bytes = ~2.4 MB still at bf16)
+
+VRAM risk:
+none
+
+Expected win:
+lower KL with minimal size increase
+
+Outcome:
+KL improved (6.34 → 5.94, groupsize=32).  New global best.
+
+## exp-20260701-009
+
+Hypothesis:
 Using activation-weighted MSE (E[x^2] per input channel from Wikitext-2 train split)
 in the scale refinement loop produces scales better aligned with output KL than
 plain weight MSE.
