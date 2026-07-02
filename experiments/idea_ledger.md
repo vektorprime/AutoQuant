@@ -309,3 +309,21 @@ KL improved (5.24 -> 4.82). New global best. Inverse-activation weighting of
 error diffusion successfully routes quantization residuals to less important
 input channels where they cause less output distortion.
 
+
+## exp-20260702-016
+
+Hypothesis: Increasing per-group scale refinement iterations from 3 to 10 will allow the activation-weighted scale optimization to converge more closely to the optimal scale, reducing per-group quantization error.
+
+Algorithm family: mse_opt
+
+Changed code: _quantize_one_layer — changed scale refinement loop from range(3) to range(10)
+
+Representation change: none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk: none (no extra metadata)
+
+VRAM risk: none (same compute pattern, no extra allocations)
+
+Expected win: lower KL from better-converged per-group scales
+
+Outcome: KL regressed (4.82 -> 4.85). 3 iterations already achieves near-optimal convergence for the activation-weighted least-squares scale update. Additional iterations overfit scale to specific quantized codes without meaningfully improving the minimizer.
