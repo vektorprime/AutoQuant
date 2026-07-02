@@ -37,8 +37,8 @@ _NEVER_QUANTIZE = frozenset([
 def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
     attn_keywords = ("q_proj", "k_proj", "v_proj", "o_proj", "lm_head")
     if any(kw in name for kw in attn_keywords):
-        return max(8, default_groupsize // 4)
-    return max(16, default_groupsize // 2)
+        return max(16, default_groupsize // 2)
+    return default_groupsize
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,6 @@ def _quantize_one_layer(
     bits: int,
     groupsize: int,
     act_stats: torch.Tensor | None = None,
-    cross_channel_K: int = 1,
 ) -> dict:
     W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
@@ -105,86 +104,43 @@ def _quantize_one_layer(
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
     diffusion = 0.5
-    K = cross_channel_K
-    assert out_features % K == 0, (
-        f"out_features {out_features} not divisible by K={K}"
-    )
-    n_blocks = out_features // K
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    scales_out = torch.zeros(n_blocks, n_groups)
+    scales = torch.zeros(out_features, n_groups)
     W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
         start = i * g
         end = start + g
-        W_g = W[:, start:end]                      # (out_features, g)
+        W_g = W[:, start:end]                      # view
 
-        if K > 1:
-            W_block = W_g.reshape(n_blocks, K, g)  # (n_blocks, K, g)
+        xmax = torch.maximum(W_g.amin(dim=-1).abs(),
+                             W_g.amax(dim=-1))
+        scale = xmax / (maxq / 2)
+        scale[scale == 0] = 1.0
 
-            xmax = torch.maximum(
-                W_block.amin(dim=-1).abs().amax(dim=1),
-                W_block.amax(dim=-1).amax(dim=1),
-            )
-            scale = xmax / (maxq / 2)
-            scale[scale == 0] = 1.0
-
-            for _ in range(3):
-                q_block = torch.clamp(
-                    torch.round(W_block / scale[:, None, None]) + zero_pt,
-                    0, maxq,
-                )                                  # (n_blocks, K, g)
-                qc = q_block - zero_pt
-                if act_stats is not None:
-                    h_g = act_stats[start:end].to(W_block.device)  # (g,)
-                    num = (W_block * qc * h_g).sum(dim=(-2, -1))
-                    den = (qc * qc * h_g).sum(dim=(-2, -1))
-                else:
-                    num = (W_block * qc).sum(dim=(-2, -1))
-                    den = (qc * qc).sum(dim=(-2, -1))
-                den[den == 0] = 1.0
-                scale = num / den
-                scale[scale <= 0] = 1.0
-
-            q_block = torch.clamp(
-                torch.round(W_block / scale[:, None, None]) + zero_pt,
-                0, maxq,
-            )
-            W_q = (scale[:, None, None] * (q_block - zero_pt)).reshape(
-                out_features, g)
-            error = W_g - W_q
-            codes[:, start:end] = q_block.reshape(out_features, g).to(
-                torch.uint8)
-            scales_out[:, i] = scale
-        else:
-            xmax = torch.maximum(W_g.amin(dim=-1).abs(),
-                                 W_g.amax(dim=-1))
-            scale = xmax / (maxq / 2)
-            scale[scale == 0] = 1.0
-
-            for _ in range(3):
-                q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
-                                0, maxq)
-                q_centered = q - zero_pt
-                if act_stats is not None:
-                    h_g = act_stats[start:end]
-                    num = (W_g * q_centered * h_g).sum(dim=-1)
-                    den = (q_centered * q_centered * h_g).sum(dim=-1)
-                else:
-                    num = (W_g * q_centered).sum(dim=-1)
-                    den = (q_centered * q_centered).sum(dim=-1)
-                den[den == 0] = 1.0
-                scale = num / den
-                scale[scale <= 0] = 1.0
-
+        for _ in range(3):
             q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
                             0, maxq)
-            W_q = scale.unsqueeze(-1) * (q - zero_pt)
-            error = W_g - W_q
-            codes[:, start:end] = q.to(torch.uint8)
-            scales_out[:, i] = scale
+            q_centered = q - zero_pt
+            if act_stats is not None:
+                h_g = act_stats[start:end]
+                num = (W_g * q_centered * h_g).sum(dim=-1)
+                den = (q_centered * q_centered * h_g).sum(dim=-1)
+            else:
+                num = (W_g * q_centered).sum(dim=-1)
+                den = (q_centered * q_centered).sum(dim=-1)
+            den[den == 0] = 1.0
+            scale = num / den
+            scale[scale <= 0] = 1.0
 
+        q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
+                        0, maxq)
+        W_q = scale.unsqueeze(-1) * (q - zero_pt)
+
+        error = W_g - W_q
+        codes[:, start:end] = q.to(torch.uint8)
+        scales[:, i] = scale
         W_q_full[:, start:end] = W_q
 
         if i + 1 < n_groups:
@@ -196,8 +152,8 @@ def _quantize_one_layer(
 
     return {
         "codes":  codes.numpy(),
-        "scales": scales_out.numpy().astype(np.float32),
-        "zeros":  np.full(scales_out.shape, zero_pt, dtype=np.float32),
+        "scales": scales.numpy().astype(np.float32),
+        "zeros":  np.full(scales.shape, zero_pt, dtype=np.float32),
         "shape":  [out_features, in_features],
     }
 
@@ -278,8 +234,7 @@ def quantize_model(
             continue
         layer_act = act_stats.get(name) if act_stats is not None else None
         meta[name] = _quantize_one_layer(layer, bits, layer_gs,
-                                         act_stats=layer_act,
-                                         cross_channel_K=2)
+                                         act_stats=layer_act)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
