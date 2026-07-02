@@ -88,3 +88,14 @@ VRAM risk: none (same memory profile)
 Expected win: KL very close to 3.36 (256 levels near-lossless for bf16 centroids)
 Outcome: KL 3.4775 — slight regression vs bf16 (3.36, +3.5%) but far better than 4-bit (7.23). The re-gather from Q8-perturbed centroids introduces minor extra error; recomputing assignments against dequantized codebook may close the gap.
 
+## exp-20260702-012
+
+Hypothesis: Per-layer groupsize (attn=32, mlp=64) already implemented by _get_layer_groupsize; explicit run to confirm it was active in exp-010
+Algorithm family: layer_policy
+Changed code: none (code already implements this via _get_layer_groupsize with groupsize=64)
+Representation change: none
+Storage risk: none (same 253.6 MB as exp-010)
+VRAM risk: none
+Expected win: same KL as exp-010 (~4.25)
+Outcome: KL=4.248302 — bit-identical to exp-010, confirming _get_layer_groupsize was already active. Per-layer groupsize alone does not beat uniform gs=32 (KL=3.04), and gs=32 everywhere exceeds 260 MB cap.
+
