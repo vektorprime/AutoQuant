@@ -447,13 +447,16 @@ git checkout -b exp/YYYYMMDD-<keyword>
 
 ### Claim protocol
 
-1. Generate a unique `EXP_ID`: `exp-$(date +%Y%m%d)-$(printf '%03d' $(wc -l < results.tsv))`
+1. Generate a unique `EXP_ID`:
+   `exp-$(date +%Y%m%d)-$(printf '%04x' $(( RANDOM * 65536 + RANDOM )) | head -c 4)`
 2. Read `experiments/in_progress.md` — if any claim is live, choose a different
    idea or wait 10s and pull again
 3. Write one line: `EXP_ID: <one-line idea description>`
 4. `git add experiments/in_progress.md && git commit -m "claim: EXP_ID"
    && git pull origin master && git push -u origin HEAD`
 5. If push fails (race), return to step 1
+6. **Do NOT start work** until `git pull origin master` confirms your claim
+   is visible on the remote
 
 ### Experiment protocol (no conflicts guaranteed)
 
@@ -466,8 +469,19 @@ git checkout -b exp/YYYYMMDD-<keyword>
 6. **Push results**: `git push`
 7. **Clear claim**: remove your line from in_progress.md, commit, push
 8. **Decide keep/revert** on YOUR branch — no impact on master
-9. **If global best**: open a PR or merge to master.  If regressed: no action
-   needed beyond recording.
+
+### Promoting to master
+
+Once your experiment finishes and you have the recorded result:
+
+- **If KL is the new global best** (lower than every row in master's results.tsv):
+  1. `git checkout master && git pull origin master`
+  2. `git merge --no-ff exp/YYYYMMDD-<keyword> -m "merge: <description> (KL=<value>)"`
+  3. `git push origin master`
+- **If KL is NOT the new global best**: do nothing — your branch records the
+  experiment history.  Master stays unchanged.
+
+Only one agent can merge to master at a time (push resolves the race).
 
 ### No-busy-wait variant
 
