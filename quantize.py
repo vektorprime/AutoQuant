@@ -105,6 +105,15 @@ def _quantize_one_layer(
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
+    did_sort = act_stats is not None
+    sort_idx = None
+    unsort_idx = None
+    if did_sort:
+        sort_idx = act_stats.argsort()
+        unsort_idx = sort_idx.argsort()
+        W = W[:, sort_idx]
+        act_stats = act_stats[sort_idx]
+
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
     codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
@@ -220,6 +229,9 @@ def _quantize_one_layer(
         W_q_full[:, start:end] = torch.gather(
             cb_deq[:, i, :], 1, codes[:, start:end].long(),
         )
+
+    if did_sort:
+        W_q_full = W_q_full[:, unsort_idx]
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
