@@ -133,6 +133,17 @@ Expected win: same KL as exp-010 (~4.25)
 Outcome: KL=4.248302 — bit-identical to exp-010, confirming _get_layer_groupsize was already active. Per-layer groupsize alone does not beat uniform gs=32 (KL=3.04), and gs=32 everywhere exceeds 260 MB cap.
 
 
+## exp-20260702-018
+
+Hypothesis: Re-assigning codes against Q8-dequantized centroids (instead of float centroids) fixes an inconsistency where stored codes use float-optimal assignments but stored codebooks are Q8-perturbed, reducing reconstruction error.
+Algorithm family: codebook_compression
+Changed code: _quantize_one_layer — replaced re-gather loop (lines 233-238) with re-assignment against cb_deq using activation-weighted L2 distance
+Representation change: none (same q8_codebook format)
+Storage risk: none
+VRAM risk: none
+Expected win: lower KL by making stored codes consistent with stored Q8 codebooks
+Outcome: KL massively improved (3.15 → 2.47, -21.6%) — NEW GLOBAL BEST, beats oracle (3.04 at gs=32)
+
 ## exp-20260702-017
 
 Hypothesis: Weighting K-means centroid updates by per-channel activation importance (h_g) makes codebooks prioritize accurate reconstruction of high-activation channels, reducing KL.
