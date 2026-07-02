@@ -233,9 +233,15 @@ def _quantize_one_layer(
     for i in range(n_groups):
         start = i * g
         end = start + g
-        W_q_full[:, start:end] = torch.gather(
-            cb_deq[:, i, :], 1, codes[:, start:end].long(),
-        )
+        cb_i = cb_deq[:, i, :]
+        W_g_orig = W_orig[:, start:end]
+        dists = (W_g_orig.unsqueeze(-1) - cb_i.unsqueeze(1)).pow(2)
+        if act_stats is not None:
+            h_g = act_stats[start:end]
+            dists = dists * h_g.unsqueeze(0).unsqueeze(-1)
+        new_codes = dists.argmin(dim=-1)
+        codes[:, start:end] = new_codes.to(torch.uint8)
+        W_q_full[:, start:end] = torch.gather(cb_i, 1, new_codes.long())
 
     bias = (W_orig - W_q_full).mean(dim=-1)
     W_q_full += bias.unsqueeze(-1)
