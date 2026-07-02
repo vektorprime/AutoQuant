@@ -132,3 +132,14 @@ VRAM risk: none
 Expected win: same KL as exp-010 (~4.25)
 Outcome: KL=4.248302 — bit-identical to exp-010, confirming _get_layer_groupsize was already active. Per-layer groupsize alone does not beat uniform gs=32 (KL=3.04), and gs=32 everywhere exceeds 260 MB cap.
 
+
+## exp-20260702-017
+
+Hypothesis: Weighting K-means centroid updates by per-channel activation importance (h_g) makes codebooks prioritize accurate reconstruction of high-activation channels, reducing KL.
+Algorithm family: activation_weighted
+Changed code: _quantize_one_layer — centroid update loop (lines 170-180) and distance sqrt
+Representation change: none
+Storage risk: none
+VRAM risk: none
+Expected win: lower KL — activation-weighted centroids focus on important channels
+Outcome: KL improved (3.46 → 3.15, -9.0%) — NEW GLOBAL BEST
