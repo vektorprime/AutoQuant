@@ -428,6 +428,61 @@ This prevents random-walk drift and ensures the search stays goal-oriented.
 
 ---
 
+## Concurrent agents
+
+When multiple agents work in parallel (each in their own workspace clone),
+they coordinate through a shared Git remote.  The rules below ensure zero
+conflict and zero wasted work.
+
+### Branch discipline
+
+**Each agent works on its own experiment branch.**  Never modify `master`
+directly.  Create a branch like `exp/20260702-layertype-diffusion` and do
+all work there.
+
+```bash
+git checkout master && git pull origin master
+git checkout -b exp/YYYYMMDD-<keyword>
+```
+
+### Claim protocol
+
+1. Generate a unique `EXP_ID`: `exp-$(date +%Y%m%d)-$(printf '%03d' $(wc -l < results.tsv))`
+2. Read `experiments/in_progress.md` — if any claim is live, choose a different
+   idea or wait 10s and pull again
+3. Write one line: `EXP_ID: <one-line idea description>`
+4. `git add experiments/in_progress.md && git commit -m "claim: EXP_ID"
+   && git pull origin master && git push -u origin HEAD`
+5. If push fails (race), return to step 1
+
+### Experiment protocol (no conflicts guaranteed)
+
+1. **Commit code**: `git add quantize.py && git commit -m "exp: <description>"`
+2. **Push code**: `git push`
+3. **Quantize + eval** (safe — no one else touches this branch)
+4. **Append results.tsv and idea_ledger.md**
+5. **Commit results**: `git add results.tsv experiments/idea_ledger.md runs/
+   && git commit -m "record: <description> (KL=<value>)"`
+6. **Push results**: `git push`
+7. **Clear claim**: remove your line from in_progress.md, commit, push
+8. **Decide keep/revert** on YOUR branch — no impact on master
+9. **If global best**: open a PR or merge to master.  If regressed: no action
+   needed beyond recording.
+
+### No-busy-wait variant
+
+If you don't want to wait for another agent to finish:
+
+- Skip the claim file entirely
+- Create your branch, run the experiment, merge results into master with
+  `git pull origin master && git merge --no-ff` only AFTER the other agent's
+  experiment has merged to master
+- Append to results.tsv on your branch, then merge to master
+
+The claim-file approach is preferred — it avoids duplicate experiments.
+
+---
+
 ## Operational notes
 
 - **Never use `pkill`.**  It hangs the session.  If a process needs to be killed,
