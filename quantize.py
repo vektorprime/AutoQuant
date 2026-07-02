@@ -31,6 +31,8 @@ VRAM_LIMIT_MB = 8192
 _NEVER_QUANTIZE = frozenset([
     "linear_attn.in_proj_a",
     "linear_attn.in_proj_b",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
 ])
 
 
