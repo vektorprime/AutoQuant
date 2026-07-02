@@ -33,6 +33,17 @@ VRAM risk: none
 Expected win: lower KL
 Outcome: KL regressed (5.91 vs 5.63 best, +4.9%)
 
+## exp-20260702-008
+
+Hypothesis: Quantizing the codebook values themselves to 4-bit (16 centroids per layer via uniform quantiles) reduces storage from 8 bytes/group to 2 bytes/group while preserving most of the codebook's expressiveness
+Algorithm family: codebook_compression
+Changed code: _quantize_one_layer — added _quantize_codebook_values post-processing; _save_compressed — new format for codebook_indices + codebook_table
+Representation change: codebook values quantized to 4-bit (16 per-layer centroids, packed uint16 indices per group)
+Storage risk: -187 MB (430→243), target met at 253.6 MB
+VRAM risk: none (same memory profile)
+Expected win: similar KL to full codebook (3.36) with much lower storage
+Outcome: KL massively regressed (7.23 vs 3.36 best, +115%) — 4-bit codebook quantization destroys the expressiveness gained from k-means
+
 ## exp-20260702-007
 
 Hypothesis: Learning explicit per-group 4-value codebooks via k-means gives more expressive quantization levels than the hardcoded {-2s, -s, 0, s} formula, reducing reconstruction error
