@@ -34,6 +34,13 @@ _NEVER_QUANTIZE = frozenset([
 ])
 
 
+def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
+    attn_keywords = ("q_proj", "k_proj", "v_proj", "o_proj", "lm_head")
+    if any(kw in name for kw in attn_keywords):
+        return max(16, default_groupsize // 2)
+    return default_groupsize
+
+
 # ---------------------------------------------------------------------------
 # Activation statistics collection (calibration data)
 # ---------------------------------------------------------------------------
@@ -217,15 +224,16 @@ def quantize_model(
 
     skipped_small = 0
     for name, layer in tqdm(layers, desc="Quantizing"):
-        if groupsize != -1 and layer.weight.shape[1] % groupsize != 0:
+        layer_gs = _get_layer_groupsize(name, groupsize)
+        if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
             logger.warning("Skipping %s: in_features %d not divisible by %d",
-                           name, layer.weight.shape[1], groupsize)
+                           name, layer.weight.shape[1], layer_gs)
             continue
         if any(pattern in name for pattern in _NEVER_QUANTIZE):
             skipped_small += 1
             continue
         layer_act = act_stats.get(name) if act_stats is not None else None
-        meta[name] = _quantize_one_layer(layer, bits, groupsize,
+        meta[name] = _quantize_one_layer(layer, bits, layer_gs,
                                          act_stats=layer_act)
 
     if save_compressed_dir:
