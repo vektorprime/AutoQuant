@@ -88,42 +88,6 @@ def _collect_input_stats(
 
 
 # ---------------------------------------------------------------------------
-# Codebook value quantization (compress codebook itself to 4-bit)
-# ---------------------------------------------------------------------------
-
-def _quantize_codebook_values(
-    codebooks: torch.Tensor,
-    n_centroids: int = 16,
-) -> dict:
-    out, n_groups, n_vals = codebooks.shape
-    cb_flat = codebooks.float().reshape(-1)
-
-    sorted_vals, _ = torch.sort(cb_flat)
-    n_total = sorted_vals.numel()
-    q_indices = torch.linspace(0, n_total - 1, n_centroids,
-                               device=cb_flat.device)
-    q_indices = q_indices.round().long().clamp(0, n_total - 1)
-    centroids = sorted_vals[q_indices]
-
-    dists = (cb_flat.unsqueeze(-1) - centroids.unsqueeze(0)).abs()
-    assignments = dists.argmin(dim=-1)
-
-    cb_dequant = centroids[assignments].reshape(out, n_groups, n_vals)
-
-    idx = assignments.reshape(out, n_groups, n_vals)
-    packed = (idx[:, :, 0].to(torch.int32)
-              | (idx[:, :, 1].to(torch.int32) << 4)
-              | (idx[:, :, 2].to(torch.int32) << 8)
-              | (idx[:, :, 3].to(torch.int32) << 12))
-
-    return {
-        "table": centroids.float(),
-        "packed_indices": packed,
-        "cb_dequant": cb_dequant,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Per-layer 2-bit symmetric quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
 
@@ -143,6 +107,7 @@ def _quantize_one_layer(
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
     codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
+    W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
         start = i * g
@@ -189,6 +154,7 @@ def _quantize_one_layer(
         error = W_g - W_q
         codes[:, start:end] = q_idx.to(torch.uint8)
         codebooks[:, i, :] = cb.to(torch.bfloat16)
+        W_q_full[:, start:end] = W_q
 
         if i + 1 < n_groups:
             ns = (i + 1) * g
@@ -202,25 +168,14 @@ def _quantize_one_layer(
             else:
                 W[:, ns:ne] += diffusion * error
 
-    cb_result = _quantize_codebook_values(codebooks, n_centroids=16)
-    cb_dequant = cb_result["cb_dequant"]
-
-    codes_long = codes.long()
-    codes_rs = codes_long.reshape(out_features, n_groups, g)
-    codes_rs = codes_rs.reshape(out_features * n_groups, g)
-    cb_dq = cb_dequant.reshape(out_features * n_groups, 4)
-    W_q = torch.gather(cb_dq, 1, codes_rs)
-    W_q_full = W_q.reshape(out_features, in_features)
-
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":            codes.numpy(),
-        "codebook_indices": cb_result["packed_indices"].cpu().numpy().astype(np.uint16),
-        "codebook_table":   cb_result["table"].cpu().numpy().astype(np.float32),
-        "codebook_format":  "quantized_4bit",
-        "shape":            [out_features, in_features],
-        "n_groups":         n_groups,
+        "codes":     codes.numpy(),
+        "codebook":  codebooks.view(torch.int16).numpy(),
+        "codebook_dtype": "bfloat16_4codebook",
+        "shape":     [out_features, in_features],
+        "n_groups":  n_groups,
     }
 
 
@@ -263,13 +218,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
             codes_out = _pack_2bit(data["codes"])
         else:
             codes_out = data["codes"]
-        if "codebook_table" in data:
-            np.savez(fname,
-                     codes=codes_out,
-                     codebook_indices=data["codebook_indices"],
-                     codebook_table=data["codebook_table"],
-                     codebook_format=data["codebook_format"])
-        elif "codebook" in data:
+        if "codebook" in data:
             np.savez(fname,
                      codes=codes_out,
                      codebook=data["codebook"],
