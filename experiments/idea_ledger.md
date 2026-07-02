@@ -110,6 +110,17 @@ VRAM risk: none (sort indices are tiny per-layer)
 Expected win: KL from 3.78 toward 3.5 by making groups more homogeneous
 Outcome: KL 3.5352 (-6.4% vs 3.78) — NEW GLOBAL BEST under 260 MB cap. Channel reordering makes K-means groups more homogeneous, allowing centroids to better capture weight distributions at gs=64 granularity.
 
+## exp-20260702-016
+
+Hypothesis: After K-means quantization with non-symmetric centroids, the per-channel quantization error has a DC bias. Subtracting `mean(W_orig - W_q, dim=-1)` from the dequantized weights removes systematic per-channel shift and improves reconstruction.
+Algorithm family: codebook
+Changed code: _quantize_one_layer — clone W_orig before loop, add per-channel bias correction after Q8 re-gather
+Representation change: none (bias baked into dequantized weights, zero extra storage)
+Storage risk: none
+VRAM risk: +1 float32 clone per layer temporarily (max ~1.2 GB for lm_head)
+Expected win: lower KL by removing systematic per-channel quantization bias
+Outcome: KL improved (3.4614 vs 3.5352 best, -2.1%) — NEW GLOBAL BEST under 260 MB cap
+
 ## exp-20260702-012
 
 Hypothesis: Per-layer groupsize (attn=32, mlp=64) already implemented by _get_layer_groupsize; explicit run to confirm it was active in exp-010
