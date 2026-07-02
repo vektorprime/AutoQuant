@@ -1,1 +1,2 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+2026-07-02T02:35:00	exp-20260702-001	33a43c7f24d520c9e21e3d7c7b0252d001e885ef	804afbe06c3ec1726f70ce6b37d2248d6e76b3f7	q2_k baseline gs=32 (0.8B)	success	6.018622	2	32	true	q2_k	1024	5000	254	2090.8	172.2
