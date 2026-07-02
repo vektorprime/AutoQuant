@@ -145,8 +145,8 @@ def _quantize_one_layer(
 
     return {
         "codes":  codes.numpy(),
-        "scales": scales.numpy().astype(np.float16),
-        "zero_pt": zero_pt,
+        "scales": scales.numpy().astype(np.float32),
+        "zeros":  np.full(scales.shape, zero_pt, dtype=np.float32),
         "shape":  [out_features, in_features],
     }
 
@@ -181,7 +181,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
         np.savez(fname,
                  codes=codes_out,
                  scales=data["scales"],
-                 zero_pt=data["zero_pt"])
+                 zeros=data["zeros"])
         total_bytes += os.path.getsize(fname)
         layer_info[name] = data["shape"]
 
