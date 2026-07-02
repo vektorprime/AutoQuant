@@ -97,7 +97,7 @@ def _quantize_one_layer(
     groupsize: int,
     act_stats: torch.Tensor | None = None,
 ) -> dict:
-    W = layer.weight.data.float()                  # CPU float32
+    W = layer.weight.data.float()
     out_features, in_features = W.shape
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
@@ -105,19 +105,22 @@ def _quantize_one_layer(
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
     diffusion = 0.5
 
-    codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    scales = torch.zeros(out_features, n_groups)
-    W_q_full = torch.zeros(out_features, in_features)
+    codes = torch.zeros(out_features, in_features, dtype=torch.uint8, device=W.device)
+    scales = torch.zeros(out_features, n_groups, device=W.device)
+    W_q_full = torch.zeros(out_features, in_features, device=W.device)
+
+    if act_stats is not None:
+        act_stats = act_stats.to(W.device)
 
     for i in range(n_groups):
         start = i * g
         end = start + g
         W_g = W[:, start:end]                      # view
 
-        xmax = torch.quantile(W_g.abs(), q=0.99, dim=1)
-        xmax = torch.maximum(xmax, torch.tensor(1e-8, device=xmax.device))
+        xmax = torch.maximum(W_g.amin(dim=-1).abs(),
+                             W_g.amax(dim=-1))
+        xmax = torch.clamp(xmax, min=1e-8)
         scale = xmax / (maxq / 2)
-        scale[scale == 0] = 1.0
 
         for _ in range(3):
             q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
@@ -130,9 +133,9 @@ def _quantize_one_layer(
             else:
                 num = (W_g * q_centered).sum(dim=-1)
                 den = (q_centered * q_centered).sum(dim=-1)
-            den[den == 0] = 1.0
+            den = torch.clamp(den, min=1e-8)
             scale = num / den
-            scale[scale <= 0] = 1.0
+            scale = torch.clamp(scale, min=1e-8)
 
         q = torch.clamp(torch.round(W_g / scale.unsqueeze(-1)) + zero_pt,
                         0, maxq)
@@ -146,20 +149,13 @@ def _quantize_one_layer(
         if i + 1 < n_groups:
             ns = (i + 1) * g
             ne = ns + g
-            if act_stats is not None:
-                h_next = act_stats[ns:ne]
-                eps_w = (1.0 / h_next.clamp(min=1e-8))
-                eps_w = eps_w / eps_w.mean()
-                eps_w = eps_w.clamp(max=3.0)
-                W[:, ns:ne] += diffusion * error * eps_w
-            else:
-                W[:, ns:ne] += diffusion * error
+            W[:, ns:ne] += diffusion * error
 
     layer.weight.data = W_q_full.to(layer.weight.dtype)
 
     return {
-        "codes":  codes.numpy(),
-        "scales": scales.to(torch.bfloat16).view(torch.int16).numpy(),
+        "codes":  codes.cpu().numpy(),
+        "scales": scales.to(torch.bfloat16).cpu().view(torch.int16).numpy(),
         "scale_dtype": "bfloat16",
         "zero_pt": zero_pt,
         "shape":  [out_features, in_features],
@@ -236,8 +232,7 @@ def quantize_model(
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
 ) -> dict:
-    model.eval()
-    model.cpu()                                     # everything happens on CPU
+    model.eval()                                    # keep on GPU if already there
     meta: dict = {}
 
     layers = [(n, m) for n, m in model.named_modules()
@@ -284,6 +279,8 @@ def parse_args():
                         help="Precision for loading the base model")
     parser.add_argument("--save", default=None,
                         help="Directory to save quantized model")
+    parser.add_argument("--calibration-cache", default=None,
+                        help="Path to cache/load calibration stats (.npz file)")
     return parser.parse_args()
 
 
@@ -304,13 +301,23 @@ def main():
     )
 
     act_stats = None
-    if torch.cuda.is_available():
+    if args.calibration_cache and os.path.exists(args.calibration_cache):
+        logger.info("Loading cached calibration stats: %s", args.calibration_cache)
+        cached = np.load(args.calibration_cache, allow_pickle=True)
+        act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
+        model.to("cuda")
+    elif torch.cuda.is_available():
         logger.info("Collecting calibration activation stats on GPU")
         torch.cuda.reset_peak_memory_stats()
         model.to("cuda")
         act_stats = _collect_input_stats(model, args.model,
                                          nsamples=16, seqlen=1024)
         logger.info("Collected stats for %d layers", len(act_stats))
+        if args.calibration_cache and act_stats:
+            os.makedirs(os.path.dirname(args.calibration_cache) or ".", exist_ok=True)
+            np.savez(args.calibration_cache,
+                     **{k: v.numpy() for k, v in act_stats.items()})
+            logger.info("Cached calibration stats to %s", args.calibration_cache)
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
