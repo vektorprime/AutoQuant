@@ -97,14 +97,12 @@ def _quantize_one_layer(
     groupsize: int,
     act_stats: torch.Tensor | None = None,
     diffusion: float = 0.5,
-    num_entries: int = 4,
 ) -> dict:
     W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
     maxq = MAXQ[bits]
-    codebook_maxq = num_entries - 1
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
     did_sort = act_stats is not None
@@ -119,7 +117,7 @@ def _quantize_one_layer(
     W_orig = W.clone()
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    codebooks = torch.zeros(out_features, n_groups, num_entries, dtype=torch.bfloat16)
+    codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
@@ -148,8 +146,7 @@ def _quantize_one_layer(
             scale[scale <= 0] = 1.0
 
         W_g_sorted = W_g.sort(dim=-1).values
-        quantile_idxs = [int(g * j / (num_entries - 1)) for j in range(num_entries)]
-        quantile_idxs[-1] = g - 1
+        quantile_idxs = [0, g // 3, 2 * g // 3, g - 1]
         cb_init = W_g_sorted[:, quantile_idxs]
 
         h_g = act_stats[start:end] if act_stats is not None else None
@@ -170,7 +167,7 @@ def _quantize_one_layer(
                 if h_g is not None:
                     dists = (dists * h_g.unsqueeze(0).unsqueeze(-1)).sqrt()
                 assign = dists.argmin(dim=-1)
-                for j in range(num_entries):
+                for j in range(4):
                     mask_j = (assign == j).float()
                     if h_g is not None:
                         weighted_W = W_g * h_g.unsqueeze(0)
@@ -231,7 +228,7 @@ def _quantize_one_layer(
             0, 255,
         ).to(torch.uint8)
         cb_deq_flat = cb_min + cb_q.float() * (range_val / 255.0)
-    cb_deq = cb_deq_flat.reshape(out_features, n_groups, num_entries).to(torch.bfloat16)
+    cb_deq = cb_deq_flat.reshape(out_features, n_groups, 4).to(torch.bfloat16)
 
     for i in range(n_groups):
         start = i * g
@@ -262,7 +259,6 @@ def _quantize_one_layer(
         "codebook_dtype": "q8_codebook",
         "shape":     [out_features, in_features],
         "n_groups":  n_groups,
-        "num_entries": num_entries,
     }
 
 
@@ -282,25 +278,6 @@ def _pack_2bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
-def _pack_3bit(codes: np.ndarray) -> np.ndarray:
-    """Pack 8 × 3-bit values into 3 uint8 bytes."""
-    out, inp = codes.shape
-    assert inp % 8 == 0
-    codes = codes.astype(np.uint8).reshape(out, inp // 8, 8)
-    b0 = (codes[..., 0] & 0x07) \
-        | ((codes[..., 1] & 0x07) << 3) \
-        | ((codes[..., 2] & 0x03) << 6)
-    b1 = ((codes[..., 2] >> 2) & 0x01) \
-        | ((codes[..., 3] & 0x07) << 1) \
-        | ((codes[..., 4] & 0x07) << 4) \
-        | ((codes[..., 5] & 0x01) << 7)
-    b2 = ((codes[..., 5] >> 1) & 0x03) \
-        | ((codes[..., 6] & 0x07) << 2) \
-        | ((codes[..., 7] & 0x07) << 5)
-    packed = np.stack([b0, b1, b2], axis=-1)
-    return packed.reshape(out, -1).astype(np.uint8)
-
-
 def _pack_4bit(codes: np.ndarray) -> np.ndarray:
     """Pack 2 × 4-bit values into one uint8."""
     out, inp = codes.shape
@@ -318,10 +295,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
     for name, data in tqdm(meta.items(), desc="Saving compressed"):
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
-        ne = data.get("num_entries", 4)
-        if ne == 5:
-            codes_out = _pack_3bit(data["codes"])
-        elif bits == 4 and data["shape"][1] % 2 == 0:
+        if bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
         elif bits == 2 and data["shape"][1] % 4 == 0:
             codes_out = _pack_2bit(data["codes"])
@@ -389,19 +363,17 @@ def quantize_model(
             skipped_small += 1
             continue
         layer_act = act_stats.get(name) if act_stats is not None else None
-        if any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj", "lm_head")):
+        if "lm_head" in name:
+            layer_diffusion = 0.1
+        elif any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
             layer_diffusion = 0.7
-            layer_entries = 5
         elif any(kw in name for kw in ("gate_proj", "up_proj", "down_proj")):
             layer_diffusion = 0.3
-            layer_entries = 4
         else:
             layer_diffusion = 0.5
-            layer_entries = 4
         meta[name] = _quantize_one_layer(layer, bits, layer_gs,
-                                          act_stats=layer_act,
-                                          diffusion=layer_diffusion,
-                                          num_entries=layer_entries)
+                                         act_stats=layer_act,
+                                         diffusion=layer_diffusion)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
