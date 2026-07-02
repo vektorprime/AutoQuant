@@ -248,3 +248,34 @@ KL regressed (5.24 -> 5.72). Sharing scales across output channels loses more
 per-output-channel fidelity than the finer groupsize gains. Adjacent output
 channels have different magnitude ranges; forcing a single scale hurts.
 
+## exp-20260702-014
+
+Hypothesis:
+Starting scale refinement from a no-clipping initialization (s = max(amax, |amin|/2))
+gives the MSE optimizer a better starting point than maxabs/1.5. Combined with 5
+refinement iterations (up from 3), this should converge to better per-group scales.
+
+Algorithm family:
+scale_optimization
+
+Changed code:
+_quantize_one_layer — initial scale computation + iteration count
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk:
+none (no extra metadata)
+
+VRAM risk:
+none (same compute pattern)
+
+Expected win:
+lower KL from better-converged scales
+
+Outcome:
+KL regressed (5.24 -> 5.29). The no-clipping initialization produces larger initial
+scales that push moderate weights to q_centered=0, starving them from the scale
+refinement. 5 iterations insufficient to escape this. The maxabs/1.5 initialization
+with 3 iterations strikes a better balance.
+
