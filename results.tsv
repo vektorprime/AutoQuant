@@ -15,3 +15,4 @@ timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	bits	group
 2026-07-02T01:05:06	exp-20260702-014	fcd071cd948cc1b91ea33e042c1fde5b5d7ba632	017fd75a8fe46a653c1937f186d380535f42aa06	no-clip init scale + 5 refinement iterations	success	5.292346	2	32	true	q2_k	1024	5000	1040	4342.5	169.8
 2026-07-02T01:15:24	exp-20260702-015	5d864de0314c619ccb4995e773aaf38002db15b1	f0f77456ca5f93dbca6adc69b66c344ff9b85132	activation-weighted error diffusion	success	4.822302	2	32	true	q2_k	1024	5000	1040	4342.5	171.3
 2026-07-02T01:29:00	exp-20260702-016	390ebae574f6a8b273e95b9aef9757578c05ce80	69d5ba5f2f41bca9dc6737499fd0d6a08b5a9442	10 scale refinement iterations (3->10)	success	4.852446	2	32	true	q2_k	1024	5000	1040	4342.5	170.0
+2026-07-02T01:36:41	exp-20260702-017	bd2826f24efacfe8dc6e5c237edc70d231d9ab06	82cd78becb0ac7a711bcd04a98f515068ab41a4a	soften error-diffusion weighting from 1/h to 1/sqrt(h)	success	5.250788	2	32	true	q2_k	1024	5000	1040	4342.5	171.1

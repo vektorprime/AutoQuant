@@ -327,3 +327,29 @@ VRAM risk: none (same compute pattern, no extra allocations)
 Expected win: lower KL from better-converged per-group scales
 
 Outcome: KL regressed (4.82 -> 4.85). 3 iterations already achieves near-optimal convergence for the activation-weighted least-squares scale update. Additional iterations overfit scale to specific quantized codes without meaningfully improving the minimizer.
+
+## exp-20260702-017
+
+Hypothesis:
+Softening error-diffusion weighting from 1/h to 1/sqrt(h) provides a less extreme trade-off between protecting high-importance channels and compensating low-importance ones, preventing over-amplification of noise in low-h channels.
+
+Algorithm family:
+activation_weighted
+
+Changed code:
+_quantize_one_layer — changed eps_w from 1/h to 1/sqrt(h)
+
+Representation change:
+none (still 2-bit symmetric {-2s, -s, 0, s})
+
+Storage risk:
+none (no extra metadata)
+
+VRAM risk:
+none (same compute pattern)
+
+Expected win:
+lower KL from softer error protection trade-off
+
+Outcome:
+KL regressed (4.82 -> 5.25). The strong 1/h inverse weighting is necessary to route quantization residuals away from high-importance channels. Softening to 1/sqrt(h) leaks more error into important channels, increasing downstream distortion.
