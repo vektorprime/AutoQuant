@@ -148,7 +148,7 @@ def _quantize_one_layer(
             ne = ns + g
             if act_stats is not None:
                 h_next = act_stats[ns:ne]
-                eps_w = (1.0 / h_next.clamp(min=1e-8).sqrt())
+                eps_w = (1.0 / h_next.clamp(min=1e-8))
                 eps_w = eps_w / eps_w.mean()
                 eps_w = eps_w.clamp(max=3.0)
                 W[:, ns:ne] += diffusion * error * eps_w
