@@ -96,6 +96,7 @@ def _quantize_one_layer(
     bits: int,
     groupsize: int,
     act_stats: torch.Tensor | None = None,
+    diffusion: float = 0.5,
 ) -> dict:
     W = layer.weight.data.float()                  # CPU float32
     out_features, in_features = W.shape
@@ -103,7 +104,6 @@ def _quantize_one_layer(
     n_groups = in_features // g
     maxq = MAXQ[bits]
     zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
-    diffusion = 0.5
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
     scales = torch.zeros(out_features, n_groups)
@@ -254,8 +254,17 @@ def quantize_model(
             skipped_small += 1
             continue
         layer_act = act_stats.get(name) if act_stats is not None else None
+        if "lm_head" in name:
+            layer_diffusion = 0.1
+        elif any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
+            layer_diffusion = 0.7
+        elif any(kw in name for kw in ("gate_proj", "up_proj", "down_proj")):
+            layer_diffusion = 0.3
+        else:
+            layer_diffusion = 0.5
         meta[name] = _quantize_one_layer(layer, bits, layer_gs,
-                                         act_stats=layer_act)
+                                         act_stats=layer_act,
+                                         diffusion=layer_diffusion)
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits)
