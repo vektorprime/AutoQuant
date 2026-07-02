@@ -134,26 +134,57 @@ def _quantize_one_layer(
             scale = num / den
             scale[scale <= 0] = 1.0
 
-        cb = scale.unsqueeze(-1) * torch.tensor(
-            [-2.0, -1.0, 0.0, 1.0], device=W_g.device, dtype=W_g.dtype
-        )
+        W_g_sorted = W_g.sort(dim=-1).values
+        quantile_idxs = [0, g // 3, 2 * g // 3, g - 1]
+        cb_init = W_g_sorted[:, quantile_idxs]
 
-        for _ in range(5):
-            dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
-            assign = dists.argmin(dim=-1)
-            for j in range(4):
-                mask_j = (assign == j).float()
-                summed = (W_g * mask_j).sum(dim=-1)
-                count = mask_j.sum(dim=-1).clamp(min=1)
-                cb[:, j] = summed / count
+        h_g = act_stats[start:end] if act_stats is not None else None
 
-        dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).abs()
+        best_err = None
+        best_cb = None
+
+        for trial in range(3):
+            if trial == 0:
+                cb = cb_init.clone()
+            else:
+                cb_std = cb_init.std(dim=-1, keepdim=True).clamp(min=1e-8)
+                cb_noise = torch.randn_like(cb_init) * cb_std * 0.05
+                cb = cb_init + cb_noise
+
+            for _ in range(20):
+                dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).pow(2)
+                if h_g is not None:
+                    dists = dists * h_g.unsqueeze(0).unsqueeze(-1)
+                assign = dists.argmin(dim=-1)
+                for j in range(4):
+                    mask_j = (assign == j).float()
+                    summed = (W_g * mask_j).sum(dim=-1)
+                    count = mask_j.sum(dim=-1).clamp(min=1)
+                    cb[:, j] = summed / count
+
+            final_dists = (W_g.unsqueeze(-1) - cb.unsqueeze(1)).pow(2)
+            if h_g is not None:
+                final_dists = final_dists * h_g.unsqueeze(0).unsqueeze(-1)
+            trial_err = final_dists.min(dim=-1).values.sum(dim=-1)
+
+            if best_err is None:
+                best_err = trial_err
+                best_cb = cb.clone()
+            else:
+                better = trial_err < best_err
+                if better.any():
+                    best_err[better] = trial_err[better]
+                    best_cb[better] = cb[better]
+
+        dists = (W_g.unsqueeze(-1) - best_cb.unsqueeze(1)).pow(2)
+        if h_g is not None:
+            dists = dists * h_g.unsqueeze(0).unsqueeze(-1)
         q_idx = dists.argmin(dim=-1)
-        W_q = torch.gather(cb, 1, q_idx)
+        W_q = torch.gather(best_cb, 1, q_idx)
 
         error = W_g - W_q
         codes[:, start:end] = q_idx.to(torch.uint8)
-        codebooks[:, i, :] = cb.to(torch.bfloat16)
+        codebooks[:, i, :] = best_cb.to(torch.bfloat16)
         W_q_full[:, start:end] = W_q
 
         if i + 1 < n_groups:
