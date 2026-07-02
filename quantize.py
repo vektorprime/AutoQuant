@@ -284,6 +284,8 @@ def parse_args():
                         help="Precision for loading the base model")
     parser.add_argument("--save", default=None,
                         help="Directory to save quantized model")
+    parser.add_argument("--calibration-cache", default=None,
+                        help="Path to cache/load calibration stats (.npz file)")
     return parser.parse_args()
 
 
@@ -304,13 +306,22 @@ def main():
     )
 
     act_stats = None
-    if torch.cuda.is_available():
+    if args.calibration_cache and os.path.exists(args.calibration_cache):
+        logger.info("Loading cached calibration stats: %s", args.calibration_cache)
+        cached = np.load(args.calibration_cache, allow_pickle=True)
+        act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
+    elif torch.cuda.is_available():
         logger.info("Collecting calibration activation stats on GPU")
         torch.cuda.reset_peak_memory_stats()
         model.to("cuda")
         act_stats = _collect_input_stats(model, args.model,
                                          nsamples=16, seqlen=1024)
         logger.info("Collected stats for %d layers", len(act_stats))
+        if args.calibration_cache and act_stats:
+            os.makedirs(os.path.dirname(args.calibration_cache) or ".", exist_ok=True)
+            np.savez(args.calibration_cache,
+                     **{k: v.numpy() for k, v in act_stats.items()})
+            logger.info("Cached calibration stats to %s", args.calibration_cache)
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
