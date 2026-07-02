@@ -99,6 +99,17 @@ VRAM risk: none (same memory profile)
 Expected win: KL very close to 3.36 (256 levels near-lossless for bf16 centroids)
 Outcome: KL 3.4775 — slight regression vs bf16 (3.36, +3.5%) but far better than 4-bit (7.23). The re-gather from Q8-perturbed centroids introduces minor extra error; recomputing assignments against dequantized codebook may close the gap.
 
+## exp-20260702-014
+
+Hypothesis: Sorting input channels by activation importance before grouping creates more homogeneous groups, enabling K-means centroids to better represent weight distributions and reducing reconstruction error
+Algorithm family: activation_weighted
+Changed code: _quantize_one_layer — sort W columns + act_stats by activation importance at start, unsort W_q_full before saving
+Representation change: none (same Q8 codebook format, same storage)
+Storage risk: none
+VRAM risk: none (sort indices are tiny per-layer)
+Expected win: KL from 3.78 toward 3.5 by making groups more homogeneous
+Outcome: KL 3.5352 (-6.4% vs 3.78) — NEW GLOBAL BEST under 260 MB cap. Channel reordering makes K-means groups more homogeneous, allowing centroids to better capture weight distributions at gs=64 granularity.
+
 ## exp-20260702-012
 
 Hypothesis: Per-layer groupsize (attn=32, mlp=64) already implemented by _get_layer_groupsize; explicit run to confirm it was active in exp-010
