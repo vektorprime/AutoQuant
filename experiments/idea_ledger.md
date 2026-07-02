@@ -77,6 +77,17 @@ VRAM risk: none
 Expected win: fits cap; KL slightly higher due to coarser groups
 Outcome: KL=4.25 (fits 253.6 MB under 260 MB cap; first valid Q8 codebook result under cap)
 
+## exp-20260702-013
+
+Hypothesis: Better K-means codebook quality (quantile init, 3 trials × 20 iters, activation-weighted L2 distance, multi-seed) improves reconstruction enough to partially compensate for coarser gs=64 groups, bringing KL closer to gs=32 quality
+Algorithm family: codebook
+Changed code: _quantize_one_layer — replaced L1 symmetric-init 5-iter K-means with quantile-init 3-trial × 20-iter activation-weighted L2 K-means
+Representation change: none (same Q8 codebook format)
+Storage risk: none
+VRAM risk: none
+Expected win: KL from 4.25 toward 3.5 at gs=64
+Outcome: KL improved (3.78 vs 4.25, -11.1%) — NEW GLOBAL BEST under 260 MB cap
+
 ## exp-20260702-009
 
 Hypothesis: Quantizing codebook values to Q8 (per-layer min/max + uint8 centroids) reduces storage from 430→305 MB while preserving near-lossless fidelity (256 levels vs 16 for 4-bit)
