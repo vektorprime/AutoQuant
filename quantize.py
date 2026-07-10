@@ -254,13 +254,32 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
     delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
 
+    # Inter-channel quants delta compression: Kq=2, store ref + 2-bit deltas
+    Kq = 2
+    out_pad_q = ((out_features + Kq - 1) // Kq) * Kq
+    quants_np = quants_flat.numpy()
+    if out_features < out_pad_q:
+        q_pad = np.pad(quants_np, ((0, out_pad_q - out_features), (0, 0)), mode='constant', constant_values=0)
+    else:
+        q_pad = quants_np
+    q_ref = q_pad[0::2][:((out_pad_q + 1) // 2)]
+    q_tgt = q_pad[1::2][:((out_pad_q + 1) // 2)]
+    if q_ref.shape[0] < q_tgt.shape[0]:
+        q_ref = q_ref[:q_tgt.shape[0]]
+    elif q_tgt.shape[0] < q_ref.shape[0]:
+        q_tgt = q_tgt[:q_ref.shape[0]]
+    quants_delta_packed = _pack_quants_delta(q_ref, q_tgt)
+    quants_ref_packed = _pack_4bit(q_ref)
+
     return {
         "base_packed":    base_packed,
         "delta_packed":   delta_packed,
         "scales_mins_shared": shared_sc,
         "mins_shared":    shared_m,
         "delta_sm":       delta_sm_packed,
-        "quants":         quants_flat.numpy(),
+        "quants_ref":     quants_ref_packed,
+        "quants_delta":   quants_delta_packed,
+        "Kq":             Kq,
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
@@ -487,6 +506,21 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray) -> np.ndarray:
+    """Pack 256 × 2-bit signed deltas (-1,0,1,2) into 64 bytes."""
+    out, inp = ref_quants.shape
+    n_blocks = inp // QK_K
+    ref_sb = ref_quants.reshape(out, n_blocks, QK_K)
+    tgt_sb = tgt_quants.reshape(out, n_blocks, QK_K)
+    delta = tgt_sb.astype(np.int16) - ref_sb.astype(np.int16)
+    delta = np.clip(delta + 1, 0, 3).astype(np.uint8)
+    packed = np.zeros((out, n_blocks, 64), dtype=np.uint8)
+    for o in range(out):
+        for b in range(n_blocks):
+            packed[o, b] = _pack_2bit(delta[o, b].reshape(1, 256)).reshape(64)
+    return packed
+
+
 def _pack_q4k_sm_joint(shared_sc: np.ndarray, shared_m: np.ndarray) -> np.ndarray:
     """Pack 8 × (5+5 bit joint scale+min) = 80 bits → 10 bytes per superblock."""
     ng, nb, nsub = shared_sc.shape
@@ -544,8 +578,13 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
         if data.get("format") == "q4_k":
-            quants = data["quants"]
-            q_out = _pack_4bit(quants)
+            if "quants_ref" in data:
+                q_out = data["quants_ref"]
+                q_delta = data["quants_delta"]
+            else:
+                quants = data["quants"]
+                q_out = _pack_4bit(quants)
+                q_delta = None
             if "scales_mins_shared" in data:
                 sm_packed = _pack_q4k_sm_joint(data["scales_mins_shared"], data["mins_shared"])
             else:
@@ -558,6 +597,9 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     K=data.get("K", 4),
                     scales_mins_packed=sm_packed,
                     format=data["format"])
+                if q_delta is not None:
+                    save_kw["quants_delta"] = q_delta
+                    save_kw["Kq"] = data.get("Kq", 2)
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
