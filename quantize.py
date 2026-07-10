@@ -9,6 +9,7 @@ CPU-based, vectorised quantization.  No GPU sync per layer.
 import argparse
 import json
 import logging
+import math
 import os
 
 import numpy as np
@@ -163,53 +164,55 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     }
 
 
-def _pack_delta_codes(sc_6bit: np.ndarray, quants_flat: np.ndarray, n_blocks: int) -> dict:
-    out = sc_6bit.shape[0]
-    q = quants_flat.reshape(out, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE).astype(np.int32)
-    deltas = q[..., 1:] - q[..., :-1]
-    max_d = np.abs(deltas).max(axis=-1)
-    use_delta = (max_d <= 3)
-    delta_codes = np.zeros((out, n_blocks, QK_K_SUB_BLOCKS, 13), dtype=np.uint8)
-    full_codes = np.zeros((out, n_blocks, QK_K_SUB_BLOCKS, 8), dtype=np.uint8)
-    for b in range(n_blocks):
-        for s in range(QK_K_SUB_BLOCKS):
-            for o in range(out):
-                if use_delta[o, b, s]:
-                    dvals = deltas[o, b, s, :].astype(np.int32) + 3
-                    start = q[o, b, s, 0]
-                    bits = int(start) & 0xF
-                    for t in range(31):
-                        bits |= (int(dvals[t]) & 0x7) << (4 + t * 3)
-                    packed = np.array([
-                        (bits >> 0) & 0xFF, (bits >> 8) & 0xFF,
-                        (bits >> 16) & 0xFF, (bits >> 24) & 0xFF,
-                        (bits >> 32) & 0xFF, (bits >> 40) & 0xFF,
-                        (bits >> 48) & 0xFF, (bits >> 56) & 0xFF,
-                        (bits >> 64) & 0xFF, (bits >> 72) & 0xFF,
-                        (bits >> 80) & 0xFF, (bits >> 88) & 0xFF,
-                        (bits >> 96) & 0xFF,
-                    ], dtype=np.uint8)
-                    delta_codes[o, b, s] = packed[:13]
-                else:
-                    fv = q[o, b, s].astype(np.uint8)
-                    packed = np.zeros(8, dtype=np.uint8)
-                    for t in range(0, 32, 2):
-                        packed[t // 2] = fv[t] | (fv[t + 1] << 4)
-                    full_codes[o, b, s] = packed
-    delta_mask = np.packbits(use_delta.reshape(-1), bitorder='little')
-    use_delta_flat = use_delta.reshape(-1)
-    return {"delta_mask": delta_mask, "delta_codes": delta_codes,
-            "full_codes": full_codes, "use_delta": use_delta_flat,
-            "n_delta": int(use_delta.sum()),
-            "format": "q4_k_delta"}
+def _next_power_of_2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
 
 
-def _quantize_one_layer_q4k_delta(layer: nn.Linear) -> dict:
+def _fwht(x: torch.Tensor) -> torch.Tensor:
+    n = x.shape[-1]
+    assert n > 0 and (n & (n - 1)) == 0
+    x = x.clone()
+    h = 1
+    while h < n:
+        shape = x.shape[:-1] + (n // (2 * h), 2, h)
+        x_r = x.reshape(shape)
+        a = x_r[..., 0, :].clone()
+        b = x_r[..., 1, :].clone()
+        x_r[..., 0, :] = a + b
+        x_r[..., 1, :] = a - b
+        x = x_r.reshape(x.shape)
+        h *= 2
+    return x / math.sqrt(n)
+
+
+def _random_signs(n: int, seed: int) -> torch.Tensor:
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.where(torch.randn(n, generator=g) > 0,
+                       torch.tensor(1.0), torch.tensor(-1.0))
+
+
+def _quantize_one_layer_q4k_sub4_hadamard(layer: nn.Linear, layer_seed: int) -> dict:
+    SUB = 4
+    SUB_SZ = QK_K // SUB
     W = layer.weight.data.float()
     out_features, in_features = W.shape
-    assert in_features % QK_K == 0
-    n_blocks = in_features // QK_K
-    W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+
+    pad_n = _next_power_of_2(in_features)
+    need_pad = pad_n != in_features
+    assert pad_n % QK_K == 0
+    n_blocks = pad_n // QK_K
+
+    s = _random_signs(in_features, layer_seed)
+    W_signed = W * s.unsqueeze(0)
+    if need_pad:
+        pad = torch.zeros(out_features, pad_n - in_features)
+        W_pad = torch.cat([W_signed, pad], dim=1)
+    else:
+        W_pad = W_signed
+    W_rot = _fwht(W_pad)
+
+    W_r = W_rot.reshape(out_features, n_blocks, SUB, SUB_SZ)
     w_sub_min = W_r.amin(dim=-1)
     w_sub_max = W_r.amax(dim=-1)
     w_blk_min = w_sub_min.amin(dim=-1)
@@ -231,13 +234,15 @@ def _quantize_one_layer_q4k_delta(layer: nn.Linear) -> dict:
     q = torch.round((W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1))
     q = torch.clamp(q, 0, 15).to(torch.uint8)
     W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
-    W_q = W_q_r.reshape(out_features, in_features)
-    layer.weight.data = W_q.to(layer.weight.dtype)
-    quants_flat = q.reshape(out_features, in_features)
+    W_rot_deq = W_q_r.reshape(out_features, pad_n)
+    W_deq_signed = _fwht(W_rot_deq)[:, :in_features]
+    W_deq = W_deq_signed * s.unsqueeze(0)
+    layer.weight.data = W_deq.to(layer.weight.dtype)
+    quants_flat = q.reshape(out_features, pad_n)
     return {
         "d": d.numpy().astype(np.float16), "dmin": dmin.numpy().astype(np.float16),
         "scales_6bit": sc_6bit.numpy(), "mins_6bit": m_6bit.numpy(),
-        "quants": quants_flat.numpy(), "format": "q4_k_delta",
+        "quants": quants_flat.numpy(), "format": "q4_k_sub4_hadamard",
         "shape": [out_features, in_features], "n_blocks": n_blocks,
     }
 
@@ -451,25 +456,17 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
-        if data.get("format") in ("q4_k", "q4_k_delta"):
+        if data.get("format") in ("q4_k", "q4_k_sub4_hadamard"):
+            # Q4_K format: pack 4-bit quants into uint8 pairs
             quants = data["quants"]
-            n_blocks = data["n_blocks"]
-            sc = data["scales_6bit"]
-            if data.get("format") == "q4_k_delta":
-                packed = _pack_delta_codes(sc, quants, n_blocks)
-                q_out = _pack_4bit(quants)
-                np.savez(fname,
-                         quants=q_out, delta_codes=packed["delta_codes"],
-                         full_codes=packed["full_codes"], delta_mask=packed["delta_mask"],
-                         d=data["d"], dmin=data["dmin"],
-                         scales_6bit=data["scales_6bit"], mins_6bit=data["mins_6bit"],
-                         format=data["format"])
-            else:
-                q_out = _pack_4bit(quants)
-                np.savez(fname,
-                         quants=q_out, d=data["d"], dmin=data["dmin"],
-                         scales_6bit=data["scales_6bit"], mins_6bit=data["mins_6bit"],
-                         format=data["format"])
+            q_out = _pack_4bit(quants)
+            np.savez(fname,
+                     quants=q_out,
+                     d=data["d"],
+                     dmin=data["dmin"],
+                     scales_6bit=data["scales_6bit"],
+                     mins_6bit=data["mins_6bit"],
+                     format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
             np.savez(fname, codes=codes_out,
@@ -553,12 +550,13 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k_delta":
+        if fmt == "q4_k_sub4_hadamard":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
-            meta[name] = _quantize_one_layer_q4k_delta(layer)
+            layer_seed = hash(name) & 0x7FFFFFFF
+            meta[name] = _quantize_one_layer_q4k_sub4_hadamard(layer, layer_seed)
         elif fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
@@ -614,8 +612,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k", "q4_k_delta"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+                        choices=["q2_kmeans", "q4_k", "q4_k_sub4_hadamard"],
+                        help="Quantization format")
     return parser.parse_args()
 
 
@@ -657,7 +655,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format in ("q4_k", "q4_k_delta") else args.bits
+    effective_bits = 4 if args.format in ("q4_k", "q4_k_sub4_hadamard") else args.bits
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
