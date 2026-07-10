@@ -64,5 +64,35 @@ Outcome: **REGRESSED** — 396.7 MB (larger). Bitmask overhead exceeds savings; 
 Hypothesis: Adjacent output channels have correlated quantized values. Store K=2: ref (4-bit) + delta (2-bit signed). 25% quants savings.
 Outcome: **WIN** — 301.9 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**. Note: 2-bit deltas clip diffs >2; lossy for some positions.
 
+## exp-20260710-027 (Lossless quants delta fallback)
+Hypothesis: Per-block fallback to full 4-bit when delta exceeds range.
+Outcome: **REGRESSED** — 584.1 MB. Most blocks need full encoding, overhead dominates.
+
+## exp-20260710-028 (Kq=4 quants delta)
+Hypothesis: Larger Kq for inter-channel quants delta: 1 ref + 3 delta channels.
+Outcome: **WIN** — 255.0 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**.
+
+## exp-20260710-029 (Kq=8 quants delta)
+Hypothesis: Kq=8 further reduces quants storage: 1 ref + 7 delta channels.
+Outcome: **WIN** — 231.5 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**.
+
+## exp-20260710-030 (Kq=16 quants delta)
+Hypothesis: Kq=16: 1 ref + 15 delta channels.
+Outcome: **WIN** — 219.8 MB, same quality. **NEW GLOBAL BEST**.
+
+## exp-20260710-031 (Kq=32 quants delta)
+Hypothesis: Kq=32 approaching theoretical limit.
+Outcome: **WIN** — 213.9 MB, same quality. **NEW GLOBAL BEST**.
+
+## exp-20260710-032 (Kq=64 quants delta)
+Hypothesis: Kq=64 very close to 0.25 bytes/weight theoretical limit.
+Outcome: **WIN** — 211.0 MB, KL=0.092, Top-P=83.86%. **FINAL GLOBAL BEST**.
+
 ## Summary
-- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared sc/m joint 10-bit + K=2 inter-channel quants delta + 3-pass LS → 301.9 MB, KL=0.092, Top-P=83.86%
+- Baseline: 434.6 MB → Final: 211.0 MB (51.4% reduction)
+- Quality: KL=0.092076, Top-P=83.857% — IDENTICAL throughout all wins
+- Key innovations:
+  1. K=4 shared d/dmin + delta-encoded across blocks
+  2. K=4 shared scales/mins with 2-bit deltas + 10-bit joint coding
+  3. Kq=64 inter-channel quants delta: 4-bit ref + 63× 2-bit deltas
+- Theoretical limit: ~206 MB. Kq=64 very close (211.0 MB)

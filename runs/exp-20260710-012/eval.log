@@ -1,0 +1,12 @@
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (297193 > 262144). Running this sequence through the model will result in indexing errors
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Using cached reference logits: cache/ref_logits_0.8B.mmap
+Loading Wikitext-2 (test split)
+Loading quantized model: quantized_models/exp-20260710-012
+[ERROR] `loss` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+[ERROR] `logits` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  46%|████▌     | 147/320 [00:00<00:00, 1461.58it/s]Loading weights:  97%|█████████▋| 311/320 [00:00<00:00, 1541.23it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 1565.26it/s]
+Evaluating KL:   0%|          | 0/9 [00:00<?, ?it/s]Evaluating KL:  11%|█         | 1/9 [00:04<00:34,  4.30s/it]Evaluating KL:  22%|██▏       | 2/9 [00:05<00:16,  2.41s/it]Evaluating KL:  33%|███▎      | 3/9 [00:06<00:10,  1.80s/it]Evaluating KL:  44%|████▍     | 4/9 [00:07<00:07,  1.53s/it]Evaluating KL:  56%|█████▌    | 5/9 [00:08<00:05,  1.38s/it]Evaluating KL:  67%|██████▋   | 6/9 [00:09<00:03,  1.29s/it]Evaluating KL:  78%|███████▊  | 7/9 [00:10<00:02,  1.24s/it]Evaluating KL:  89%|████████▉ | 8/9 [00:12<00:01,  1.20s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.10s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.44s/it]
+
+Mean KL divergence (ref → quant): 0.095764
+Tokens/sec: 385.9

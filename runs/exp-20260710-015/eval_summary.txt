@@ -1,0 +1,5 @@
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  53%|█████▎    | 170/320 [00:00<00:00, 1699.25it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 1688.51it/s]
+Evaluating KL:   0%|          | 0/9 [00:00<?, ?it/s]Evaluating KL:  11%|█         | 1/9 [00:04<00:34,  4.28s/it]Evaluating KL:  22%|██▏       | 2/9 [00:05<00:16,  2.38s/it]Evaluating KL:  33%|███▎      | 3/9 [00:06<00:10,  1.77s/it]Evaluating KL:  44%|████▍     | 4/9 [00:07<00:07,  1.51s/it]Evaluating KL:  56%|█████▌    | 5/9 [00:08<00:05,  1.37s/it]Evaluating KL:  67%|██████▋   | 6/9 [00:09<00:03,  1.28s/it]Evaluating KL:  78%|███████▊  | 7/9 [00:10<00:02,  1.23s/it]Evaluating KL:  89%|████████▉ | 8/9 [00:11<00:01,  1.19s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.08s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.42s/it]
+
+Mean KL divergence (ref → quant): 0.092076
+Tokens/sec: 391.5
