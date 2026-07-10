@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-q2_k post-training quantization for AutoModelForCausalLM.
+Post-training quantization for AutoModelForCausalLM.
+Supports multiple formats: q2_kmeans (default), q4_k (GGML-style 4-bit blocks).
 
-CPU-based, vectorised per-group min/max symmetric quantization.
-No GPU sync per layer — the entire model is quantised on CPU in one pass.
+CPU-based, vectorised quantization.  No GPU sync per layer.
 """
 
 import argparse
@@ -19,19 +19,23 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-# Quantization is always symmetric — hardcoded.
 MAXQ = {2: 3, 3: 7, 4: 15, 8: 255}
 DEFAULT_GROUPSIZE = 32
-MAX_COMPRESSED_MB = 260
 VRAM_LIMIT_MB = 8192
 
-# Modules that must NEVER be quantized (SSM projections, norms, small params).
-# Norms and Conv1d are already excluded by the nn.Linear filter — this list
-# catches nn.Linear sub-modules that should stay at native precision.
+# Max compressed size: Q4_K baseline for 0.8B is ~450 MB.  We'll know the
+# exact number after the first Q4_K run and update this.
+MAX_COMPRESSED_MB = 500
+
 _NEVER_QUANTIZE = frozenset([
     "linear_attn.in_proj_a",
     "linear_attn.in_proj_b",
 ])
+
+# Q4_K block geometry (GGML-compatible)
+QK_K = 256
+QK_K_SUB_BLOCKS = 8
+QK_K_SUB_SIZE = QK_K // QK_K_SUB_BLOCKS  # 32
 
 
 def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
@@ -88,7 +92,79 @@ def _collect_input_stats(
 
 
 # ---------------------------------------------------------------------------
-# Per-layer 2-bit symmetric quantization (vectorised, CPU)
+# Q4_K quantization (GGML-style 4-bit block quantization)
+# Superblock: 256 weights, 8 sub-blocks of 32.
+# Per superblock: fp16 d + fp16 dmin (4 bytes).
+# Per sub-block: 6-bit scale + 6-bit min (12 bytes / 8 sub-blocks).
+# Per weight: 4-bit quantized value (128 bytes / 256 weights).
+# Total: 144 bytes per 256 weights → 4.5 bits/weight.
+# ---------------------------------------------------------------------------
+
+def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0, (
+        f"in_features ({in_features}) must be divisible by QK_K ({QK_K})")
+    n_blocks = in_features // QK_K
+
+    W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+    # shape: (out, n_blocks, 8, 32)
+
+    # Per-sub-block min/max → per-block (superblock) min/max
+    w_sub_min = W_r.amin(dim=-1)      # (out, n_blocks, 8)
+    w_sub_max = W_r.amax(dim=-1)
+    w_blk_min = w_sub_min.amin(dim=-1)  # (out, n_blocks)
+    w_blk_max = w_sub_max.amax(dim=-1)
+
+    # Global scale d and min-offset base dmin (positive magnitude)
+    d = (w_blk_max - w_blk_min) / 15.0
+    d[d < 1e-8] = 1e-8
+    dmin = w_blk_min.abs().clamp(min=1e-8)
+
+    # Per-sub-block effective scale and min
+    d_sub = (w_sub_max - w_sub_min) / 15.0
+    d_sub[d_sub < 1e-8] = 1e-8
+
+    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
+    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
+    sc_norm = sc_6bit.float() / 63.0
+
+    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
+    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
+    m_norm = m_6bit.float() / 63.0
+
+    eff_scale = d.unsqueeze(-1) * sc_norm         # (out, n_blocks, 8)
+    eff_scale[eff_scale < 1e-8] = 1e-8
+    eff_offset = dmin.unsqueeze(-1) * m_norm       # (out, n_blocks, 8)
+
+    # Quantize:  w ≈ eff_scale * q - eff_offset,   q ∈ {0..15}
+    q = torch.round(
+        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
+    )
+    q = torch.clamp(q, 0, 15).to(torch.uint8)
+
+    # Dequantize back into the weight tensor
+    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
+    W_q = W_q_r.reshape(out_features, in_features)
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    quants_flat = q.reshape(out_features, in_features)
+
+    return {
+        "d":              d.numpy().astype(np.float16),
+        "dmin":           dmin.numpy().astype(np.float16),
+        "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
+        "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
+        "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
+        "format":         "q4_k",
+        "shape":          [out_features, in_features],
+        "n_blocks":       n_blocks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Per-layer 2-bit K-means quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
 
 def _quantize_one_layer(
@@ -287,7 +363,7 @@ def _pack_4bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
-def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
+def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans") -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
     layer_info = {}
@@ -295,36 +371,67 @@ def _save_compressed(meta: dict, save_dir: str, bits: int) -> int:
     for name, data in tqdm(meta.items(), desc="Saving compressed"):
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
-        if bits == 4 and data["shape"][1] % 2 == 0:
+
+        if data.get("format") == "q4_k":
+            # Q4_K format: pack 4-bit quants into uint8 pairs
+            quants = data["quants"]
+            q_out = _pack_4bit(quants)
+            np.savez(fname,
+                     quants=q_out,
+                     d=data["d"],
+                     dmin=data["dmin"],
+                     scales_6bit=data["scales_6bit"],
+                     mins_6bit=data["mins_6bit"],
+                     format=data["format"])
+        elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
+            np.savez(fname, codes=codes_out,
+                     codebook_q=data.get("codebook_q"),
+                     cb_min=data.get("cb_min"),
+                     cb_max=data.get("cb_max"),
+                     codebook_dtype=data.get("codebook_dtype", "q4"))
         elif bits == 2 and data["shape"][1] % 4 == 0:
             codes_out = _pack_2bit(data["codes"])
+            if "codebook_q" in data:
+                np.savez(fname,
+                         codes=codes_out,
+                         codebook_q=data["codebook_q"],
+                         cb_min=data["cb_min"],
+                         cb_max=data["cb_max"],
+                         codebook_dtype=data["codebook_dtype"])
+            elif "codebook" in data:
+                np.savez(fname,
+                         codes=codes_out,
+                         codebook=data["codebook"],
+                         codebook_dtype=data["codebook_dtype"])
+            else:
+                np.savez(fname,
+                         codes=codes_out,
+                         scales=data["scales"],
+                         scale_dtype=data["scale_dtype"],
+                         zero_pt=data["zero_pt"])
         else:
             codes_out = data["codes"]
-        if "codebook_q" in data:
-            np.savez(fname,
-                     codes=codes_out,
-                     codebook_q=data["codebook_q"],
-                     cb_min=data["cb_min"],
-                     cb_max=data["cb_max"],
-                     codebook_dtype=data["codebook_dtype"])
-        elif "codebook" in data:
-            np.savez(fname,
-                     codes=codes_out,
-                     codebook=data["codebook"],
-                     codebook_dtype=data["codebook_dtype"])
-        else:
-            np.savez(fname,
-                     codes=codes_out,
-                     scales=data["scales"],
-                     scale_dtype=data["scale_dtype"],
-                     zero_pt=data["zero_pt"])
+            if "codebook_q" in data:
+                np.savez(fname,
+                         codes=codes_out,
+                         codebook_q=data["codebook_q"],
+                         cb_min=data["cb_min"],
+                         cb_max=data["cb_max"],
+                         codebook_dtype=data["codebook_dtype"])
+            else:
+                np.savez(fname,
+                         codes=codes_out,
+                         scales=data["scales"],
+                         scale_dtype=data["scale_dtype"],
+                         zero_pt=data["zero_pt"])
         total_bytes += os.path.getsize(fname)
         layer_info[name] = data["shape"]
 
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump({
             "bits": bits,
+            "format": fmt,
             "layers": layer_info,
             "total_compressed_mb": round(total_bytes / 1e6, 2),
         }, f, indent=2)
@@ -344,9 +451,10 @@ def quantize_model(
     groupsize: int = DEFAULT_GROUPSIZE,
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
+    fmt: str = "q2_kmeans",
 ) -> dict:
     model.eval()
-    model.cpu()                                     # CPU for deterministic results
+    model.cpu()
     meta: dict = {}
 
     layers = [(n, m) for n, m in model.named_modules()
@@ -354,29 +462,37 @@ def quantize_model(
 
     skipped_small = 0
     for name, layer in tqdm(layers, desc="Quantizing"):
-        layer_gs = _get_layer_groupsize(name, groupsize)
-        if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
-            logger.warning("Skipping %s: in_features %d not divisible by %d",
-                           name, layer.weight.shape[1], layer_gs)
-            continue
         if any(pattern in name for pattern in _NEVER_QUANTIZE):
             skipped_small += 1
             continue
-        layer_act = act_stats.get(name) if act_stats is not None else None
-        if "lm_head" in name:
-            layer_diffusion = 0.1
-        elif any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
-            layer_diffusion = 0.7
-        elif any(kw in name for kw in ("gate_proj", "up_proj", "down_proj")):
-            layer_diffusion = 0.3
+
+        if fmt == "q4_k":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            meta[name] = _quantize_one_layer_q4k(layer)
         else:
-            layer_diffusion = 0.5
-        meta[name] = _quantize_one_layer(layer, bits, layer_gs,
-                                         act_stats=layer_act,
-                                         diffusion=layer_diffusion)
+            layer_gs = _get_layer_groupsize(name, groupsize)
+            if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], layer_gs)
+                continue
+            layer_act = act_stats.get(name) if act_stats is not None else None
+            if "lm_head" in name:
+                layer_diffusion = 0.1
+            elif any(kw in name for kw in ("q_proj", "k_proj", "v_proj", "o_proj")):
+                layer_diffusion = 0.7
+            elif any(kw in name for kw in ("gate_proj", "up_proj", "down_proj")):
+                layer_diffusion = 0.3
+            else:
+                layer_diffusion = 0.5
+            meta[name] = _quantize_one_layer(layer, bits, layer_gs,
+                                             act_stats=layer_act,
+                                             diffusion=layer_diffusion)
 
     if save_compressed_dir:
-        _save_compressed(meta, save_compressed_dir, bits)
+        _save_compressed(meta, save_compressed_dir, bits, fmt)
 
     if skipped_small:
         logger.info("Skipped %d small/SSM layers (never quantize)", skipped_small)
@@ -390,7 +506,7 @@ def quantize_model(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="q2_k quantization for causal LMs (symmetric, always on)",
+        description="Post-training quantization for causal LMs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
@@ -404,6 +520,9 @@ def parse_args():
                         help="Directory to save quantized model")
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
+    parser.add_argument("--format", default="q2_kmeans",
+                        choices=["q2_kmeans", "q4_k"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
     return parser.parse_args()
 
 
@@ -424,34 +543,37 @@ def main():
     )
 
     act_stats = None
-    if args.calibration_cache and os.path.exists(args.calibration_cache):
-        logger.info("Loading cached calibration stats: %s", args.calibration_cache)
-        cached = np.load(args.calibration_cache, allow_pickle=True)
-        act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
-        model.to("cuda")
-    elif torch.cuda.is_available():
-        logger.info("Collecting calibration activation stats on GPU")
-        torch.cuda.reset_peak_memory_stats()
-        model.to("cuda")
-        act_stats = _collect_input_stats(model, args.model,
-                                         nsamples=16, seqlen=1024)
-        logger.info("Collected stats for %d layers", len(act_stats))
-        if args.calibration_cache and act_stats:
-            os.makedirs(os.path.dirname(args.calibration_cache) or ".", exist_ok=True)
-            np.savez(args.calibration_cache,
-                     **{k: v.numpy() for k, v in act_stats.items()})
-            logger.info("Cached calibration stats to %s", args.calibration_cache)
+    if args.format == "q2_kmeans":
+        if args.calibration_cache and os.path.exists(args.calibration_cache):
+            logger.info("Loading cached calibration stats: %s", args.calibration_cache)
+            cached = np.load(args.calibration_cache, allow_pickle=True)
+            act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
+            model.to("cuda")
+        elif torch.cuda.is_available():
+            logger.info("Collecting calibration activation stats on GPU")
+            torch.cuda.reset_peak_memory_stats()
+            model.to("cuda")
+            act_stats = _collect_input_stats(model, args.model,
+                                             nsamples=16, seqlen=1024)
+            logger.info("Collected stats for %d layers", len(act_stats))
+            if args.calibration_cache and act_stats:
+                os.makedirs(os.path.dirname(args.calibration_cache) or ".", exist_ok=True)
+                np.savez(args.calibration_cache,
+                         **{k: v.numpy() for k, v in act_stats.items()})
+                logger.info("Cached calibration stats to %s", args.calibration_cache)
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    logger.info("Quantizing  bits=%d  groupsize=%d  symmetric=True",
-                args.bits, args.groupsize)
+    effective_bits = 4 if args.format == "q4_k" else args.bits
+    logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
+                args.format, effective_bits, args.groupsize)
     meta = quantize_model(
         model,
         bits=args.bits,
         groupsize=args.groupsize,
         save_compressed_dir=compressed_dir,
         act_stats=act_stats,
+        fmt=args.format,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 

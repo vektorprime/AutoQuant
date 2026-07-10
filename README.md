@@ -1,41 +1,37 @@
 # AutoQuant
 
-inspired by [autoresearch](https://github.com/karpathy/autoresearch) by Andrej Karpathy.
+Inspired by [autoresearch](https://github.com/karpathy/autoresearch) by Andrej Karpathy.
 
-![teaser](assets/progress.png)
+AutoQuant is an autonomous quantization research system. An AI agent modifies the quantization
+algorithm, measures the result against a reference baseline, and iterates to discover novel
+quantization techniques.
 
-The idea: give an AI agent a post-training quantization setup and let it experiment autonomously overnight. It modifies the code, quantizes the model, checks if the result improved, keeps or discards, and repeats.
+## Current Experiment: Q4_K
 
+The goal is to discover a novel quantization technique that outperforms Q4_K — the industry
+standard 4-bit group quantization format. The target technique must be:
 
-## How it works
+1. **Smaller** than Q4_K in compressed storage size
+2. **Same or better** KL divergence against FP16 reference
+3. **Same or better** same-top-P agreement (argmax overlap with FP16 reference)
 
-The repo is deliberately kept small and only really has five files that matter:
-- **quantize.py** — the quantization script with the algorithm
-- **quantizer.py** — the quantizer class
-- **data_utils.py** — data preparation utilities
-- **eval_perplexity.py** — KL divergence evaluation script
-- **program.md** — the experiment description for the agent
+The baseline is Q4_K applied to Qwen/Qwen3.5-0.8B. The agent freely explores any
+quantization scheme (2-bit, 3-bit, mixed precision, novel encoding, etc.) as long as
+the compressed size is strictly smaller than Q4_K's.
 
-The starting point is q2_k (2-bit symmetric group quantization) — a simple per-group
-min/max approach without calibration data or iterative optimisation. The agent is free
-to explore other quantization algorithms — it is not limited to a specific method.
-The model is quantized using the `quantize.py` script and saved.
-After quantization, KL divergence (lower = better) is evaluated against the reference
-model using `eval_perplexity.py`.
+## Files
 
-The goal of the agent is to achieve the lowest possible KL divergence for a fixed
-quantization configuration — 2-bit, groupsize 128, symmetric.  Groupsize can be as low
-as 16 (must divide `in_features`).  Smaller groups yield finer quantization at the cost
-of larger scale/zero overhead in the compressed representation.
+- **quantize.py** — The quantization script (editable by the agent)
+- **quantizer.py** — Reference Quantizer class (read-only)
+- **data_utils.py** — Calibration data utilities (read-only)
+- **eval_perplexity.py** — KL divergence evaluation (read-only)
+- **eval_topk.py** — Same-top-P agreement evaluation (read-only)
+- **program.md** — The experiment protocol for the AI agent
 
 ## Quick start
 
-* Prepare environment with up-to-date `torch`, `transformers`, and `datasets` packages.
+Prepare environment with up-to-date `torch`, `transformers`, and `datasets` packages.
 
 ## Running the agent
 
-Prompt something like this:
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
-During the experiment the agent with ask which model to quantize. In the example provided above, the agent quantizes `Llama-3.1-8B-Instruct`.
+Prompt: "Read program.md and let's start a new experiment."

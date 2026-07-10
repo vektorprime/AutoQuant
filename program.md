@@ -1,97 +1,139 @@
-# autoresearch
+# Q4_K — AutoQuant experiment
 
-This is an experiment to have the LLM do its own research.
+This experiment searches for a **novel quantization technique** that is **smaller**
+than the Q4_K format while matching or beating Q4_K's quality on two metrics:
+- **KL divergence** against FP16 reference (lower = better)
+- **Same-top-P agreement** with FP16 reference (higher = better)
+
+The baseline is **Q4_K** applied to **Qwen/Qwen3.5-0.8B**. Every proposed technique
+must produce a compressed model strictly smaller than Q4_K's compressed size.
+
+---
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `jul1`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
+1. **Agree on a run tag**: propose a tag based on the technique name (e.g. `Q4_K`).
+   The branch `autoresearch/<tag>` or the standalone branch name must not already exist.
+2. **Create the branch**: `git checkout -b <tag>` from current HEAD.
+3. **Read the in-scope files**:
    - `README.md` — repository context.
-   - `eval_perplexity.py` — fixed evaluation, read-only.
-   - `quantizer.py` — **read-only** reference.  Understand the packed format,
+   - `eval_perplexity.py` — fixed KL evaluation, read-only.
+   - `eval_topk.py` — same-top-P evaluation, read-only.
+   - `quantizer.py` — **read-only** reference. Understand the packed format,
      dequantization path, supported metadata, and what custom schemes are
      actually representable before inventing a new format.
    - `quantize.py` — the file containing the quantization algorithm (**you edit this**).
    - `data_utils.py` — data preparation utilities (read-only).
 4. **Initialize results.tsv**: Create `results.tsv` with just the header row.
-   The baseline will be recorded after the first run.
+   The Q4_K baseline will be recorded as the first row.
 5. **Initialize experiments/**: Create `experiments/idea_ledger.md` and
    `experiments/failures.tsv` (header row only).
 6. **Confirm and go**: Confirm setup looks good.
 
-Once you get confirmation, kick off the experimentation.
+Once you get confirmation, establish the Q4_K baseline, then start experimentation.
 
 ---
 
 ## Research phases
 
-The search follows a phased plan.  Start at Phase 0 and move forward as each
-phase is exhausted or hits diminishing returns.  You may revisit earlier phases
+The search follows a phased plan. Start at Phase 0 and move forward as each
+phase is exhausted or hits diminishing returns. You may revisit earlier phases
 after discoveries in later phases.
 
-### Phase 0 — Baseline sweep and format audit
+### Phase 0 — Q4_K baseline establishment
 
-Run the default implementation at feasible groupsizes:
+Before any experimentation, establish the Q4_K baseline:
 
-| groupsize | expected size | notes |
-|---|---|---|
-| 16 | ~1411 MB | finest granularity |
-| 32 | ~941 MB  | default |
-| 64 | ~500 MB  | coarser |
-| 128| ~328 MB  | coarsest |
-| 256| ~200 MB  | may be too coarse |
+1. Implement Q4_K quantization in `quantize.py`:
+   - Superblock size: 256 weights
+   - Per superblock: fp16 scale (`d`) and fp16 min (`dmin`)
+   - 16 sub-blocks of 16 weights each
+   - Per sub-block: 6-bit scale delta (12 bytes per superblock for all 16 sub-scales)
+   - Per weight: 4-bit quantized value (128 bytes per superblock)
+   - Total: 144 bytes per 256 weights → ~4.5 bits per weight
 
-Stop any groupsize that exceeds the 260 MB size limit or 8 GB VRAM limit.
-This establishes the size/KL frontier.  **No algorithm changes** during Phase 0
-— these runs are pure baselines.
+2. Quantize Qwen3.5-0.8B with Q4_K and save to `quantized_models/q4k_baseline`
 
-Also inspect (reading `quantizer.py` and `eval_perplexity.py`):
-- How weights are packed, decompressed, and mapped back to tensors.
-- How scales/zeros are stored per group.
-- Whether per-layer groupsize is possible.
-- Whether non-uniform codebooks can be stored.
-- Whether layer-specific metadata is supported by the save/load round-trip.
+3. Measure compressed size and record it
 
-### Phase 1 — No-format-change improvements
+4. Generate Q4_K reference logits cache (optional — may reuse FP16 reference)
 
-These are the safest first experiments — they change only the scale/computation
-without altering the stored representation:
+5. Run `eval_perplexity.py` against FP16 reference → record KL divergence
 
-- MSE-optimal scale instead of maxabs scale.
-- Activation-weighted MSE scale (see Calibration data rules).
-- Clipped-scale variants (closed-form or small grid search, avoiding `.item()` loops).
-- Layer-type-specific scale rules (different policy for attention vs MLP).
-- Per-layer effective groupsize if the format supports it.
-- **Cross-channel grouping** — currently groups partition `in_features`
-  independently per output channel.  What if scales are shared across nearby
-  output channels (e.g. 2×2 blocks of `(out, in)` groups)?  This reduces
-  scale storage overhead without changing group granularity.
+6. Run `eval_topk.py` against FP16 reference → record same-top-P agreement
 
-### Phase 2 — Activation-aware methods
+7. Record the Q4_K baseline row in `results.tsv` with `exp_id = exp-q4k-baseline`
 
-Try AWQ/GPTQ-inspired approximations within the constraints:
+These three numbers (size, KLD, top-P) are the **quality bar**. Every proposed
+technique must be **smaller** with KLD **≤ baseline** and top-P **≥ baseline**.
 
-- Stream calibration data (do not store full activations).
-- Store only diagonal activation statistics per linear layer (e.g. `E[x²]`).
-- Optimize per-group quantization using weighted reconstruction error.
-- The weighted objective `loss = Σⱼ E[xⱼ²] · (Wᵢⱼ - Wqᵢⱼ)²` is **far more aligned
-  with KL** than plain weight MSE, while fitting the VRAM rule.
+### Phase 1 — Bit-width frontier mapping
 
-### Phase 3 — Representation changes
+Explore the size-vs-quality frontier across different bit-widths and schemes:
 
-Only after proving the eval loader supports them:
+- **3-bit quantization** with codebook compression (~340-380 MB expected)
+- **2-bit quantization** variants (already explored in prior runs — may already
+  beat Q4_K; verify against the new baseline)
+- **2.5-bit schemes** (e.g., 3-bit codes with Huffman/entropy coding)
+- **Mixed-precision**: higher bits for attention, lower for MLP
+- **Per-channel variable bit-width**: assign more bits to high-activation channels
 
-- Non-uniform 2-bit codebooks (e.g. per-group lookup tables).  For example,
-  instead of the hardcoded `{-2s, -s, 0, s}`, store four learned values per group
-  such as `{-1.5s, -0.8s, 0.3s, 1.2s}`.  Only feasible if the eval loader's
-  dequantization path can consume per-group codebooks.
-- Layer-level codebooks (shared across groups).
-- Per-group asymmetric offsets or learned levels.
-- Outlier-preserving transforms that do not exceed the 260 MB size limit.
-- Error-feedback schemes spanning multiple layers (not just within one layer).
+Record the Pareto frontier — for each size point, what's the best achievable KLD
+and top-P? This guides later phases toward the most promising region of the
+size/quality space.
+
+### Phase 2 — Codebook and representation innovation
+
+Go beyond simple per-group quantization:
+
+- **Multi-codebook additive quantization**: W ≈ Q₁ + Q₂ + ... + Qₖ where each
+  Qᵢ uses a small codebook (e.g., two 2-bit codebooks = 4 bits of expressiveness
+  with less storage than a single 4-bit codebook)
+- **Learned non-uniform quantization grids**: optimize quantization levels
+  per tensor/channel via gradient descent or iterative refinement
+- **Across-layer codebook sharing**: identify layers with similar weight
+  distributions and share a single codebook pool
+- **Vector/subspace quantization**: quantize groups of weights jointly using
+  vector quantization (e.g., 4 weights → one 8-bit index into a 256-entry
+  codebook of 4-vectors = 2 bits per weight)
+- **GPTVQ-style**: larger block sizes with optimized lattice codebooks
+- **Lookup-free quantization (LFQ)**: directly quantize to integer lattice
+  without storing explicit codebooks
+
+### Phase 3 — Pre/post-processing transforms
+
+Transformations applied to weights before or after quantization:
+
+- **Hadamard/random rotation**: multiply weight matrices by orthogonal transforms
+  to make distributions more uniform before quantization (QuaRot-inspired).
+  The inverse transform is fused into the next layer at load time.
+- **Channel reordering/permutation**: find optimal input channel ordering that
+  makes groups more homogeneous (already explored — revisit with new formats)
+- **Outlier channel splitting**: isolate a small number of high-magnitude
+  channels at higher precision, quantize the rest aggressively
+- **Low-rank correction**: store a low-rank residual (SVD of quantization error)
+  alongside quantized weights
+
+### Phase 4 — Entropy coding and compression
+
+Post-quantization coding to squeeze out redundancy:
+
+- **Huffman/arithmetic coding** of quantized codes — exploit non-uniform code
+  distributions for additional compression
+- **Run-length encoding** for repetitive code patterns
+- **Dictionary compression** across layers
+- **Deduplication**: if two layers have identical quantized weights (unlikely
+  but possible after aggressive quantization), store once
+
+### Phase 5 — Hybrid approaches
+
+Combine wins from earlier phases:
+
+- Multi-codebook + Hadamard rotation + entropy coding
+- Mixed-precision + outlier splitting + vector quantization
+- The best composable techniques should multiply their benefits
 
 ---
 
@@ -100,71 +142,65 @@ Only after proving the eval loader supports them:
 Each experiment runs on a single GPU. The workflow is:
 
 1. Run `quantize.py` to quantize the model and save it to `quantized_models/<tag>`
-2. Load the quantized model from `quantized_models/<tag>` and run `eval_perplexity.py` to evaluate KL divergence against the reference model. Save the results to `results.tsv`.
-3. Delete the quantized model from `quantized_models/<tag>`.
+2. Load the quantized model from `quantized_models/<tag>` and run `eval_perplexity.py`
+   to evaluate KL divergence against the FP16 reference model.
+3. Run `eval_topk.py` to measure same-top-P agreement.
+4. Record both results in `results.tsv`.
+5. Delete the quantized model from `quantized_models/<tag>`.
 
 All experiments MUST be run with the following arguments for quantize.py:
-* `--bits 2` — quantize to 2 bits (fixed, never change)
-* `--groupsize <N>` — group size (min 16, must divide `in_features`; default 32)
-* `--dtype bfloat16` — load the base model in BF16 precision (fixed, never change)
+- `--model Qwen/Qwen3.5-0.8B` (fixed — the reference model)
+- `--bits <N>` — bit width (2, 3, 4, etc.; no longer fixed to 2)
+- `--groupsize <N>` — group size (min 16, must divide `in_features`; default 32)
+- `--dtype bfloat16` — load the base model in BF16 precision (fixed)
+- `--save quantized_models/<tag>` — output directory
 
-Symmetric quantization is **hardcoded** (always on).  There is no `--symmetric` flag.
+Symmetric quantization is **hardcoded** (always on). There is no `--symmetric` flag.
 
 ### Resource limits (enforced)
 
-* **Compressed model size**: max **260 MB** (1500 MB + 5% tolerance).
-  `quantize.py` will exit with an error if the compressed `.npz` files exceed this.
-  Smaller groupsize = more metadata = larger output.  Use `--groupsize` to stay
-  under the limit.
-* **VRAM**: max **8 GB** during quantization (checked via `nvidia-smi`).  No
-  allocating auxiliary tensors that persist across layers.  Views, in-place ops,
-  and broadcasting are fine — copies and sorts are not.
+- **Compressed model size**: must be **strictly less than Q4_K's compressed size**
+  (to be measured in Phase 0). `quantize.py` will enforce this limit.
+  Smaller groupsize = more metadata = larger output.
+- **VRAM**: max **8 GB** during quantization (checked via `nvidia-smi`). No
+  allocating auxiliary tensors that persist across layers.
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
-- Change the quantization algorithm **completely**.  You are not limited to tweaking
-  the existing formula — replace the entire `_quantize_one_layer` function, invent
-  a new quantization scheme, use iterative optimisation, implement error-diffusion
-  across layers, try non-uniform quantization, or anything else that maps float
-  weights to 2-bit representations.  The only hard requirements are the bit-width
-  and the size/VRAM limits.
-- Make multiple passes over the weights (iterative refinement, error feedback) —
-  extra compute is fine as long as VRAM stays under 8 GB.
-- Add new functions, classes, or imports within `quantize.py` (no external packages).
-- Vary `--groupsize` (≥ 16) to trade off between finer quantization and compressed size.
-- **Extend `main()`** to add optional quantization-internal arguments or structured
-  logging, provided all official runs still pass `--bits 2`, `--dtype bfloat16`, and a
-  valid `--groupsize`, and eval integrity is unchanged.
+- Change the quantization algorithm **completely**. Invent new schemes, use
+  iterative optimisation, implement multi-codebook quantization, add rotation
+  transforms, use entropy coding, or anything else that maps float weights to
+  a compact representation with size < Q4_K's.
+- Use any bit-width (2, 3, 4, or even fractional effective bits via coding).
+- Make multiple passes over the weights — extra compute is fine as long as
+  VRAM stays under 8 GB.
+- Add new functions, classes, or imports within `quantize.py` (no new packages).
+- Vary `--groupsize` (≥ 16).
+- **Extend `main()`** to add optional quantization-internal arguments, provided
+  all official runs use consistent base arguments.
+- **Any storage format** is allowed as long as the FP16 dequantized weights
+  can be reconstructed from the compressed file and loaded via
+  `AutoModelForCausalLM.from_pretrained()`.
 
 **What you CANNOT do:**
-- Modify `eval_perplexity.py`. It is read-only. It contains the fixed evaluation.
+- Modify `eval_perplexity.py` or `eval_topk.py`. They are read-only.
 - Modify `quantizer.py` (the `Quantizer` class and `quantize_tensor` function).
 - Modify `data_utils.py`.
-- Install new packages or add dependencies beyond those already in the environment.
-- Add modifications that increase the size of the compressed model beyond 260 MB
-  (1500 MB + 5% tolerance).  Low-rank corrections, extra stored tensors, or storing
-  weights at > 2 bits per value are all forbidden if they push the final compressed
-  `.npz` total above the limit.
-- **Increase VRAM usage beyond 8 GB.**  GPU memory consumption must stay at or
-  below 8 GB peak.  Extra computation (FLOPs) is acceptable, but VRAM is strictly
-  capped.  No caching intermediate activations, no allocating auxiliary tensors
-  that persist across layers, no doubling the working set.
-- Use more than one GPU. All experiments run on a single GPU.
+- Install new packages or add dependencies.
+- Exceed Q4_K's compressed size.
+- Exceed 8 GB VRAM.
+- Use more than one GPU.
+- Use the Wikitext-2 test split during quantization (calibration only from train/val).
 
-**The goal is simple: get the lowest KL divergence as provided by eval_perplexity.py evaluation script.**
+**The goal is simple: find the smallest possible representation that matches or
+beats Q4_K's KL divergence and same-top-P agreement.**
 
 ### Why `quantizer.py` is off-limits
 
 The `Quantizer` class and `quantize_tensor` function are the **default primitives**
-that define affine 2-bit symmetric group quantization.  The restriction means you
-cannot *edit* these specific primitives — you can, however, write your own
-quantization logic from scratch inside `quantize.py`.  A lookup-table quantizer,
-a k-means-based centroid approach, or any other 2-bit scheme is fair game as long
-as you implement it in `quantize.py` and the weights remain at exactly 2 bits per value.
-
-What the restriction *prevents* is cheating the default primitives — e.g., changing
-`maxq` to 15 so the existing `Quantizer` silently does 4-bit work.  You may replace
-these primitives entirely with your own, but you may not "adjust" them.
+that define affine quantization. The restriction means you cannot *edit* these
+specific primitives — you can, however, write your own quantization logic from
+scratch inside `quantize.py`.
 
 ---
 
@@ -175,25 +211,15 @@ Do **not** use Wikitext-2 test split (`eval_perplexity.py --split test`) or the
 eval reference logits (`cache/ref_logits.mmap`) during quantization.
 
 **Allowed calibration statistics:**
-- Per-layer input activation second moments `E[xⱼ²]` (one scalar per input channel).
+- Per-layer input activation second moments `E[x_j^2]` (one scalar per input channel).
 - Per-channel activation scales.
 - Small streaming diagonal Hessian approximations.
 - Wikitext-2 **train** or **validation** split.
 
 **Forbidden calibration state:**
-- Cached full activation tensors across layers (violates VRAM limit and rules).
+- Cached full activation tensors across layers (violates VRAM limit).
 - Test-set activations.
 - Reference logits from `eval_perplexity.py`.
-
-Weighted reconstruction objectives using calibration statistics are strongly
-encouraged.  For example:
-
-```
-weighted_MSE = Σⱼ E[xⱼ²] · (Wᵢⱼ - Wqᵢⱼ)²
-```
-
-This is much more aligned with KL than plain weight MSE and fits the VRAM rule
-(storing only one scalar per input channel).
 
 ---
 
@@ -202,56 +228,47 @@ This is much more aligned with KL than plain weight MSE and fits the VRAM rule
 Diagnostic runs are **allowed** if:
 - They are **not** written to `results.tsv`.
 - They do **not** use the Wikitext-2 test split.
-- They do **not** modify `eval_perplexity.py`.
+- They do **not** modify `eval_perplexity.py` or `eval_topk.py`.
 - They are clearly logged under `runs/<exp_id>/diagnostics/`.
 
 Allowed diagnostics:
-- Synthetic tensor roundtrip tests (verify your quantize/dequantize is correct).
-- Per-layer quantization error summaries (MSE, max abs error per layer).
-- Calibration-split proxy KL or loss (use Wikitext-2 **train** split).
-- Layer sensitivity experiments on non-test data.
+- Synthetic tensor roundtrip tests.
+- Per-layer quantization error summaries.
+- Calibration-split proxy KL or loss.
 - Size and VRAM estimates before full runs.
-
-Use diagnostics to reject obviously bad ideas before paying for the full official eval.
+- Layer sensitivity experiments on non-test data.
 
 ---
 
 ### Performance guidance
 
-**Ranked idea queue.**  Try these in order — early ideas are higher-probability
+**Ranked idea queue.** Try these in order — early ideas are higher-probability
 improvements:
 
-1. **MSE-optimal per-group scale** — Replace `max(abs)/1.5` with an iterative
-   least-squares scale.  For each group:
-   ```
-   q = clamp(round(w / s), qmin, qmax)
-   s = sum(w * q) / sum(q * q)
-   repeat 2–3 times
-   ```
-   Keeps the same 2-bit representation and nearly the same storage.
+1. **Re-evaluate 2-bit K-means** — The existing 2-bit pipeline (K-means codebooks,
+   Q8 compression, error diffusion, activation weighting, channel sorting) may
+   already beat Q4_K. Verify this first.
 
-2. **Activation-weighted MSE scale** — Use calibration activations to estimate
-   input-channel importance.  If `hⱼ = E[xⱼ²]`, then optimize:
-   ```
-   loss = Σⱼ hⱼ · (wⱼ - s·qⱼ)²
-   s = Σ(h · w · q) / Σ(h · q · q)
-   ```
-   Much more useful than raw weight MSE.
+2. **3-bit with codebook compression** — 3-bit offers 8 levels per group vs 4,
+   dramatically reducing quantization error. With Q8 codebook compression and
+   a groupsize of 64-128, the storage may still be under Q4_K's size.
 
-3. **Layer-type policies** — Different linear layers should not necessarily use
-   the same clipping or scale rule.  Classify layer names:
-   - Attention: `q_proj`, `k_proj`, `v_proj`, `o_proj`
-   - MLP: `gate_proj`, `up_proj`, `down_proj`
-   - Output: `lm_head`
-   Then test one layer-policy change at a time.
+3. **Multi-codebook additive (AQLM-style)** — Represent W ≈ Q₁ + Q₂ where each
+   uses a small 2-bit codebook. Two 2-bit codebooks = 4-bit expressiveness but
+   less storage than 4-bit (only pay for two small codebooks per group).
 
-4. **Sensitivity-aware groupsize** — If the format supports it, spend metadata
-   budget where it matters: sensitive layers get smaller groupsize, less sensitive
-   layers get larger groupsize.
+4. **Hadamard rotation + quantization** — For each weight matrix W (out × in),
+   apply a random Hadamard transform H: W' = W @ H. Quantize W'. At load time,
+   apply H^T during the forward pass. This makes weight distributions more
+   uniform, reducing quantization error.
 
-5. **Error feedback within a layer** — Quantize groups sequentially and carry a
-   bounded residual into the next group or block.  Useful at 2 bits, but should
-   come after scale optimization and activation weighting.
+5. **Variable bit-width per layer** — Attention layers (q/k/v/o-proj) are more
+   sensitive than MLP layers (gate/up/down). Spend 3-4 bits on attention and
+   2 bits on MLP. The average bit-width determines total size.
+
+6. **Entropy coding of quantized codes** — After quantization, apply Huffman
+   coding to the per-weight codes. Non-uniform code distributions (some levels
+   are more common) yield additional compression at zero quality cost.
 
 ---
 
@@ -260,84 +277,60 @@ improvements:
 The quantization loop iterates over ~187 `nn.Linear` layers in a Python `for` loop.
 Keep these rules in mind:
 
-* **Use vectorised PyTorch operations** — `reshape`, broadcasting, `torch.clamp`,
-  `torch.round`.  One GPU kernel handles millions of weights.
-* **NEVER iterate over individual weights, rows, or columns in Python.**  A Python
-  for-loop over 2048 columns × 187 layers = 383K iterations, each launching a
-  tiny GPU kernel.  This is 100× slower than a single vectorised call.
-* **Avoid `.item()` calls inside loops over layers.**  `.item()` synchronises the
-  CUDA stream (blocks CPU until GPU finishes).  If you call it inside the layer
-  loop, you force a GPU→CPU round-trip for every single layer, serialising work
-  that could otherwise overlap.
-* **Avoid trial-by-error grid searches** (e.g., trying 9 scale factors for each
-  layer).  This multiplies per-layer work and adds 1683 extra CUDA syncs.
-  Design a closed-form solution instead.
-* **Avoid operations that allocate full-sized tensor copies.**  `torch.sort`
-  returns a sorted copy plus indices — it doubles the memory footprint of the
-  tensor being sorted.  Similarly, `torch.clone()`, `repeat_interleave` on large
-  tensors, and any `.abs()` on a non-view all silently blow up VRAM.  Prefer
-  views, in-place ops (`torch.abs` not `.abs()`, `amin`/`amax` which don't copy),
-  and broadcasting over allocation.
-* **`eval_perplexity.py` automatically prints `Tokens/sec`** in its output.
-  You do not need to compute it manually — just read it from the eval result.
+- **Use vectorised PyTorch operations** — `reshape`, broadcasting, `torch.clamp`,
+  `torch.round`. One GPU kernel handles millions of weights.
+- **NEVER iterate over individual weights, rows, or columns in Python.**
+- **Avoid `.item()` calls inside loops over layers.** It synchronises CUDA.
+- **Avoid trial-by-error grid searches** that multiply per-layer work.
+- **Avoid operations that allocate full-sized tensor copies.** Prefer views,
+  in-place ops, and broadcasting over allocation.
+- **`eval_perplexity.py` automatically prints `Tokens/sec`.**
 
 ---
 
 ## Integrity Rules — what the agent MUST NOT do
 
-These rules exist to prevent the agent from gaming the benchmark.  Violating any of
-them invalidates the experiment.
+These rules exist to prevent the agent from gaming the benchmark. Violating any
+of them invalidates the experiment.
 
 ### Evaluation integrity
-- **Do not modify `eval_perplexity.py`.**  No exceptions.
-- **Do not run eval with different parameters between experiments.**  `--context-length`,
+- **Do not modify `eval_perplexity.py` or `eval_topk.py`.** No exceptions.
+- **Do not run eval with different parameters between experiments.** `--context-length`,
   `--stride`, `--max-tokens`, `--reference-cache`, `--split`, and `--device` must be
   identical for every run in the same experiment branch.
-- **Do not change the reference model.**  The `--reference` argument must always point
-  to the same base model (e.g. `Qwen/Qwen3.5-0.8B`).  Running against a degraded or
-  different reference makes results incomparable.
-- **Do not corrupt or replace the reference cache.**  Once created, the `.mmap` cache
+- **Do not change the reference model.** The `--reference` argument must always point
+  to `Qwen/Qwen3.5-0.8B` (FP16).
+- **Do not corrupt or replace the reference cache.** Once created, the `.mmap` cache
   must not be modified, truncated, or regenerated with different parameters.
-- **Do not fabricate eval results.**  Every row in `results.tsv` must come from an
-  actual `eval_perplexity.py` run whose output was captured verbatim.
+- **Do not fabricate eval results.** Every row in `results.tsv` must come from actual
+  eval runs whose output was captured verbatim.
 
 ### Quantization integrity
-- **Do not skip quantization.**  Every experiment must run `quantize.py` with `--save`
+- **Do not skip quantization.** Every experiment must run `quantize.py` with `--save`
   pointing to a _new_ `quantized_models/<tag>` directory, then run eval against that
   freshly saved model.
-- **Do not re-use old quantized models.**  `rm -rf quantized_models/<tag>` after every
-  eval.  The next experiment must produce a new quantization from scratch.
-- **Do not partially quantize.**  All `nn.Linear` layers must be quantized (no skipping
-  layers to cheat on KL).
-- **Do not change the fixed CLI arguments.**  `--bits 2` and `--dtype bfloat16`
-  must always be passed.  Groupsize may vary (via `--groupsize`, ≥ 16).
-  Symmetric is hardcoded — there is no flag for it and it must not be added.
-- **Do not exceed the compressed size limit of 260 MB.**  `quantize.py` enforces
-  this — if your experiment hits the limit, increase `--groupsize` to reduce
-  scale/zero overhead.
-- **Do not modify `quantizer.py`.**  The `Quantizer` class and `quantize_tensor`
-  function are off-limits.
-- **Do not increase VRAM.**  GPU memory usage must not exceed 8 GB.  Extra compute
-  is fine; extra memory allocations that persist across the quantization loop
-  are forbidden.
-- **Do not consume the test set during quantization.**  Calibration data and evaluation
-  data must be disjoint.  `eval_perplexity.py` uses Wikitext-2 test split — do not use
-  that split for calibration.  The Wikitext-2 **train** split is available.
-- **KL divergence regression is not acceptable by any means.**  Any change that
-  increases KL divergence (even by small numerical margins) is a regression.
-  The quantization must produce *identical* results regardless of the device
-  (CPU/GPU) or caching strategy used.  If a change causes KL to increase, it
-  must be fully reverted — no partial regressions are tolerated.
+- **Do not re-use old quantized models.** `rm -rf quantized_models/<tag>` after every
+  eval. The next experiment must produce a new quantization from scratch.
+- **Do not partially quantize.** All `nn.Linear` layers must be quantized (no skipping
+  layers to cheat on KL or top-P).
+- **Do not change `--dtype bfloat16`.** This must always be passed.
+- **Do not exceed Q4_K's compressed size.**
+- **Do not modify `quantizer.py`.**
+- **Do not increase VRAM beyond 8 GB.**
+- **Do not consume the test set during quantization.** Calibration data and evaluation
+  data must be disjoint. `eval_perplexity.py` uses Wikitext-2 test split.
+- **KL divergence or top-P regression is not acceptable.** Any change that worsens
+  either metric is a regression and must be reverted. The quantization must produce
+  identical results regardless of device (CPU/GPU) or caching strategy.
 
 ### Git and record-keeping integrity
 - **Do not edit `results.tsv` directly** except to append a new row after a completed
-  experiment.  Never change or delete past rows.
-- **Do not skip recording bad results.**  Every experiment must be recorded, even
-  (especially) the ones that regress.  Selective recording is cheating.
+  experiment. Never change or delete past rows.
+- **Do not skip recording bad results.** Every experiment must be recorded.
 - **Do not `git commit --amend` or rewrite history** after the fact.
-- **Do not delete or force-push branches.**  The git history is the experiment log.
-- **Do not run concurrent experiments.**  One experiment at a time on one GPU.
-- **Do not skip the cleanup step.**  After each eval, delete `quantized_models/<tag>`.
+- **Do not delete or force-push branches.**
+- **Do not run concurrent experiments.** One experiment at a time on one GPU.
+- **Do not skip the cleanup step.** After each eval, delete `quantized_models/<tag>`.
 - **Do not change the Python environment** (no `pip install`, no version bumps) between
   experiments in the same branch.
 
@@ -351,27 +344,28 @@ Each experiment records into **three** files:
 
 Header:
 ```
-timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
 ```
 
 Fields:
 | field | source |
 |---|---|
 | `timestamp` | ISO-8601 time of eval completion |
-| `exp_id` | Unique experiment ID (e.g. `exp-20260701-001`) |
+| `exp_id` | Unique experiment ID (e.g. `exp-20260710-001`) |
 | `code_sha` | `git rev-parse HEAD` **of the code commit** (not the result commit) |
 | `parent_sha` | `git rev-parse HEAD~1` from before the code change |
 | `description` | One-line idea description (no tabs, no commas) |
 | `status` | `success` or the error type |
 | `kl_divergence` | Mean KL from eval output |
-| `bits` | Always `2` |
-| `groupsize` | Groupsize used |
+| `top_p_agreement` | Same-top-P percentage from eval_topk.py output |
+| `bits` | Average/effective bits per weight |
+| `groupsize` | Groupsize used (or equivalent block size) |
 | `symmetric` | Always `true` |
-| `format` | Quantization scheme tag (e.g. `q2_k`, `err_diff`, `mse_opt`) |
+| `format` | Quantization scheme tag (e.g. `q4_k`, `q2_kmeans`, `aqlm_2x2`, `hadamard_q3`) |
 | `context_length` | Always `1024` |
 | `max_tokens` | Always `5000` |
-| `size_mb` | `du -sm quantized_models/<tag>/compressed` |
-| `peak_vram_mb` | Peak VRAM from `nvidia-smi` or `torch.cuda.max_memory_allocated()` |
+| `size_mb` | Compressed model size in MB |
+| `peak_vram_mb` | Peak VRAM during quantization |
 | `tokens_per_sec` | Tokens/sec from eval output |
 
 ### idea_ledger.md (experiments/)
@@ -387,7 +381,7 @@ Changed code: <function/region>
 Representation change: <none | what changed>
 Storage risk: <none | size increase estimate>
 VRAM risk: <none | what extra is allocated>
-Expected win: <lower KL / faster / same>
+Expected win: <lower KL / higher top-P / both>
 Outcome: <KL improved/regressed/failed>
 ```
 
@@ -398,7 +392,7 @@ Log crashes, OOMs, NaNs, size-limit failures, and invalid-format attempts here
 
 Header:
 ```
-timestamp	exp_id	code_sha	description	status	error_signature	groupsize	size_mb	peak_vram_mb	notes
+timestamp	exp_id	code_sha	description	status	error_signature	bits	groupsize	size_mb	peak_vram_mb	notes
 ```
 
 ---
@@ -411,9 +405,10 @@ timestamp	exp_id	code_sha	description	status	error_signature	groupsize	size_mb	p
 ```markdown
 # Synthesis checkpoint — <date>
 
-- Current global best KL: <value>
+- Q4_K baseline: KL=<X>, top-P=<Y>, size=<Z> MB
+- Current global best: KL=<X>, top-P=<Y>, size=<Z> MB
 - Best code sha: <sha>
-- Best groupsize: <N>
+- Best effective bits: <N>
 - Ideas that improved: <list>
 - Ideas that regressed: <list>
 - Failure patterns: <list>
@@ -424,26 +419,19 @@ timestamp	exp_id	code_sha	description	status	error_signature	groupsize	size_mb	p
 - Current phase: <phase number and name>
 ```
 
-This prevents random-walk drift and ensures the search stays goal-oriented.
-
 ---
 
 ## Concurrent agents
 
 When multiple agents work in parallel (each in their own workspace clone),
-they coordinate through a shared Git remote.  The rules below ensure zero
+they coordinate through a shared Git remote. The rules below ensure zero
 conflict and zero wasted work.
 
 ### Branch discipline
 
-**Each agent works on its own experiment branch.**  Never modify `master`
-directly.  Create a branch like `exp/20260702-layertype-diffusion` and do
+**Each agent works on its own experiment branch.** Never modify the main
+branch directly. Create a branch like `exp/20260710-variable-bit` and do
 all work there.
-
-```bash
-git checkout master && git pull origin master
-git checkout -b exp/YYYYMMDD-<keyword>
-```
 
 ### Claim protocol
 
@@ -453,9 +441,9 @@ git checkout -b exp/YYYYMMDD-<keyword>
    idea or wait 10s and pull again
 3. Write one line: `EXP_ID: <one-line idea description>`
 4. `git add experiments/in_progress.md && git commit -m "claim: EXP_ID"
-   && git pull origin master && git push -u origin HEAD`
+   && git pull origin <main> && git push -u origin HEAD`
 5. If push fails (race), return to step 1
-6. **Do NOT start work** until `git pull origin master` confirms your claim
+6. **Do NOT start work** until `git pull origin <main>` confirms your claim
    is visible on the remote
 
 ### Experiment protocol (no conflicts guaranteed)
@@ -465,62 +453,42 @@ git checkout -b exp/YYYYMMDD-<keyword>
 3. **Quantize + eval** (safe — no one else touches this branch)
 4. **Append results.tsv and idea_ledger.md**
 5. **Commit results**: `git add results.tsv experiments/idea_ledger.md runs/
-   && git commit -m "record: <description> (KL=<value>)"`
+   && git commit -m "record: <description> (KL=<value>, top-P=<value>)"`
 6. **Push results**: `git push`
 7. **Clear claim**: remove your line from in_progress.md, commit, push
-8. **Decide keep/revert** on YOUR branch — no impact on master
+8. **Decide keep/revert** on YOUR branch — no impact on main
 
-### Promoting to master
+### Promoting to main
 
 Once your experiment finishes and you have the recorded result:
 
-- **If KL is the new global best** (lower than every row in master's results.tsv):
-  1. `git checkout master && git pull origin master`
-  2. `git merge --no-ff exp/YYYYMMDD-<keyword> -m "merge: <description> (KL=<value>)"`
-  3. `git push origin master`
-- **If KL is NOT the new global best**: do nothing — your branch records the
-  experiment history.  Master stays unchanged.
-
-Only one agent can merge to master at a time (push resolves the race).
-
-### No-busy-wait variant
-
-If you don't want to wait for another agent to finish:
-
-- Skip the claim file entirely
-- Create your branch, run the experiment, merge results into master with
-  `git pull origin master && git merge --no-ff` only AFTER the other agent's
-  experiment has merged to master
-- Append to results.tsv on your branch, then merge to master
-
-The claim-file approach is preferred — it avoids duplicate experiments.
+- **If this is the new global best** (smaller + same/better KLD + same/better top-P
+  compared to the current best under the Q4_K size cap):
+  1. `git checkout <main> && git pull origin <main>`
+  2. `git merge --no-ff exp/YYYYMMDD-<keyword> -m "merge: <description>"`
+  3. `git push origin <main>`
+- **If NOT the new global best**: do nothing — your branch records the
+  experiment history. Main stays unchanged.
 
 ---
 
 ## Operational notes
 
-- **Never use `pkill`.**  It hangs the session.  If a process needs to be killed,
-  use `kill <PID>` by finding the PID with `ps aux | grep <process>`.  Better
-  yet, avoid killing processes — just delete the output directory
-  (`rm -rf quantized_models/<tag>`) and the next run will overwrite cleanly.
-
-- **Peak VRAM** can be read from the last line of quantize.py output
-  (`Peak VRAM: <N> MB`), or via `nvidia-smi --query-gpu=memory.used --format=csv,noheader`
-  after the quantization completes.
+- **Never use `pkill`.** It hangs the session. Use `kill <PID>` instead.
+- **Peak VRAM** can be read from `torch.cuda.max_memory_allocated()` after
+  quantization completes.
 
 ---
 
 ## The experiment loop
 
 The active `quantize.py` at the branch tip should **always** be the global best
-KL implementation.  The search must not drift into worse code because of
-groupsize-specific baselines.
+implementation. The search must not drift into worse code.
 
 ### Pre-loop checks (do these ONCE at the start)
 
-1. **Verify the branch**: `git branch --show-current` — must match `autoresearch/<tag>`.
-2. **Read current global best**: `cut -f6 results.tsv | sort -n | head -1`
-   (KL is column 6).  This is your target to beat.
+1. **Verify the branch**: `git branch --show-current`.
+2. **Read Q4_K baseline**: See first row of `results.tsv` for size, KLD, and top-P targets.
 3. **Confirm reference cache exists**: `ls cache/ref_logits_0.8B.mmap` — must be present.
    Do NOT delete or regenerate it.
 4. **Confirm environment**: `HF_HUB_OFFLINE=1` is set in the shell for all commands.
@@ -537,10 +505,9 @@ groupsize-specific baselines.
 
 2. **Propose one experiment**:
    - Hypothesis (one sentence).
-   - Algorithm family tag (e.g. `scale_optimization`, `error_compensation`,
-     `activation_weighted`, `codebook`, `layer_policy`).
-   - Expected storage impact (none / +X MB).
-   - Expected VRAM impact (none / +X MB for Y tensors).
+   - Algorithm family tag.
+   - Expected storage impact (must end up < Q4_K size).
+   - Expected VRAM impact.
    - Why it is novel versus prior runs (check idea_ledger.md).
 
 3. **Modify only `quantize.py`**.
@@ -549,10 +516,8 @@ groupsize-specific baselines.
    ```
    python -m py_compile quantize.py
    ```
-   If your change introduces new metadata or format, verify the save/load round-trip
-   works with a minimal test (logged under `runs/<exp_id>/diagnostics/`).
 
-5. **Commit the code BEFORE eval** (so `code_sha` points to the actual tested code):
+5. **Commit the code BEFORE eval**:
    ```bash
    git add quantize.py
    git commit -m "exp: <description>"
@@ -562,28 +527,35 @@ groupsize-specific baselines.
    mkdir -p runs/$EXP_ID
    ```
 
-6. **Run quantization and eval** (from repo root):
+6. **Run quantization and evals**:
    ```bash
    # Quantize
    HF_HUB_OFFLINE=1 .venv/bin/python quantize.py \
-       --model Qwen/Qwen3.5-0.8B --bits 2 \
+       --model Qwen/Qwen3.5-0.8B --bits <N> \
        --dtype bfloat16 --groupsize <N> \
        --save quantized_models/<tag> 2>&1 | tee runs/$EXP_ID/quantize.log
 
-   # Record size BEFORE deleting
+   # Record size
    du -sm quantized_models/<tag>/compressed | tee runs/$EXP_ID/size_mb.txt
 
-   # Evaluate
+   # Evaluate KL divergence
    HF_HUB_OFFLINE=1 .venv/bin/python eval_perplexity.py \
        --model quantized_models/<tag> \
        --reference Qwen/Qwen3.5-0.8B \
        --context-length 1024 --max-tokens 5000 \
        --reference-cache cache/ref_logits_0.8B.mmap 2>&1 | tee runs/$EXP_ID/eval.log
 
+   # Evaluate same-top-P
+   HF_HUB_OFFLINE=1 .venv/bin/python eval_topk.py \
+       --model quantized_models/<tag> \
+       --reference Qwen/Qwen3.5-0.8B \
+       --reference-cache cache/ref_logits_0.8B.mmap \
+       --context-length 1024 --max-tokens 5000 2>&1 | tee runs/$EXP_ID/topk.log
+
    # Cleanup
    rm -rf quantized_models/<tag>
    ```
-   Extract `SIZE_MB`, `KL`, and `TOK_PER_SEC` from the log files.
+   Extract `SIZE_MB`, `KL`, `TOP_P`, and `TOK_PER_SEC` from the log files.
 
 7. **On crash / OOM / NaN / size-limit failure**:
    - Append one row to `experiments/failures.tsv`.
@@ -600,7 +572,7 @@ groupsize-specific baselines.
 
 8. **On valid eval** — append one TSV row to `results.tsv` using actual values:
    ```
-   <timestamp>	<EXP_ID>	<CODE_SHA>	<PARENT_SHA>	<description>	success	<KL>	2	<groupsize>	true	<format>	1024	5000	<SIZE_MB>	<VRAM_MB>	<TOK_PER_SEC>
+   <timestamp>	<EXP_ID>	<CODE_SHA>	<PARENT_SHA>	<description>	success	<KL>	<TOP_P>	<bits>	<groupsize>	true	<format>	1024	5000	<SIZE_MB>	<VRAM_MB>	<TOK_PER_SEC>
    ```
    Tab-separated, no commas in description.
 
@@ -609,21 +581,18 @@ groupsize-specific baselines.
 9. **Record the result permanently**:
    ```bash
    git add results.tsv experiments/idea_ledger.md runs/$EXP_ID/
-   git commit -m "record: <description> (KL=<value>)"
+   git commit -m "record: <description> (KL=<value>, top-P=<value>)"
    ```
 
 10. **Decide whether to keep the code**:
-    - **If this KL is the new global best** (lower than every other row in results.tsv):
-      keep the code — the branch tip is now the best implementation.
-    - **If KL is NOT a new global best**:
-      ```bash
-      git revert --no-edit $CODE_SHA
-      ```
-      The result remains recorded forever.  The branch tip returns to the
-      previous-best code.  Do NOT reset — `git revert` preserves history.
+    - **If this result beats the current best across all three metrics**
+      (smaller, same/better KLD, same/better top-P): keep the code.
+    - **If NOT a new global best**: `git revert --no-edit $CODE_SHA`.
+      The result remains recorded forever. The branch tip returns to the
+      previous-best code.
 
-    Exception: during **Phase 0 baseline sweeps**, no algorithm changes are made
-    and results are only used to choose the default groupsize.  Code does not change.
+    Exception: during **Phase 0 baseline establishment**, only the Q4_K
+    baseline is recorded. No algorithm changes are made.
 
 11. **Every 5 valid official runs**, write a synthesis checkpoint to
     `experiments/synthesis.md` and commit it.
