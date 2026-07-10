@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 64) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 128) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -684,7 +684,7 @@ def quantize_model(
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
     fmt: str = "q2_kmeans",
-    quants_delta_K: int = 64,
+    quants_delta_K: int = 128,
 ) -> dict:
     model.eval()
     model.cpu()
