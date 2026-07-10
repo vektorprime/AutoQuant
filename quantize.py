@@ -7,7 +7,6 @@ CPU-based, vectorised quantization.  No GPU sync per layer.
 """
 
 import argparse
-import bz2
 import json
 import logging
 import os
@@ -431,18 +430,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                          scales_shape=data["scales_6bit"].shape,
                          mins_zlib=m_arr,
                          mins_shape=data["mins_6bit"].shape,
-                          format="q4_k_zlib2")
-            elif fmt == "q4_k_bz2":
-                q_compressed = bz2.compress(q_out.tobytes(), compresslevel=9)
-                q_arr = np.frombuffer(q_compressed, dtype=np.uint8)
-                np.savez(fname,
-                         quants_bz2=q_arr,
-                         quants_shape=q_out.shape,
-                         d=data["d"],
-                         dmin=data["dmin"],
-                         scales_6bit=data["scales_6bit"],
-                         mins_6bit=data["mins_6bit"],
-                         format="q4_k_bz2")
+                         format="q4_k_zlib2")
             else:
                 np.savez(fname,
                          quants=q_out,
@@ -549,7 +537,7 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k" or fmt == "q4_k_zlib" or fmt == "q4_k_zlib2" or fmt == "q4_k_bz2":
+        if fmt == "q4_k" or fmt == "q4_k_zlib" or fmt == "q4_k_zlib2":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -604,8 +592,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_bz2"],
-                        help="Quantization format (..., q4_k_zlib2=Q4_K+zlib codes+meta, q4_k_bz2=Q4_K+bz2 codes)")
+                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q3_kmeans=K-means 3-bit, q4_k=GGML-style 4-bit blocks, q4_k_zlib=Q4_K+zlib codes, q4_k_zlib2=Q4_K+zlib codes+meta)")
     return parser.parse_args()
 
 
@@ -647,7 +635,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_bz2") else (3 if args.format == "q3_kmeans" else args.bits)
+    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2") else (3 if args.format == "q3_kmeans" else args.bits)
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
