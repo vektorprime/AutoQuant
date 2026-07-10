@@ -254,22 +254,20 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
     delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
 
-    # Inter-channel quants delta compression: Kq=2, store ref + 2-bit deltas
-    Kq = 2
+    # Inter-channel quants delta compression: Kq=4, store 1 ref + 3 delta channels
+    Kq = 4
     out_pad_q = ((out_features + Kq - 1) // Kq) * Kq
     quants_np = quants_flat.numpy()
     if out_features < out_pad_q:
         q_pad = np.pad(quants_np, ((0, out_pad_q - out_features), (0, 0)), mode='constant', constant_values=0)
     else:
         q_pad = quants_np
-    q_ref = q_pad[0::2][:((out_pad_q + 1) // 2)]
-    q_tgt = q_pad[1::2][:((out_pad_q + 1) // 2)]
-    if q_ref.shape[0] < q_tgt.shape[0]:
-        q_ref = q_ref[:q_tgt.shape[0]]
-    elif q_tgt.shape[0] < q_ref.shape[0]:
-        q_tgt = q_tgt[:q_ref.shape[0]]
-    quants_delta_packed = _pack_quants_delta(q_ref, q_tgt)
+    n_groups_q = out_pad_q // Kq
+    q_grp = q_pad.reshape(n_groups_q, Kq, -1)
+    q_ref = q_grp[:, 0, :]
+    q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
     quants_ref_packed = _pack_4bit(q_ref)
+    quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1)
 
     return {
         "base_packed":    base_packed,
@@ -506,18 +504,19 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray) -> np.ndarray:
-    """Pack 256 × 2-bit signed deltas (-1,0,1,2) into 64 bytes."""
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int) -> np.ndarray:
+    """Pack 256 × 2-bit signed deltas (-1,0,1,2) into 64 bytes per target channel."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
-    ref_sb = ref_quants.reshape(out, n_blocks, QK_K)
-    tgt_sb = tgt_quants.reshape(out, n_blocks, QK_K)
-    delta = tgt_sb.astype(np.int16) - ref_sb.astype(np.int16)
-    delta = np.clip(delta + 1, 0, 3).astype(np.uint8)
-    packed = np.zeros((out, n_blocks, 64), dtype=np.uint8)
-    for o in range(out):
-        for b in range(n_blocks):
-            packed[o, b] = _pack_2bit(delta[o, b].reshape(1, 256)).reshape(64)
+    ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
+    tgt_sb = tgt_quants.reshape(n_tgt, out, n_blocks, QK_K).astype(np.int16)
+    packed = np.zeros((n_tgt, out, n_blocks, 64), dtype=np.uint8)
+    for t in range(n_tgt):
+        diff = tgt_sb[t] - ref_sb
+        delta = np.clip(diff + 1, 0, 3).astype(np.uint8)
+        for o in range(out):
+            for b in range(n_blocks):
+                packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(64)
     return packed
 
 
