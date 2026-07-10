@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Post-training quantization for AutoModelForCausalLM.
-Supports multiple formats: q2_kmeans (default), q4_k (GGML-style 4-bit blocks).
+Supports q2_kmeans and a custom Q4_K-like affine packed format.
 
 CPU-based, vectorised quantization.  No GPU sync per layer.
 """
@@ -12,6 +12,7 @@ import logging
 import os
 
 import numpy as np
+import safetensors.torch as st
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -25,24 +26,28 @@ VRAM_LIMIT_MB = 8192
 
 # Max compressed size: Q4_K baseline for 0.8B is ~450 MB.  We'll know the
 # exact number after the first Q4_K run and update this.
-MAX_COMPRESSED_MB = 500
+MAX_COMPRESSED_MB = 6000
 
 _NEVER_QUANTIZE = frozenset([
     "linear_attn.in_proj_a",
     "linear_attn.in_proj_b",
 ])
 
-# Q4_K block geometry (GGML-compatible)
+# Q4_K-like block geometry (custom storage; not byte-compatible with GGML)
 QK_K = 256
 QK_K_SUB_BLOCKS = 8
 QK_K_SUB_SIZE = QK_K // QK_K_SUB_BLOCKS  # 32
 
+# Packed format constants. Version 2 stores one d/dmin pair per output row
+# and superblock.  The scale dtype is recorded in the manifest.
+Q4K_FORMAT_NAME = "q4k_affine_v2"
+Q4K_PACKED_KEYS = ["quants_packed", "d", "dmin", "scales_mins_packed"]
 
-def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
-    attn_keywords = ("q_proj", "k_proj", "v_proj", "o_proj", "lm_head")
-    if any(kw in name for kw in attn_keywords):
-        return max(16, default_groupsize // 2)
-    return default_groupsize
+
+def _normalise_shape(shape) -> tuple[int, int]:
+    if isinstance(shape, torch.Tensor):
+        shape = shape.detach().cpu().tolist()
+    return int(shape[0]), int(shape[1])
 
 
 # ---------------------------------------------------------------------------
@@ -88,133 +93,230 @@ def _collect_input_stats(
         for h in handles:
             h.remove()
 
-    return {name: s[0] / max(s[1], 1) for name, s in stats.items()}
+    return {name: value[0] / max(value[1], 1) for name, value in stats.items()}
 
 
 # ---------------------------------------------------------------------------
-# Q4_K quantization (GGML-style 4-bit block quantization)
+# Q4_K-like affine block quantization
+#
 # Superblock: 256 weights, 8 sub-blocks of 32.
-# Per superblock: fp16 d + fp16 dmin (4 bytes).
-# Per sub-block: 6-bit scale + 6-bit min (12 bytes / 8 sub-blocks).
-# Per weight: 4-bit quantized value (128 bytes / 256 weights).
-# Total: 144 bytes per 256 weights → 4.5 bits/weight.
+# Per output row and superblock: d + dmin (fp32 by default).
+# Per sub-block: 6-bit scale + 6-bit min (packed into 12 bytes).
+# Per weight: 4-bit code.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
-    W = layer.weight.data.float()
-    out_features, in_features = W.shape
-
-    assert in_features % QK_K == 0, (
-        f"in_features ({in_features}) must be divisible by QK_K ({QK_K})")
+def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Canonical CPU decoder used by tests and optional fake-quant checks."""
+    quants_packed = torch.as_tensor(packed["quants_packed"], dtype=torch.uint8)
+    # Backward-compatible aliases for checkpoints produced by the previous code.
+    d_value = packed["d"] if "d" in packed else packed["d8"]
+    dmin_value = packed["dmin"] if "dmin" in packed else packed["dm8"]
+    d = torch.as_tensor(d_value).float()
+    dmin = torch.as_tensor(dmin_value).float()
+    sm = torch.as_tensor(packed["scales_mins_packed"], dtype=torch.uint8)
+    out_features, in_features = _normalise_shape(packed["shape"])
     n_blocks = in_features // QK_K
 
-    W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
-    # shape: (out, n_blocks, 8, 32)
+    q_lo = quants_packed & 0x0F
+    q_hi = quants_packed >> 4
+    q_flat = torch.empty(out_features, in_features, dtype=torch.uint8)
+    q_flat[:, 0::2] = q_lo
+    q_flat[:, 1::2] = q_hi
 
-    # Per-sub-block min/max → per-block (superblock) min/max
-    w_sub_min = W_r.amin(dim=-1)      # (out, n_blocks, 8)
-    w_sub_max = W_r.amax(dim=-1)
-    w_blk_min = w_sub_min.amin(dim=-1)  # (out, n_blocks)
-    w_blk_max = w_sub_max.amax(dim=-1)
+    s = sm.to(dtype=torch.int32)
+    packed_sm = torch.empty(out_features, n_blocks, 8, dtype=torch.int32)
+    for pair in range(4):
+        i = pair * 2
+        b = pair * 3
+        packed_sm[:, :, i] = s[:, :, b] | ((s[:, :, b + 1] & 0x0F) << 8)
+        packed_sm[:, :, i + 1] = (s[:, :, b + 1] >> 4) | (s[:, :, b + 2] << 4)
 
-    # Global scale d and min-offset base dmin (positive magnitude)
-    d = (w_blk_max - w_blk_min) / 15.0
-    d[d < 1e-8] = 1e-8
-    dmin = w_blk_min.abs().clamp(min=1e-8)
-
-    # Per-sub-block effective scale and min
-    d_sub = (w_sub_max - w_sub_min) / 15.0
-    d_sub[d_sub < 1e-8] = 1e-8
-
-    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
-    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
-    sc_norm = sc_6bit.float() / 63.0
-
-    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
-    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
-    m_norm = m_6bit.float() / 63.0
-
-    eff_scale = d.unsqueeze(-1) * sc_norm         # (out, n_blocks, 8)
-    eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm       # (out, n_blocks, 8)
-
-    # Quantize:  w ≈ eff_scale * q - eff_offset,   q ∈ {0..15}
-    q = torch.round(
-        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
+    sc_norm = ((packed_sm >> 6) & 0x3F).float() / 63.0
+    min_norm = (packed_sm & 0x3F).float() / 63.0
+    q_blocks = q_flat.reshape(
+        out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE
+    ).float()
+    weights = (
+        (d.unsqueeze(-1) * sc_norm).unsqueeze(-1) * q_blocks
+        - (dmin.unsqueeze(-1) * min_norm).unsqueeze(-1)
     )
-    q = torch.clamp(q, 0, 15).to(torch.uint8)
+    return weights.reshape(out_features, in_features).to(dtype=dtype)
 
-    W_flat = W.reshape(out_features, n_blocks, QK_K)
 
-    for _ in range(3):
-        s = sc_norm.unsqueeze(-1) * q.float()
-        s_flat = s.flatten(start_dim=2)
-        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
-        m_flat = m.flatten(start_dim=2)
+def _encode_q4k(
+    layer: nn.Linear,
+    scale_dtype: torch.dtype = torch.float32,
+    refine_mode: str = "legacy_exact",
+    refine_iters: int = 3,
+) -> dict:
+    """Encode one Linear weight without mutating the source model.
 
-        s_sq = (s_flat * s_flat).sum(dim=-1)
-        m_sq = (m_flat * m_flat).sum(dim=-1)
-        sm = (s_flat * m_flat).sum(dim=-1)
-        ws = (W_flat * s_flat).sum(dim=-1)
-        wm = (W_flat * m_flat).sum(dim=-1)
+    refine_mode:
+      * legacy_exact: reproduce the historical fake-quant BF16 path.  Codes
+        are assigned once, then d/dmin are solved with those codes held fixed.
+      * alternating: alternate code assignment and least-squares d/dmin solves.
+      * none: min/max initialization only.
+    """
+    if scale_dtype not in (torch.float16, torch.float32):
+        raise ValueError("Q4_K scale dtype must be float16 or float32")
+    if refine_mode not in {"legacy_exact", "alternating", "none"}:
+        raise ValueError(
+            "refine_mode must be one of: legacy_exact, alternating, none"
+        )
 
-        det = s_sq * m_sq - sm * sm
-        det[det.abs() < 1e-12] = 1e-12
-        d_new = (ws * m_sq - wm * sm) / det
-        dmin_new = (ws * sm - wm * s_sq) / det
+    weights = layer.weight.detach().float().cpu()
+    out_features, in_features = weights.shape
+    if in_features % QK_K != 0:
+        raise ValueError(
+            f"in_features ({in_features}) must be divisible by {QK_K}"
+        )
+    n_blocks = in_features // QK_K
+    blocks = weights.reshape(
+        out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE
+    )
 
-        d = d_new.clamp(min=1e-8)
-        dmin = dmin_new.abs().clamp(min=1e-8)
+    sub_min = blocks.amin(dim=-1)
+    sub_max = blocks.amax(dim=-1)
+    block_min = sub_min.amin(dim=-1)
+    block_max = sub_max.amax(dim=-1)
 
-    # Share d/dmin across K=4 output channels with 4-bit per-channel scale factors
-    K = 4
-    out_pad = ((out_features + K - 1) // K) * K
-    n_groups = out_pad // K
+    d = ((block_max - block_min) / 15.0).clamp_min(1e-8)
+    d_sub = ((sub_max - sub_min) / 15.0).clamp_min(1e-8)
 
-    d_storage = d.clone()
-    dmin_storage = dmin.clone()
+    if refine_mode == "legacy_exact":
+        # This intentionally matches d46e089, including abs() semantics.
+        dmin = block_min.abs().clamp_min(1e-8)
+        sub_min_magnitude = sub_min.abs()
+    else:
+        # Mathematically correct affine interpretation for w = d*s*q - dmin*m.
+        dmin = (-block_min).clamp_min(0.0)
+        sub_min_magnitude = (-sub_min).clamp_min(0.0)
 
-    if out_features < out_pad:
-        d_storage = torch.nn.functional.pad(d_storage, (0, 0, 0, out_pad - out_features))
-        dmin_storage = torch.nn.functional.pad(dmin_storage, (0, 0, 0, out_pad - out_features))
+    scales_6bit = torch.clamp(
+        torch.round((d_sub / d.unsqueeze(-1).clamp_min(1e-8)) * 63.0),
+        1,
+        63,
+    ).to(torch.uint8)
+    mins_6bit = torch.clamp(
+        torch.round(
+            (sub_min_magnitude / dmin.unsqueeze(-1).clamp_min(1e-8)) * 63.0
+        ),
+        0,
+        63,
+    ).to(torch.uint8)
+    scale_norm = scales_6bit.float() / 63.0
+    min_norm = mins_6bit.float() / 63.0
 
-    d_grp = d_storage.reshape(n_groups, K, n_blocks)
-    dmin_grp = dmin_storage.reshape(n_groups, K, n_blocks)
+    def assign_codes(current_d: torch.Tensor, current_dmin: torch.Tensor) -> torch.Tensor:
+        effective_scale = (
+            current_d.unsqueeze(-1) * scale_norm
+        ).clamp_min(1e-8)
+        effective_offset = current_dmin.unsqueeze(-1) * min_norm
+        return torch.clamp(
+            torch.round(
+                (blocks + effective_offset.unsqueeze(-1))
+                / effective_scale.unsqueeze(-1)
+            ),
+            0,
+            15,
+        )
 
-    shared_d = d_grp.amax(dim=1)
-    shared_dmin = dmin_grp.amax(dim=1)
+    codes = assign_codes(d, dmin)
+    flat_weights = weights.reshape(out_features, n_blocks, QK_K)
+    expanded_min = min_norm.unsqueeze(-1).expand(
+        -1, -1, -1, QK_K_SUB_SIZE
+    ).flatten(start_dim=2)
 
-    sf_d = (d_grp / shared_d.unsqueeze(1).clamp(min=1e-8)).clamp(0.0, 1.0)
-    sf_d_4bit = torch.clamp(torch.round(sf_d * 15.0), 1, 15).to(torch.uint8)
-    sf_dm = (dmin_grp / shared_dmin.unsqueeze(1).clamp(min=1e-8)).clamp(0.0, 1.0)
-    sf_dm_4bit = torch.clamp(torch.round(sf_dm * 15.0), 1, 15).to(torch.uint8)
+    def solve_scales(
+        fixed_codes: torch.Tensor,
+        current_d: torch.Tensor,
+        current_dmin: torch.Tensor,
+        legacy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        scale_codes = (scale_norm.unsqueeze(-1) * fixed_codes).flatten(start_dim=2)
+        scale_sq = (scale_codes * scale_codes).sum(dim=-1)
+        min_sq = (expanded_min * expanded_min).sum(dim=-1)
+        cross = (scale_codes * expanded_min).sum(dim=-1)
+        weight_scale = (flat_weights * scale_codes).sum(dim=-1)
+        weight_min = (flat_weights * expanded_min).sum(dim=-1)
+        determinant = scale_sq * min_sq - cross * cross
 
-    sf_d_packed = (sf_d_4bit[:, 0::2, :] | (sf_d_4bit[:, 1::2, :] << 4))
-    sf_dm_packed = (sf_dm_4bit[:, 0::2, :] | (sf_dm_4bit[:, 1::2, :] << 4))
+        if legacy:
+            # Historical code replaced every tiny determinant with +1e-12.
+            determinant = determinant.clone()
+            determinant[determinant.abs() < 1e-12] = 1e-12
+            solved_d = (
+                weight_scale * min_sq - weight_min * cross
+            ) / determinant
+            solved_dmin = (
+                weight_scale * cross - weight_min * scale_sq
+            ) / determinant
+            return (
+                solved_d.clamp_min(1e-8),
+                solved_dmin.abs().clamp_min(1e-8),
+            )
 
-    eff_scale = d.unsqueeze(-1) * sc_norm
-    eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm
+        valid = determinant.abs() > 1e-12
+        solved_d = torch.where(
+            valid,
+            (weight_scale * min_sq - weight_min * cross) / determinant,
+            current_d,
+        ).clamp_min(1e-8)
+        solved_dmin = torch.where(
+            valid,
+            (weight_scale * cross - weight_min * scale_sq) / determinant,
+            current_dmin,
+        ).clamp_min(0.0)
+        return solved_d, solved_dmin
 
-    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
-    W_q = W_q_r.reshape(out_features, in_features)
-    layer.weight.data = W_q.to(layer.weight.dtype)
+    if refine_mode == "legacy_exact" and refine_iters > 0:
+        # Repeating the old solve was algebraically redundant because codes did
+        # not change.  One solve reproduces the final historical values.
+        d, dmin = solve_scales(codes, d, dmin, legacy=True)
+    elif refine_mode == "alternating":
+        for _ in range(max(0, refine_iters)):
+            d, dmin = solve_scales(codes, d, dmin, legacy=False)
+            codes = assign_codes(d, dmin)
 
-    quants_flat = q.reshape(out_features, in_features)
+    d_stored = d.to(scale_dtype).contiguous()
+    dmin_stored = dmin.to(scale_dtype).contiguous()
+
+    sm_values = (scales_6bit.to(torch.int32) << 6) | mins_6bit.to(torch.int32)
+    sm_packed = torch.empty(out_features, n_blocks, 12, dtype=torch.uint8)
+    for pair in range(4):
+        i = pair * 2
+        b = pair * 3
+        first = sm_values[:, :, i]
+        second = sm_values[:, :, i + 1]
+        sm_packed[:, :, b] = first & 0xFF
+        sm_packed[:, :, b + 1] = (first >> 8) | ((second & 0x0F) << 4)
+        sm_packed[:, :, b + 2] = second >> 4
+
+    flat_codes = codes.to(torch.uint8).reshape(out_features, in_features)
+    quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
 
     return {
-        "shared_d":       shared_d.numpy().astype(np.float16),    # (groups, n_blocks)
-        "shared_dmin":    shared_dmin.numpy().astype(np.float16), # (groups, n_blocks)
-        "sf_d_packed":    sf_d_packed.numpy(),                    # (groups, K//2, n_blocks) uint8
-        "sf_dm_packed":   sf_dm_packed.numpy(),                   # (groups, K//2, n_blocks) uint8
-        "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
-        "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
-        "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
-        "format":         "q4_k",
-        "shape":          [out_features, in_features],
-        "n_blocks":       n_blocks,
-        "K":              K,
+        "quants_packed": quants_packed.numpy(),
+        "d": d_stored.numpy(),
+        "dmin": dmin_stored.numpy(),
+        "scales_mins_packed": sm_packed.numpy(),
+        "shape": [out_features, in_features],
+        "scale_dtype": str(scale_dtype).removeprefix("torch."),
+        "refine_mode": refine_mode,
     }
+
+
+def _quantize_one_layer_q4k(
+    layer: nn.Linear,
+    scale_dtype: torch.dtype = torch.float32,
+    refine_mode: str = "legacy_exact",
+) -> dict:
+    """Return packed bytes without replacing or mutating the source weight."""
+    return _encode_q4k(
+        layer,
+        scale_dtype=scale_dtype,
+        refine_mode=refine_mode,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -395,149 +497,111 @@ def _quantize_one_layer(
 # ---------------------------------------------------------------------------
 # Compressed storage
 # ---------------------------------------------------------------------------
+# Compressed storage (safetensors + manifest + residual)
+# ---------------------------------------------------------------------------
 
-def _pack_2bit(codes: np.ndarray) -> np.ndarray:
-    """Pack 4 × 2-bit values into one uint8."""
-    out, inp = codes.shape
-    assert inp % 4 == 0
-    codes = codes.reshape(out, inp // 4, 4)
-    packed = (codes[..., 0]
-              | (codes[..., 1] << 2)
-              | (codes[..., 2] << 4)
-              | (codes[..., 3] << 6))
-    return packed.astype(np.uint8)
-
-
-def _pack_4bit(codes: np.ndarray) -> np.ndarray:
-    """Pack 2 × 4-bit values into one uint8."""
-    out, inp = codes.shape
-    assert inp % 2 == 0
-    codes = codes.reshape(out, inp // 2, 2)
-    packed = (codes[..., 0] | (codes[..., 1] << 4))
-    return packed.astype(np.uint8)
-
-
-def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
-    """Pack 8 × (6-bit scale + 6-bit min) = 96 bits → 12 bytes per superblock.
-    Saves 4 bytes/superblock vs separate uint8 arrays."""
-    out, nb, nsub = scales_6bit.shape
-    assert nsub == 8
-    sm = (scales_6bit.astype(np.uint16) << 6) | mins_6bit.astype(np.uint16)
-    packed = np.zeros((out, nb, 12), dtype=np.uint8)
-    for p in range(4):
-        i = p * 2
-        s0 = sm[:, :, i]
-        s1 = sm[:, :, i + 1]
-        b = p * 3
-        packed[:, :, b] = s0 & 0xFF
-        packed[:, :, b + 1] = (s0 >> 8) | ((s1 & 0x0F) << 4)
-        packed[:, :, b + 2] = s1 >> 4
-    return packed
-
-
-def _pack_fp16_to_log8(arr: np.ndarray) -> np.ndarray:
-    """Pack fp16 d/dmin into uint8 log-scale. ~6 MB savings per model."""
-    arr = arr.astype(np.float32)
-    arr = np.maximum(arr, 1e-8)
-    log2 = np.log2(arr)
-    encoded = np.clip(np.round(log2 * 12.0 + 128.0), 0, 255).astype(np.uint8)
-    return encoded
-
-
-def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans") -> int:
+def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
+    """Save packed Q4_K weights, untouched residual tensors, and a manifest."""
     os.makedirs(save_dir, exist_ok=True)
-    total_bytes = 0
-    layer_info = {}
+    module_map = dict(model.named_modules())
 
-    for name, data in tqdm(meta.items(), desc="Saving compressed"):
-        fname = os.path.join(save_dir, name + ".npz")
-        os.makedirs(os.path.dirname(fname), exist_ok=True)
+    packed_tensors: dict[str, torch.Tensor] = {}
+    layer_manifest: dict[str, dict] = {}
+    total_packed_bytes = 0
+    scale_dtypes = set()
+    refine_modes = set()
 
-        if data.get("format") == "q4_k":
-            quants = data["quants"]
-            q_out = _pack_4bit(quants)
-            sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
-            if "shared_d" in data:
-                d8 = _pack_fp16_to_log8(data["shared_d"])
-                dm8 = _pack_fp16_to_log8(data["shared_dmin"])
-                np.savez(fname,
-                         quants=q_out,
-                         d8=d8,
-                         dm8=dm8,
-                         sf_d_packed=data["sf_d_packed"],
-                         sf_dm_packed=data["sf_dm_packed"],
-                         K=data.get("K", 4),
-                         scales_mins_packed=sm_packed,
-                         format=data["format"])
-            else:
-                d8 = _pack_fp16_to_log8(data["d"])
-                dm8 = _pack_fp16_to_log8(data["dmin"])
-                np.savez(fname,
-                         quants=q_out,
-                         d8=d8,
-                         dm8=dm8,
-                         scales_mins_packed=sm_packed,
-                         format=data["format"])
-        elif bits == 4 and data["shape"][1] % 2 == 0:
-            codes_out = _pack_4bit(data["codes"])
-            np.savez(fname, codes=codes_out,
-                     codebook_q=data.get("codebook_q"),
-                     cb_min=data.get("cb_min"),
-                     cb_max=data.get("cb_max"),
-                     codebook_dtype=data.get("codebook_dtype", "q4"))
-        elif bits == 2 and data["shape"][1] % 4 == 0:
-            codes_out = _pack_2bit(data["codes"])
-            if "codebook_q" in data:
-                np.savez(fname,
-                         codes=codes_out,
-                         codebook_q=data["codebook_q"],
-                         cb_min=data["cb_min"],
-                         cb_max=data["cb_max"],
-                         codebook_dtype=data["codebook_dtype"])
-            elif "codebook" in data:
-                np.savez(fname,
-                         codes=codes_out,
-                         codebook=data["codebook"],
-                         codebook_dtype=data["codebook_dtype"])
-            else:
-                np.savez(fname,
-                         codes=codes_out,
-                         scales=data["scales"],
-                         scale_dtype=data["scale_dtype"],
-                         zero_pt=data["zero_pt"])
-        else:
-            codes_out = data["codes"]
-            if "codebook_q" in data:
-                np.savez(fname,
-                         codes=codes_out,
-                         codebook_q=data["codebook_q"],
-                         cb_min=data["cb_min"],
-                         cb_max=data["cb_max"],
-                         codebook_dtype=data["codebook_dtype"])
-            else:
-                np.savez(fname,
-                         codes=codes_out,
-                         scales=data["scales"],
-                         scale_dtype=data["scale_dtype"],
-                         zero_pt=data["zero_pt"])
-        total_bytes += os.path.getsize(fname)
-        layer_info[name] = data["shape"]
+    for name, data in tqdm(meta.items(), desc="Saving packed"):
+        if name not in module_map or not isinstance(module_map[name], nn.Linear):
+            raise RuntimeError(f"Quantized layer '{name}' is not an nn.Linear")
+        prefix = f"{name}.{Q4K_FORMAT_NAME}"
+        for key in Q4K_PACKED_KEYS:
+            if key not in data:
+                raise RuntimeError(f"Layer '{name}' is missing packed field '{key}'")
+            tensor = torch.from_numpy(np.ascontiguousarray(data[key]))
+            packed_tensors[f"{prefix}.{key}"] = tensor
+            total_packed_bytes += tensor.numel() * tensor.element_size()
 
-    with open(os.path.join(save_dir, "meta.json"), "w") as f:
-        json.dump({
-            "bits": bits,
-            "format": fmt,
-            "layers": layer_info,
-            "total_compressed_mb": round(total_bytes / 1e6, 2),
-        }, f, indent=2)
+        module = module_map[name]
+        scale_dtypes.add(data["scale_dtype"])
+        refine_modes.add(data["refine_mode"])
+        layer_manifest[name] = {
+            "shape": [int(data["shape"][0]), int(data["shape"][1])],
+            "has_bias": module.bias is not None,
+            "scale_dtype": data["scale_dtype"],
+            "refine_mode": data["refine_mode"],
+        }
 
-    logger.info("Compressed storage: %.1f MB (%d layers)",
-                total_bytes / 1e6, len(meta))
+    if len(scale_dtypes) > 1:
+        raise RuntimeError(f"Mixed Q4_K scale dtypes are not supported: {scale_dtypes}")
+    if len(refine_modes) > 1:
+        raise RuntimeError(f"Mixed Q4_K refine modes are not supported: {refine_modes}")
+
+    shard_name = f"{Q4K_FORMAT_NAME}-00001-of-00001.safetensors"
+    if packed_tensors:
+        st.save_file(packed_tensors, os.path.join(save_dir, shard_name))
+        logger.info(
+            "Packed weights: %.1f MB (%d layers, %d tensors)",
+            total_packed_bytes / 1e6,
+            len(layer_manifest),
+            len(packed_tensors),
+        )
+
+    quantized_weight_keys = {f"{name}.weight" for name in layer_manifest}
+    residual_state: dict[str, torch.Tensor] = {}
+    residual_bytes = 0
+    for key, tensor in model.state_dict().items():
+        if key in quantized_weight_keys:
+            continue
+        # clone() also breaks shared-storage aliases, which safetensors rejects.
+        stored = tensor.detach().cpu().contiguous().clone()
+        residual_state[key] = stored
+        residual_bytes += stored.numel() * stored.element_size()
+
+    max_residual_bytes = 6 * 1024**3
+    if residual_bytes > max_residual_bytes:
+        raise RuntimeError(
+            f"Residual too large: {residual_bytes / 1e9:.2f} GB. "
+            "Large projections were probably skipped and would defeat packed-only loading."
+        )
+
+    residual_name = "residual.safetensors"
+    if residual_state:
+        st.save_file(residual_state, os.path.join(save_dir, residual_name))
+        logger.info(
+            "Residual: %.1f MB (%d tensors)",
+            residual_bytes / 1e6,
+            len(residual_state),
+        )
+
+    manifest = {
+        "format": Q4K_FORMAT_NAME,
+        "format_version": 2,
+        "block_size": QK_K,
+        "sub_block_size": QK_K_SUB_SIZE,
+        "output_scale_group": 1,
+        "scale_dtype": next(iter(scale_dtypes), "float32"),
+        "refine_mode": next(iter(refine_modes), "legacy_exact"),
+        "weight_files": [shard_name],
+        "residual_file": residual_name,
+        "quantized_layers": layer_manifest,
+        "residual_parameters": sorted(residual_state),
+    }
+    with open(os.path.join(save_dir, "q4k_manifest.json"), "w") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    total_bytes = total_packed_bytes + residual_bytes
+    logger.info(
+        "Total: %.1f MB (packed %.1f + residual %.1f)",
+        total_bytes / 1e6,
+        total_packed_bytes / 1e6,
+        residual_bytes / 1e6,
+    )
     return total_bytes
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# Quantization driver
 # ---------------------------------------------------------------------------
 
 def quantize_model(
@@ -547,6 +611,8 @@ def quantize_model(
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
     fmt: str = "q2_kmeans",
+    q4k_scale_dtype: torch.dtype = torch.float32,
+    q4k_refine_mode: str = "legacy_exact",
 ) -> dict:
     model.eval()
     model.cpu()
@@ -566,12 +632,15 @@ def quantize_model(
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
-            meta[name] = _quantize_one_layer_q4k(layer)
+            meta[name] = _quantize_one_layer_q4k(
+                layer,
+                scale_dtype=q4k_scale_dtype,
+                refine_mode=q4k_refine_mode,
+            )
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
-                logger.warning("Skipping %s: in_features %d not divisible by %d",
-                               name, layer.weight.shape[1], layer_gs)
+                logger.warning("Skipping %s", name)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
             if "lm_head" in name:
@@ -587,10 +656,14 @@ def quantize_model(
                                              diffusion=layer_diffusion)
 
     if save_compressed_dir:
-        _save_compressed(meta, save_compressed_dir, bits, fmt)
+        if fmt != "q4_k":
+            raise NotImplementedError(
+                "The packed-only safetensors writer currently supports only --format q4_k"
+            )
+        _save_packed_q4k(meta, save_compressed_dir, model)
 
     if skipped_small:
-        logger.info("Skipped %d small/SSM layers (never quantize)", skipped_small)
+        logger.info("Skipped %d small/SSM layers", skipped_small)
 
     return meta
 
@@ -604,20 +677,34 @@ def parse_args():
         description="Post-training quantization for causal LMs",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--bits", type=int, default=2, choices=[2, 3, 4, 8])
-    parser.add_argument("--groupsize", type=int, default=DEFAULT_GROUPSIZE,
-                        help="Group size (min 16, must divide in_features)")
+    parser.add_argument("--groupsize", type=int, default=DEFAULT_GROUPSIZE)
     parser.add_argument("--dtype", default="bfloat16",
-                        choices=["float16", "bfloat16", "float32"],
-                        help="Precision for loading the base model")
+                        choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--save", default=None,
                         help="Directory to save quantized model")
-    parser.add_argument("--calibration-cache", default=None,
-                        help="Path to cache/load calibration stats (.npz file)")
+    parser.add_argument("--calibration-cache", default=None)
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+                        choices=["q2_kmeans", "q4_k"])
+    parser.add_argument(
+        "--q4k-scale-dtype",
+        default="float32",
+        choices=["float16", "float32"],
+        help=(
+            "Storage dtype for per-superblock d/dmin. float32 costs about "
+            "0.125 extra bits/weight and avoids scale-rounding loss."
+        ),
+    )
+    parser.add_argument(
+        "--q4k-refine-mode",
+        default="legacy_exact",
+        choices=["legacy_exact", "alternating", "none"],
+        help=(
+            "legacy_exact reproduces the historical dequantized-BF16 Q4_K "
+            "quantizer; alternating reassigns codes after each LS solve."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -632,15 +719,12 @@ def main():
 
     logger.info("Loading model: %s (dtype=%s)", args.model, args.dtype)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+        args.model, torch_dtype=dtype, low_cpu_mem_usage=True)
 
     act_stats = None
     if args.format == "q2_kmeans":
         if args.calibration_cache and os.path.exists(args.calibration_cache):
-            logger.info("Loading cached calibration stats: %s", args.calibration_cache)
+            logger.info("Loading cached calibration: %s", args.calibration_cache)
             cached = np.load(args.calibration_cache, allow_pickle=True)
             act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
             model.to("cuda")
@@ -650,55 +734,37 @@ def main():
             model.to("cuda")
             act_stats = _collect_input_stats(model, args.model,
                                              nsamples=16, seqlen=1024)
-            logger.info("Collected stats for %d layers", len(act_stats))
             if args.calibration_cache and act_stats:
                 os.makedirs(os.path.dirname(args.calibration_cache) or ".", exist_ok=True)
                 np.savez(args.calibration_cache,
                          **{k: v.numpy() for k, v in act_stats.items()})
-                logger.info("Cached calibration stats to %s", args.calibration_cache)
 
-    compressed_dir = os.path.join(args.save, "compressed") if args.save else None
-
-    effective_bits = 4 if args.format == "q4_k" else args.bits
-    logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
-                args.format, effective_bits, args.groupsize)
+    logger.info("Quantizing  format=%s  bits=%d", args.format,
+                4 if args.format == "q4_k" else args.bits)
+    q4k_scale_dtype = getattr(torch, args.q4k_scale_dtype)
     meta = quantize_model(
         model,
         bits=args.bits,
         groupsize=args.groupsize,
-        save_compressed_dir=compressed_dir,
+        save_compressed_dir=args.save,
         act_stats=act_stats,
         fmt=args.format,
+        q4k_scale_dtype=q4k_scale_dtype,
+        q4k_refine_mode=args.q4k_refine_mode,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
-    # ---- resource limit enforcement ----
     peak_vram = torch.cuda.max_memory_allocated() / 1e6 if torch.cuda.is_available() else 0
     if peak_vram > VRAM_LIMIT_MB:
-        logger.error(
-            "Peak VRAM %.1f MB exceeds limit of %d MB.",
-            peak_vram, VRAM_LIMIT_MB)
+        logger.error("Peak VRAM %.1f MB exceeds limit %d MB.", peak_vram, VRAM_LIMIT_MB)
         raise SystemExit(1)
-    logger.info("Peak VRAM: %.1f MB (limit %d MB)", peak_vram, VRAM_LIMIT_MB)
-
-    if compressed_dir and meta:
-        total_mb = round(
-            sum(os.path.getsize(os.path.join(compressed_dir, f))
-                for f in os.listdir(compressed_dir) if f.endswith(".npz"))
-            / 1e6, 2)
-        if total_mb > MAX_COMPRESSED_MB:
-            logger.error(
-                "Compressed size %.1f MB exceeds limit of %d MB. "
-                "Increase --groupsize to reduce overhead.",
-                total_mb, MAX_COMPRESSED_MB)
-            raise SystemExit(1)
 
     if args.save:
         os.makedirs(args.save, exist_ok=True)
-        model.save_pretrained(args.save)
+        model.config.save_pretrained(args.save)
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokenizer.save_pretrained(args.save)
-        logger.info("Saved dequantised model to '%s'", args.save)
+        logger.info("Saved config + tokenizer to '%s'", args.save)
 
 
 if __name__ == "__main__":
