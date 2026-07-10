@@ -255,7 +255,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
 
     # Inter-channel quants delta compression: Kq=4, store 1 ref + 3 delta channels
-    Kq = 4
+    Kq = 8
     out_pad_q = ((out_features + Kq - 1) // Kq) * Kq
     quants_np = quants_flat.numpy()
     if out_features < out_pad_q:
