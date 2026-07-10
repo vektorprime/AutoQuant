@@ -51,3 +51,9 @@ Outcome: KL=0.437 regressed 4.7x (vs 0.093), top-P=65.23% regressed 18.3pp, size
 Hypothesis: Non-uniform quantization levels (normal-quantile spaced) in Q4_K framework improve quality vs uniform {0..15} without increasing storage
 Algorithm family: non-uniform-quantization
 Outcome: KL=0.114 regressed 22% (vs 0.093), top-P=82.74% regressed 0.8pp (vs 83.56%), size=434.6 MB (same). Non-uniform levels don't compensate for scale/min quantization errors. The d/dmin+scales/mins framework already adapts well enough.
+
+## exp-20260710-007
+
+Hypothesis: LS refinement of d/dmin combined with 5-bit scales/mins can match Q4_K quality at 4.44 bpw (slightly smaller)
+Algorithm family: least-squares-refinement
+Outcome: KL=0.101 regressed 8% (vs 0.093), top-P=82.12% regressed 1.4pp, size=434.6 MB (same — 5-bit not packed). LS refinement helps quality (best KL so far at 0.101) but doesn't beat Q4_K baseline. Packing 5-bit scales to save space requires tight encoding.
