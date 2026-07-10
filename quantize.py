@@ -7,9 +7,11 @@ CPU-based, vectorised quantization.  No GPU sync per layer.
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
+import struct
 
 import numpy as np
 import torch
@@ -955,30 +957,79 @@ def _pack_layer_data(data: dict, bits: int, fmt: str) -> dict:
                         scale_dtype=data["scale_dtype"], zero_pt=data["zero_pt"])
 
 
+def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
+    """Compact binary format: dedup quants, pack arrays, no npz overhead."""
+    B = bytearray()
+    B.extend(b'AQ02')
+    B.extend(struct.pack('<I', 0))
+
+    quants_table = []
+    quants_to_idx = {}
+    layer_quants_idx = {}
+
+    for name, shape, arrays in packed_layers:
+        if 'quants' in arrays:
+            qb = arrays['quants'].tobytes()
+            qhash = hashlib.md5(qb).hexdigest()
+            if qhash not in quants_to_idx:
+                quants_to_idx[qhash] = len(quants_table)
+                quants_table.append((shape[1], qb))
+            layer_quants_idx[name] = quants_to_idx[qhash]
+
+    B.extend(struct.pack('<H', len(quants_table)))
+    for in_feat, qb in quants_table:
+        B.extend(struct.pack('<I', in_feat))
+        B.extend(struct.pack('<I', len(qb)))
+        B.extend(qb)
+
+    B.extend(struct.pack('<H', len(packed_layers)))
+    for name, shape, arrays in packed_layers:
+        name_b = name.encode('utf-8')
+        B.extend(struct.pack('<H', len(name_b)))
+        B.extend(name_b)
+        B.extend(struct.pack('<H', shape[0]))
+        B.extend(struct.pack('<H', shape[1]))
+        n_arrays = len(arrays)
+        B.extend(struct.pack('<H', n_arrays))
+        for k, v in arrays.items():
+            k_b = k.encode('utf-8')
+            B.extend(struct.pack('<B', len(k_b)))
+            B.extend(k_b)
+            v_b = v.tobytes()
+            is_shared_quants = (k == 'quants' and name in layer_quants_idx)
+            flags = 0x01 if is_shared_quants else 0x00
+            qidx = layer_quants_idx.get(name, 0xFFFF) if is_shared_quants else 0xFFFF
+            if is_shared_quants:
+                B.extend(struct.pack('<B', flags))
+                B.extend(struct.pack('<H', qidx))
+                B.extend(struct.pack('<I', 0))
+            else:
+                B.extend(struct.pack('<B', flags))
+                B.extend(struct.pack('<H', qidx))
+                B.extend(struct.pack('<I', len(v_b)))
+                B.extend(v_b)
+
+    total_sz = len(B)
+    B[4:8] = struct.pack('<I', total_sz)
+    return bytes(B)
+
+
 def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans", consolidated: bool = False) -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
     layer_info = {}
 
-    if consolidated:
-        all_data = {}
-        for name, data in tqdm(meta.items(), desc="Packing layers"):
-            packed = _pack_layer_data(data, bits, fmt)
-            for k, v in packed.items():
-                all_data[f"{name}__{k}"] = v
-            layer_info[name] = data["shape"]
+    packed_layers = []
+    for name, data in tqdm(meta.items(), desc="Packing layers"):
+        packed = _pack_layer_data(data, bits, fmt)
+        layer_info[name] = data["shape"]
+        packed_layers.append((name, data["shape"], packed))
 
-        fname = os.path.join(save_dir, "model.npz")
-        np.savez(fname, **all_data)
-        total_bytes = os.path.getsize(fname)
-    else:
-        for name, data in tqdm(meta.items(), desc="Saving compressed"):
-            packed = _pack_layer_data(data, bits, fmt)
-            fname = os.path.join(save_dir, name + ".npz")
-            os.makedirs(os.path.dirname(fname), exist_ok=True)
-            np.savez(fname, **packed)
-            total_bytes += os.path.getsize(fname)
-            layer_info[name] = data["shape"]
+    raw = _serialize_compact(meta, packed_layers)
+    fname = os.path.join(save_dir, "model.bin")
+    with open(fname, 'wb') as f:
+        f.write(raw)
+    total_bytes = os.path.getsize(fname)
 
     with open(os.path.join(save_dir, "meta.json"), "w") as f:
         json.dump({
