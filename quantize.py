@@ -221,16 +221,51 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
     quants_flat = q.reshape(out_features, in_features)
 
+    # Share scales/mins across K_sm=4 output channels with 2-bit multiplicative deltas
+    K_sm = 4
+    out_pad_sm = ((out_features + K_sm - 1) // K_sm) * K_sm
+    n_groups_sm = out_pad_sm // K_sm
+
+    sc_np = sc_6bit.numpy()
+    m_np = m_6bit.numpy()
+
+    if out_features < out_pad_sm:
+        sc_pad = np.pad(sc_np, ((0, out_pad_sm - out_features), (0, 0), (0, 0)), mode='constant', constant_values=0)
+        m_pad = np.pad(m_np, ((0, out_pad_sm - out_features), (0, 0), (0, 0)), mode='constant', constant_values=0)
+    else:
+        sc_pad = sc_np
+        m_pad = m_np
+
+    sc_grp = sc_pad.reshape(n_groups_sm, K_sm, n_blocks, 8)
+    m_grp = m_pad.reshape(n_groups_sm, K_sm, n_blocks, 8)
+
+    shared_sc = sc_grp.max(axis=1)
+    shared_m = m_grp.max(axis=1)
+
+    delta_sc = np.clip(np.round(
+        sc_grp.astype(np.float32) / np.maximum(shared_sc.astype(np.float32), 1.0)[:, np.newaxis, :, :] * 3.0
+    ), 0, 3).astype(np.uint8)
+    delta_m = np.clip(np.round(
+        m_grp.astype(np.float32) / np.maximum(shared_m.astype(np.float32), 1.0)[:, np.newaxis, :, :] * 3.0
+    ), 0, 3).astype(np.uint8)
+
+    delta_sc = delta_sc.reshape(out_pad_sm, n_blocks, 8)[:out_features]
+    delta_m = delta_m.reshape(out_pad_sm, n_blocks, 8)[:out_features]
+
+    delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
+
     return {
-        "base_packed":    base_packed,                  # (groups, 1) uint8 — 2×6-bit base d+dmin per group
-        "delta_packed":   delta_packed,                # (groups, n_blocks-1) uint8 — 2×4-bit signed deltas
-        "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
-        "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
-        "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
+        "base_packed":    base_packed,
+        "delta_packed":   delta_packed,
+        "scales_mins_shared": shared_sc,
+        "mins_shared":    shared_m,
+        "delta_sm":       delta_sm_packed,
+        "quants":         quants_flat.numpy(),
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
         "K":              K,
+        "K_sm":           K_sm,
     }
 
 
@@ -452,6 +487,21 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
+def _pack_q4k_sm_deltas(delta_sc: np.ndarray, delta_m: np.ndarray) -> np.ndarray:
+    """Pack 8 sub-blocks × per-sub-block (2-bit sc delta + 2-bit m delta) → 4 bytes/superblock."""
+    out, nb, nsub = delta_sc.shape
+    assert nsub == 8
+    delta_sc = delta_sc.astype(np.uint8) & 0x3
+    delta_m = delta_m.astype(np.uint8) & 0x3
+    packed = np.zeros((out, nb, 4), dtype=np.uint8)
+    for p in range(4):
+        i = p * 2
+        lo = (delta_sc[:, :, i] & 0x3) | ((delta_m[:, :, i] & 0x3) << 2)
+        hi = (delta_sc[:, :, i + 1] & 0x3) | ((delta_m[:, :, i + 1] & 0x3) << 2)
+        packed[:, :, p] = lo | (hi << 4)
+    return packed
+
+
 def _pack_fp16_to_log8(arr: np.ndarray) -> np.ndarray:
     """Pack fp16 d/dmin into uint8 log-scale. ~6 MB savings per model."""
     arr = arr.astype(np.float32)
@@ -473,15 +523,22 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         if data.get("format") == "q4_k":
             quants = data["quants"]
             q_out = _pack_4bit(quants)
-            sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
+            if "scales_mins_shared" in data:
+                sm_packed = _pack_q4k_sm(data["scales_mins_shared"], data["mins_shared"])
+            else:
+                sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
             if "base_packed" in data:
-                np.savez(fname,
-                         quants=q_out,
-                         base_packed=data["base_packed"],
-                         delta_packed=data["delta_packed"],
-                         K=data.get("K", 4),
-                         scales_mins_packed=sm_packed,
-                         format=data["format"])
+                save_kw = dict(
+                    quants=q_out,
+                    base_packed=data["base_packed"],
+                    delta_packed=data["delta_packed"],
+                    K=data.get("K", 4),
+                    scales_mins_packed=sm_packed,
+                    format=data["format"])
+                if "delta_sm" in data:
+                    save_kw["delta_sm"] = data["delta_sm"]
+                    save_kw["K_sm"] = data.get("K_sm", 4)
+                np.savez(fname, **save_kw)
             else:
                 d8 = _pack_fp16_to_log8(data["d"])
                 dm8 = _pack_fp16_to_log8(data["dmin"])
