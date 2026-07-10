@@ -271,6 +271,13 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
             q_pad = quants_np
         n_groups_q = out_pad_q // Kq
         q_grp = q_pad.reshape(n_groups_q, Kq, -1)
+        ref_indices = _select_best_reference(q_grp, n_blocks, Kq, out_features)
+        for g in range(n_groups_q):
+            ri = int(ref_indices[g])
+            if ri != 0:
+                tmp = q_grp[g, 0].copy()
+                q_grp[g, 0] = q_grp[g, ri]
+                q_grp[g, ri] = tmp
         q_ref = q_grp[:, 0, :]
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
         if ref_bits == 2:
@@ -278,7 +285,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         else:
             quants_ref_packed = _pack_4bit(q_ref)
         quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
-        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits, ref_indices=ref_indices)
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -565,6 +572,26 @@ def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: in
     return packed
 
 
+def _select_best_reference(q_grp: np.ndarray, n_blocks: int, Kq: int, out_features: int) -> np.ndarray:
+    """Select the most representative channel as reference per group.
+    Uses sub-block mean quants to find channel closest to group centroid.
+    Returns ref_indices of shape (n_groups_q,) as uint16."""
+    n_groups_q = q_grp.shape[0]
+    in_features = q_grp.shape[2]
+    q_sb = q_grp.reshape(n_groups_q, Kq, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+    q_sb_means = q_sb.mean(axis=-1).reshape(n_groups_q, Kq, -1)
+    centroid = q_sb_means.mean(axis=1)
+    dists = ((q_sb_means - centroid[:, np.newaxis, :]) ** 2).sum(axis=2)
+    ref_indices = np.zeros(n_groups_q, dtype=np.uint16)
+    for g in range(n_groups_q):
+        n_real = min(Kq, out_features - g * Kq)
+        if n_real <= 0:
+            n_real = Kq
+        dists_g = dists[g, :n_real]
+        ref_indices[g] = int(dists_g.argmin())
+    return ref_indices
+
+
 def _pack_quants_delta_subblock(ref_sb, tgt_sb, n_tgt, out, n_blocks, subblock_delta_bits, delta_bits):
     """Encode quants delta at sub-block (32-weight) granularity.
     subblock_delta_bits: bits per sub-block (2, 3, or 4). Returns (n_tgt, out, n_blocks, bytes_per_sb)."""
@@ -711,6 +738,8 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     save_kw["ref_bits"] = data.get("ref_bits", 4)
                     if data.get("subblock_delta_bits", 0) > 0:
                         save_kw["subblock_delta_bits"] = data["subblock_delta_bits"]
+                    if "ref_indices" in data:
+                        save_kw["ref_indices"] = data["ref_indices"]
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
