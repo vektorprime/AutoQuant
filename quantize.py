@@ -1007,8 +1007,8 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         name_b = name.encode('utf-8')
         B.extend(struct.pack('<H', len(name_b)))
         B.extend(name_b)
-        B.extend(struct.pack('<H', shape[0]))
-        B.extend(struct.pack('<H', shape[1]))
+        B.extend(struct.pack('<I', shape[0]))
+        B.extend(struct.pack('<I', shape[1]))
         n_arrays = len(arrays)
         B.extend(struct.pack('<H', n_arrays))
         for k, v in arrays.items():
