@@ -406,6 +406,15 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
+def _pack_fp16_to_log8(arr: np.ndarray) -> np.ndarray:
+    """Pack fp16 d/dmin into uint8 log-scale. ~6 MB savings per model."""
+    arr = arr.astype(np.float32)
+    arr = np.maximum(arr, 1e-8)
+    log2 = np.log2(arr)
+    encoded = np.clip(np.round(log2 * 12.0 + 128.0), 0, 255).astype(np.uint8)
+    return encoded
+
+
 def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans") -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
@@ -419,10 +428,12 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
             quants = data["quants"]
             q_out = _pack_4bit(quants)
             sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
+            d8 = _pack_fp16_to_log8(data["d"])
+            dm8 = _pack_fp16_to_log8(data["dmin"])
             np.savez(fname,
                      quants=q_out,
-                     d=data["d"],
-                     dmin=data["dmin"],
+                     d8=d8,
+                     dm8=dm8,
                      scales_mins_packed=sm_packed,
                      format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
