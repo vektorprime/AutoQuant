@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, return_raw_d: bool = False) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -294,6 +294,9 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
     if not skip_delta_sm:
         result["delta_sm"] = delta_sm_packed
         result["delta_sm_encoded"] = True
+    if return_raw_d:
+        result["shared_d_raw"] = shared_d.numpy().astype(np.float32).copy()
+        result["shared_dmin_raw"] = shared_dmin.numpy().astype(np.float32).copy()
     return result
 
 
@@ -632,6 +635,12 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
     layer_info = {}
+    global_d_table = meta.pop("_global_d_table", None)
+    global_dmin_table = meta.pop("_global_dmin_table", None)
+
+    if global_d_table is not None:
+        np.savez(os.path.join(save_dir, "_global_tables.npz"),
+                 d_table=global_d_table, dmin_table=global_dmin_table)
 
     for name, data in tqdm(meta.items(), desc="Saving compressed"):
         fname = os.path.join(save_dir, name + ".npz")
@@ -649,7 +658,24 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                 sm_packed = _pack_q4k_sm_joint(data["scales_mins_shared"], data["mins_shared"])
             else:
                 sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
-            if "base_packed" in data:
+            if "d_dmin_indices" in data:
+                save_kw = dict(
+                    quants=q_out,
+                    d_dmin_indices=data["d_dmin_indices"],
+                    K=data.get("K", 4),
+                    scales_mins_packed=sm_packed,
+                    format=data["format"])
+                if q_delta is not None:
+                    save_kw["quants_delta"] = q_delta
+                    save_kw["Kq"] = data.get("Kq", 2)
+                    save_kw["delta_bits"] = data.get("delta_bits", 2)
+                if "delta_sm" in data:
+                    save_kw["delta_sm"] = data["delta_sm"]
+                    save_kw["K_sm"] = data.get("K_sm", 4)
+                    if data.get("delta_sm_encoded"):
+                        save_kw["delta_sm_encoded"] = True
+                np.savez(fname, **save_kw)
+            elif "base_packed" in data:
                 save_kw = dict(
                     quants=q_out,
                     base_packed=data["base_packed"],
@@ -735,6 +761,76 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
 
 
 # ---------------------------------------------------------------------------
+# Global scale table for d/dmin (Idea #3)
+# ---------------------------------------------------------------------------
+
+def _build_global_d_table(meta: dict, n_entries: int = 256) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Collect shared_d/shared_dmin across all layers and build k-means joint table.
+    Returns (d_table, dmin_table, d_table_log, dmin_table_log) where
+    d_table and dmin_table are shape (n_entries,) float32."""
+    all_d = []
+    all_dm = []
+    for name, data in meta.items():
+        if data.get("format") != "q4_k":
+            continue
+        if "shared_d_raw" not in data:
+            continue
+        all_d.append(data["shared_d_raw"].ravel())
+        all_dm.append(data["shared_dmin_raw"].ravel())
+    if not all_d:
+        return None, None, None, None
+    all_d = np.concatenate(all_d)
+    all_dm = np.concatenate(all_dm)
+    all_d = np.maximum(all_d, 1e-8)
+    all_dm = np.maximum(all_dm, 1e-8)
+    all_logd = np.log2(all_d)
+    all_logdm = np.log2(all_dm)
+    pairs = np.stack([all_logd, all_logdm], axis=1)
+    n_samples = pairs.shape[0]
+    if n_samples <= n_entries:
+        d_table = all_d[:n_entries].copy()
+        dmin_table = all_dm[:n_entries].copy()
+        dlog_table = all_logd[:n_entries].copy()
+        dmlog_table = all_logdm[:n_entries].copy()
+        return d_table, dmin_table, dlog_table, dmlog_table
+    rng = np.random.RandomState(42)
+    idx = rng.choice(n_samples, n_entries, replace=False)
+    centers = pairs[idx].copy().astype(np.float32)
+    for _ in range(10):
+        diffs = pairs[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = (diffs * diffs).sum(axis=2)
+        labels = dists.argmin(axis=1)
+        for j in range(n_entries):
+            mask = labels == j
+            if mask.sum() > 0:
+                centers[j] = pairs[mask].mean(axis=0)
+    dlog_table = centers[:, 0].astype(np.float32)
+    dmlog_table = centers[:, 1].astype(np.float32)
+    d_table = np.power(2.0, dlog_table).astype(np.float32)
+    dmin_table = np.power(2.0, dmlog_table).astype(np.float32)
+    return d_table, dmin_table, dlog_table, dmlog_table
+
+
+def _assign_d_table_indices(shared_d: np.ndarray, shared_dmin: np.ndarray,
+                            dlog_table: np.ndarray, dmlog_table: np.ndarray) -> np.ndarray:
+    """Assign each (d, dmin) pair to nearest table index. Returns uint8 array same shape as shared_d."""
+    sd = np.maximum(shared_d, 1e-8)
+    sdm = np.maximum(shared_dmin, 1e-8)
+    logd = np.log2(sd)
+    logdm = np.log2(sdm)
+    n_entries = len(dlog_table)
+    n_groups, n_blocks = sd.shape
+    indices = np.zeros((n_groups, n_blocks), dtype=np.uint8)
+    for g in range(n_groups):
+        for b in range(n_blocks):
+            diff_d = logd[g, b] - dlog_table
+            diff_dm = logdm[g, b] - dmlog_table
+            dist = diff_d * diff_d + diff_dm * diff_dm
+            indices[g, b] = dist.argmin()
+    return indices
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -770,7 +866,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, return_raw_d=True)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -789,6 +885,26 @@ def quantize_model(
             meta[name] = _quantize_one_layer(layer, bits, layer_gs,
                                              act_stats=layer_act,
                                              diffusion=layer_diffusion)
+
+    if fmt == "q4_k":
+        d_table, dmin_table, dlog_table, dmlog_table = _build_global_d_table(meta)
+        if d_table is not None:
+            logger.info("Global d/dmin table: %d entries, d=[%.6f..%.6f], dmin=[%.6f..%.6f]",
+                        len(d_table), d_table.min(), d_table.max(),
+                        dmin_table.min(), dmin_table.max())
+            for name, data in meta.items():
+                if data.get("format") != "q4_k" or "shared_d_raw" not in data:
+                    continue
+                indices = _assign_d_table_indices(
+                    data["shared_d_raw"], data["shared_dmin_raw"],
+                    dlog_table, dmlog_table)
+                data["d_dmin_indices"] = indices
+                data.pop("base_packed", None)
+                data.pop("delta_packed", None)
+                data.pop("shared_d_raw", None)
+                data.pop("shared_dmin_raw", None)
+            meta["_global_d_table"] = d_table
+            meta["_global_dmin_table"] = dmin_table
 
     if save_compressed_dir:
         _save_compressed(meta, save_compressed_dir, bits, fmt)
