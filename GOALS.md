@@ -1,4 +1,4 @@
 # Q4_K
-## Goal: Find a novel quantization technique that is SMALLER than Q4_K while matching or beating its KLD and same-top-P agreement
+## Goal: Find a novel quantization technique that is SMALLER than Q4_K (434.6 MB) while matching or beating its KL (≤0.0935) and top-P (≥83.56%)
 ## Model: Qwen/Qwen3.5-0.8B
-## Baseline: Q4_K quantized model (establish metrics first, then beat them)
+## Baseline recorded — experiments can begin
