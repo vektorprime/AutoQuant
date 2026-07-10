@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, subblock_delta_bits: int = 0) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, subblock_delta_bits: int = 0, ref_bits: int = 4) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -273,9 +273,12 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         q_grp = q_pad.reshape(n_groups_q, Kq, -1)
         q_ref = q_grp[:, 0, :]
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
-        quants_ref_packed = _pack_4bit(q_ref)
+        if ref_bits == 2:
+            quants_ref_packed = _pack_2bit(q_ref)
+        else:
+            quants_ref_packed = _pack_4bit(q_ref)
         quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
-        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits)
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -705,6 +708,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
                     save_kw["delta_bits"] = data.get("delta_bits", 2)
+                    save_kw["ref_bits"] = data.get("ref_bits", 4)
                     if data.get("subblock_delta_bits", 0) > 0:
                         save_kw["subblock_delta_bits"] = data["subblock_delta_bits"]
                 if "delta_sm" in data:
@@ -797,6 +801,7 @@ def quantize_model(
     quants_delta_bits: int = 2,
     skip_delta_sm: bool = False,
     subblock_delta_bits: int = 0,
+    ref_bits: int = 4,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -817,7 +822,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, subblock_delta_bits=subblock_delta_bits)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -880,7 +885,9 @@ def parse_args():
     parser.add_argument("--skip-delta-sm", action="store_true",
                         help="Skip per-channel delta_sm storage (saves ~6 MB).")
     parser.add_argument("--quants-delta-subblock", type=int, default=0,
-                        help="Sub-block delta bits (0=per-weight deltas, 2/3/4=sub-block granularity).")
+                        help="Sub-block delta bits (0=per-weight deltas, 1/2/3/4=sub-block granularity).")
+    parser.add_argument("--quants-ref-bits", type=int, default=4, choices=[2, 4],
+                        help="Reference quants packing: 4=pack_4bit (2/byte), 2=pack_2bit (4/byte).")
     return parser.parse_args()
 
 
@@ -945,6 +952,7 @@ def main():
         quants_delta_bits=args.quants_delta_bits,
         skip_delta_sm=args.skip_delta_sm,
         subblock_delta_bits=args.quants_delta_subblock,
+        ref_bits=args.quants_ref_bits,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
