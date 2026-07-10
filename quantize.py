@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -146,17 +146,22 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
 
     W_flat = W.reshape(out_features, n_blocks, QK_K)
 
+    act_w = None
+    if act_stats is not None:
+        act_w = act_stats.to(W.device).view(1, n_blocks, QK_K)
+        act_w = act_w / act_w.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
     for _ in range(3):
         s = sc_norm.unsqueeze(-1) * q.float()
         s_flat = s.flatten(start_dim=2)
         m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
         m_flat = m.flatten(start_dim=2)
 
-        s_sq = (s_flat * s_flat).sum(dim=-1)
-        m_sq = (m_flat * m_flat).sum(dim=-1)
-        sm = (s_flat * m_flat).sum(dim=-1)
-        ws = (W_flat * s_flat).sum(dim=-1)
-        wm = (W_flat * m_flat).sum(dim=-1)
+        s_sq = (s_flat * s_flat * act_w).sum(dim=-1) if act_w is not None else (s_flat * s_flat).sum(dim=-1)
+        m_sq = (m_flat * m_flat * act_w).sum(dim=-1) if act_w is not None else (m_flat * m_flat).sum(dim=-1)
+        sm = (s_flat * m_flat * act_w).sum(dim=-1) if act_w is not None else (s_flat * m_flat).sum(dim=-1)
+        ws = (W_flat * s_flat * act_w).sum(dim=-1) if act_w is not None else (W_flat * s_flat).sum(dim=-1)
+        wm = (W_flat * m_flat * act_w).sum(dim=-1) if act_w is not None else (W_flat * m_flat).sum(dim=-1)
 
         det = s_sq * m_sq - sm * sm
         det[det.abs() < 1e-12] = 1e-12
@@ -734,7 +739,8 @@ def quantize_model(
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K)
+            layer_act = act_stats.get(name) if act_stats is not None else None
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -830,6 +836,13 @@ def main():
                 np.savez(args.calibration_cache,
                          **{k: v.numpy() for k, v in act_stats.items()})
                 logger.info("Cached calibration stats to %s", args.calibration_cache)
+    elif args.format == "q4_k":
+        # Load cached calibration for activation-weighted LS
+        cache_path = args.calibration_cache or "cache/calib_stats.npz"
+        if os.path.exists(cache_path):
+            logger.info("Loading cached calibration stats for Q4_K LS: %s", cache_path)
+            cached = np.load(cache_path, allow_pickle=True)
+            act_stats = {k: torch.from_numpy(cached[k]) for k in cached.files}
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
