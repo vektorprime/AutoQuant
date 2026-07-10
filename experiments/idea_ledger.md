@@ -48,7 +48,11 @@ Outcome: REGRESSED — KL=0.090 (improved), Top-P=83.60% (degraded). Weighting i
 Hypothesis: Share 6-bit scales/mins across K_sc=2 output channels with 4-bit per-channel scale factors (storage-only).
 Outcome: REGRESSED — 417.8 MB (larger). sf arrays add more overhead than shared sm_packed saves.
 
+## exp-20260710-023 (Shared scales/mins K=4 with 2-bit deltas)
+Hypothesis: Share 6-bit scales/mins across K_sc=4 channels with 2-bit multiplicative deltas packed into 4 bytes/superblock/channel (vs previous 12). Storage-only.
+Outcome: **WIN** — 397.2 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**. Saves 14.6 MB vs previous best (14.6/411.8 = 3.5%). Key improvement: K=4 sharing halved shared sm cost, 2-bit deltas only 4 bytes/channel vs 12 saved.
+
 ## Summary
-- Best: K=4 shared d/dmin + delta-encoded base/deltas (6+4 bit) + packed 6-bit scales/mins + 3-pass LS → 411.8 MB, KL=0.092, Top-P=83.86%
-- Storage breakdown: ~398.5 MB weights + ~12.4 MB packed sc/m + ~0.9 MB delta-encoded d/dmin
-- Key techniques: (1) Storage-only compression preserves quality. (2) d/dmin sharing across output channels. (3) Delta encoding across superblocks exploits temporal correlation.
+- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared scales/mins with 2-bit deltas + 3-pass LS → 397.2 MB, KL=0.092, Top-P=83.86%
+- Storage breakdown: ~398.5 MB weights + ~3.2 MB shared sc/m + deltas + ~0.9 MB delta-encoded d/dmin (total ~397.2)
+- Key techniques: (1) Storage-only compression preserves quality. (2) Sharing across output channels saves on per-channel metadata. (3) Delta encoding exploits correlation.
