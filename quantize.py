@@ -268,8 +268,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
         q_ref = q_ref[:q_tgt.shape[0]]
     elif q_tgt.shape[0] < q_ref.shape[0]:
         q_tgt = q_tgt[:q_ref.shape[0]]
+    quants_delta_packed = _pack_quants_delta(q_ref, q_tgt)
     quants_ref_packed = _pack_4bit(q_ref)
-    quants_delta_packed, quants_full_ref, quants_full_tgt, quants_bm_packed, q_n_delta = _pack_quants_delta(q_ref, q_tgt)
 
     return {
         "base_packed":    base_packed,
@@ -279,10 +279,6 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
         "delta_sm":       delta_sm_packed,
         "quants_ref":     quants_ref_packed,
         "quants_delta":   quants_delta_packed,
-        "quants_full_ref": quants_full_ref,
-        "quants_full_tgt": quants_full_tgt,
-        "quants_bm":      quants_bm_packed,
-        "n_delta":        int(q_n_delta[0]),
         "Kq":             Kq,
         "format":         "q4_k",
         "shape":          [out_features, in_features],
@@ -510,42 +506,19 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Mixed encoding: 2-bit deltas where possible, full 4-bit where needed.
-    Returns (ref_packed_4bit, delta_packed_2bit, block_mask_packed)."""
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray) -> np.ndarray:
+    """Pack 256 × 2-bit signed deltas (-1,0,1,2) into 64 bytes."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
-    ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
-    tgt_sb = tgt_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
-
-    diff = tgt_sb - ref_sb
-    can_delta = ((diff >= -1) & (diff <= 2)).all(axis=-1)
-
-    delta_blocks = np.count_nonzero(can_delta)
-    full_blocks = out * n_blocks - delta_blocks
-
-    delta_data = np.zeros((delta_blocks, 64), dtype=np.uint8)
-    full_data_ref = np.zeros((full_blocks, 128), dtype=np.uint8)
-    full_data_tgt = np.zeros((full_blocks, 128), dtype=np.uint8)
-    di = 0
-    fi = 0
-
+    ref_sb = ref_quants.reshape(out, n_blocks, QK_K)
+    tgt_sb = tgt_quants.reshape(out, n_blocks, QK_K)
+    delta = tgt_sb.astype(np.int16) - ref_sb.astype(np.int16)
+    delta = np.clip(delta + 1, 0, 3).astype(np.uint8)
+    packed = np.zeros((out, n_blocks, 64), dtype=np.uint8)
     for o in range(out):
         for b in range(n_blocks):
-            if can_delta[o, b]:
-                d = np.clip(diff[o, b] + 1, 0, 3).astype(np.uint8)
-                delta_data[di] = _pack_2bit(d.reshape(1, QK_K)).reshape(64)
-                di += 1
-            else:
-                full_data_ref[fi] = _pack_4bit(ref_sb[o, b].astype(np.uint8).reshape(1, QK_K)).reshape(128)
-                full_data_tgt[fi] = _pack_4bit(tgt_sb[o, b].astype(np.uint8).reshape(1, QK_K)).reshape(128)
-                fi += 1
-
-    bm_rows = (n_blocks + 7) // 8
-    bm_packed = np.packbits(can_delta.reshape(out, n_blocks), axis=-1, bitorder='little')
-    n_delta = np.array([delta_blocks], dtype=np.int32)
-
-    return delta_data, full_data_ref, full_data_tgt, bm_packed, n_delta
+            packed[o, b] = _pack_2bit(delta[o, b].reshape(1, 256)).reshape(64)
+    return packed
 
 
 def _pack_q4k_sm_joint(shared_sc: np.ndarray, shared_m: np.ndarray) -> np.ndarray:
@@ -627,11 +600,6 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                 if q_delta is not None:
                     save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
-                if "quants_full_ref" in data and data["quants_full_ref"].size > 0:
-                    save_kw["quants_full_ref"] = data["quants_full_ref"]
-                    save_kw["quants_full_tgt"] = data["quants_full_tgt"]
-                    save_kw["quants_bm"] = data["quants_bm"]
-                    save_kw["n_delta"] = data.get("n_delta", 0)
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
