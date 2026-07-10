@@ -1,2 +1,1 @@
 timestamp	exp_id	code_sha	description	status	error_signature	bits	groupsize	size_mb	peak_vram_mb	notes
-2026-07-10T03:00:52Z	exp-20260710-006	d8092c8d49d8be52d32cef7fefa1bc0feaf950b7	Q4_K + lzma on codes and metadata	crashed	lzma too slow, save interrupted before completion	4	256	0	0	lzma preset 9 ~1s/layer, ~3min total for 151 layers

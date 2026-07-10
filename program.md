@@ -30,6 +30,13 @@ and compression techniques** — not about cleverly mixing existing ones.
 - Parameter tuning of existing methods without algorithmic change
 - Skipping layers or quantizing only a subset
 - Techniques that only work because of Qwen3.5's specific layer layout or dimensions
+- **Generic CPU compression (zlib, bz2, LZMA, gzip, etc.) applied as a post-processing
+  step on already-quantized data.** This is not a quantization technique — it's just file
+  compression. The goal is to invent better ways to quantize, not better ways to zip files.
+- **Entropy coding (Huffman, arithmetic coding) of quantized codes is allowed ONLY
+  if it's integrated into the quantization process** (e.g., variable-length codes chosen
+  during quantization to minimize the combined size+error objective). Standalone
+  post-hoc compression is not valid.
 
 **Time constraint:** Quantization must complete in **≤ 5 minutes**. Avoid exhaustive
 grid searches, per-weight iterative refinement, or other super-linear algorithms.
@@ -104,9 +111,6 @@ algorithms (not just different bit-widths)?
   Qᵢ uses a small codebook (e.g., two 2-bit codebooks = 4 bits of expressiveness
   with less storage than a single 4-bit codebook). Two 2-bit codebooks cost 8 values
   per group vs 16 for one 4-bit codebook — a storage win.
-- **Huffman/entropy coding of quantized codes**: After quantization, non-uniform
-  code distributions can be compressed losslessly. This is a pure storage win at
-  zero quality cost — applicable to ANY quantization method.
 - **2.5-bit schemes**: Use 3-bit quantization but encode two 3-bit values into
   a 5-bit field (saves 1 bit per pair). Novel encoding, not a new quant type.
 - **Codebook deduplication across layers**: If two layers have near-identical
@@ -289,28 +293,23 @@ improvements. ALL ideas below are novel techniques, not parameter mixing.
    uses a small 2-bit codebook. Two 2-bit codebooks = 4 addends of expressiveness
    but less storage than a single 4-bit codebook. Novel representation.
 
-2. **Entropy coding of quantized codes** — After quantization, apply Huffman
-   coding to the per-weight codes. Non-uniform code distributions (some levels
-   are more common) yield additional compression at zero quality cost. Pure
-   storage win, applicable as a post-processing step to any quantizer.
-
-3. **Hadamard rotation + quantization** — For each weight matrix W (out × in),
+2. **Hadamard rotation + quantization** — For each weight matrix W (out × in),
    apply a random Hadamard transform H: W' = W @ H. Quantize W'. At load time,
    the inverse transform is fused into the next layer. Makes weight distributions
    more uniform, reducing quantization error. Novel transform.
 
-4. **Channel-shared codebooks with delta coding** — Store a base codebook shared
+3. **Channel-shared codebooks with delta coding** — Store a base codebook shared
    across multiple output channels, plus small per-channel delta values encoded
    in fewer bits. Reduces codebook storage while preserving per-channel specificity.
 
-5. **Vector quantization of weight blocks** — Quantize groups of 4 or 8 weights
+4. **Vector quantization of weight blocks** — Quantize groups of 4 or 8 weights
    jointly using a learned vector codebook (e.g., 4 weights → 8-bit index =
    2 bits/weight). Exploits correlations between adjacent weights that scalar
    quantization misses.
 
-6. **Codebook deduplication** — After quantization, identify near-identical
-   codebooks across layers and merge them. A single codebook pool shared across
-   similar layers dramatically cuts metadata overhead. Novel memory optimization.
+5. **Codebook deduplication + interpolation** — After quantization, identify
+   near-identical codebooks across layers. Merge them into a shared pool and
+   reference by index. Novel memory optimization.
 
 ---
 

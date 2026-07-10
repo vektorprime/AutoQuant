@@ -10,7 +10,6 @@ import argparse
 import json
 import logging
 import os
-import zlib
 
 import numpy as np
 import torch
@@ -180,8 +179,7 @@ def _quantize_one_layer(
     g = groupsize if groupsize != -1 else in_features
     n_groups = in_features // g
     maxq = MAXQ[bits]
-    num_entries = maxq + 1
-    zero_pt = (maxq + 1) / 2
+    zero_pt = (maxq + 1) / 2                       # 2.0 for 2-bit
 
     did_sort = act_stats is not None
     sort_idx = None
@@ -195,7 +193,7 @@ def _quantize_one_layer(
     W_orig = W.clone()
 
     codes = torch.zeros(out_features, in_features, dtype=torch.uint8)
-    codebooks = torch.zeros(out_features, n_groups, num_entries, dtype=torch.bfloat16)
+    codebooks = torch.zeros(out_features, n_groups, 4, dtype=torch.bfloat16)
     W_q_full = torch.zeros(out_features, in_features)
 
     for i in range(n_groups):
@@ -224,8 +222,7 @@ def _quantize_one_layer(
             scale[scale <= 0] = 1.0
 
         W_g_sorted = W_g.sort(dim=-1).values
-        quantile_idxs = [int(g * j / (num_entries - 1)) for j in range(num_entries)]
-        quantile_idxs[-1] = g - 1
+        quantile_idxs = [0, g // 3, 2 * g // 3, g - 1]
         cb_init = W_g_sorted[:, quantile_idxs]
 
         h_g = act_stats[start:end] if act_stats is not None else None
@@ -246,7 +243,7 @@ def _quantize_one_layer(
                 if h_g is not None:
                     dists = (dists * h_g.unsqueeze(0).unsqueeze(-1)).sqrt()
                 assign = dists.argmin(dim=-1)
-                for j in range(num_entries):
+                for j in range(4):
                     mask_j = (assign == j).float()
                     if h_g is not None:
                         weighted_W = W_g * h_g.unsqueeze(0)
@@ -307,7 +304,7 @@ def _quantize_one_layer(
             0, 255,
         ).to(torch.uint8)
         cb_deq_flat = cb_min + cb_q.float() * (range_val / 255.0)
-    cb_deq = cb_deq_flat.reshape(out_features, n_groups, num_entries).to(torch.bfloat16)
+    cb_deq = cb_deq_flat.reshape(out_features, n_groups, 4).to(torch.bfloat16)
 
     for i in range(n_groups):
         start = i * g
@@ -366,26 +363,6 @@ def _pack_4bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
-def _pack_3bit(codes: np.ndarray) -> np.ndarray:
-    """Pack 8 × 3-bit values into 3 uint8 bytes."""
-    out, inp = codes.shape
-    assert inp % 8 == 0
-    codes = codes.reshape(out, inp // 8, 8).astype(np.uint32)
-    packed_24 = (codes[..., 0]
-                 | (codes[..., 1] << 3)
-                 | (codes[..., 2] << 6)
-                 | (codes[..., 3] << 9)
-                 | (codes[..., 4] << 12)
-                 | (codes[..., 5] << 15)
-                 | (codes[..., 6] << 18)
-                 | (codes[..., 7] << 21))
-    b = np.zeros((out, inp // 8, 3), dtype=np.uint8)
-    b[..., 0] = packed_24 & 0xFF
-    b[..., 1] = (packed_24 >> 8) & 0xFF
-    b[..., 2] = (packed_24 >> 16) & 0xFF
-    return b.reshape(out, -1)
-
-
 def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans") -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
@@ -399,61 +376,13 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
             # Q4_K format: pack 4-bit quants into uint8 pairs
             quants = data["quants"]
             q_out = _pack_4bit(quants)
-            if fmt == "q4_k_zlib":
-                q_raw = q_out.tobytes()
-                q_compressed = zlib.compress(q_raw, level=9)
-                q_compressed_arr = np.frombuffer(q_compressed, dtype=np.uint8)
-                np.savez(fname,
-                         quants_zlib=q_compressed_arr,
-                         quants_shape=q_out.shape,
-                         d=data["d"],
-                         dmin=data["dmin"],
-                         scales_6bit=data["scales_6bit"],
-                         mins_6bit=data["mins_6bit"],
-                         format="q4_k_zlib")
-            elif fmt == "q4_k_zlib2":
-                q_raw = q_out.tobytes()
-                q_compressed = zlib.compress(q_raw, level=9)
-                q_compressed_arr = np.frombuffer(q_compressed, dtype=np.uint8)
-                s_raw = data["scales_6bit"].tobytes()
-                s_compressed = zlib.compress(s_raw, level=9)
-                s_arr = np.frombuffer(s_compressed, dtype=np.uint8)
-                m_raw = data["mins_6bit"].tobytes()
-                m_compressed = zlib.compress(m_raw, level=9)
-                m_arr = np.frombuffer(m_compressed, dtype=np.uint8)
-                np.savez(fname,
-                         quants_zlib=q_compressed_arr,
-                         quants_shape=q_out.shape,
-                         d=data["d"],
-                         dmin=data["dmin"],
-                         scales_zlib=s_arr,
-                         scales_shape=data["scales_6bit"].shape,
-                         mins_zlib=m_arr,
-                         mins_shape=data["mins_6bit"].shape,
-                         format="q4_k_zlib2")
-            else:
-                np.savez(fname,
-                         quants=q_out,
-                         d=data["d"],
-                         dmin=data["dmin"],
-                         scales_6bit=data["scales_6bit"],
-                         mins_6bit=data["mins_6bit"],
-                         format=data["format"])
-        elif bits == 3 and data["shape"][1] % 8 == 0:
-            codes_out = _pack_3bit(data["codes"])
-            if "codebook_q" in data:
-                np.savez(fname,
-                         codes=codes_out,
-                         codebook_q=data["codebook_q"],
-                         cb_min=data["cb_min"],
-                         cb_max=data["cb_max"],
-                         codebook_dtype=data["codebook_dtype"])
-            else:
-                np.savez(fname,
-                         codes=codes_out,
-                         scales=data["scales"],
-                         scale_dtype=data["scale_dtype"],
-                         zero_pt=data["zero_pt"])
+            np.savez(fname,
+                     quants=q_out,
+                     d=data["d"],
+                     dmin=data["dmin"],
+                     scales_6bit=data["scales_6bit"],
+                     mins_6bit=data["mins_6bit"],
+                     format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
             np.savez(fname, codes=codes_out,
@@ -537,7 +466,7 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k" or fmt == "q4_k_zlib" or fmt == "q4_k_zlib2":
+        if fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -592,8 +521,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q3_kmeans=K-means 3-bit, q4_k=GGML-style 4-bit blocks, q4_k_zlib=Q4_K+zlib codes, q4_k_zlib2=Q4_K+zlib codes+meta)")
+                        choices=["q2_kmeans", "q4_k"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
     return parser.parse_args()
 
 
@@ -614,7 +543,7 @@ def main():
     )
 
     act_stats = None
-    if args.format in ("q2_kmeans", "q3_kmeans"):
+    if args.format == "q2_kmeans":
         if args.calibration_cache and os.path.exists(args.calibration_cache):
             logger.info("Loading cached calibration stats: %s", args.calibration_cache)
             cached = np.load(args.calibration_cache, allow_pickle=True)
@@ -635,12 +564,12 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2") else (3 if args.format == "q3_kmeans" else args.bits)
+    effective_bits = 4 if args.format == "q4_k" else args.bits
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
         model,
-        bits=effective_bits,
+        bits=args.bits,
         groupsize=args.groupsize,
         save_compressed_dir=compressed_dir,
         act_stats=act_stats,
