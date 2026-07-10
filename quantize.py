@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -274,8 +274,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         q_ref = q_grp[:, 0, :]
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
         quants_ref_packed = _pack_4bit(q_ref)
-        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1)
-        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq)
+        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits)
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -486,6 +486,22 @@ def _pack_2bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
+def _pack_1bit(codes: np.ndarray) -> np.ndarray:
+    """Pack 8 × 1-bit values into one uint8."""
+    out, inp = codes.shape
+    assert inp % 8 == 0
+    codes = codes.reshape(out, inp // 8, 8)
+    packed = (codes[..., 0]
+              | (codes[..., 1] << 1)
+              | (codes[..., 2] << 2)
+              | (codes[..., 3] << 3)
+              | (codes[..., 4] << 4)
+              | (codes[..., 5] << 5)
+              | (codes[..., 6] << 6)
+              | (codes[..., 7] << 7))
+    return packed.astype(np.uint8)
+
+
 def _pack_4bit(codes: np.ndarray) -> np.ndarray:
     """Pack 2 × 4-bit values into one uint8."""
     out, inp = codes.shape
@@ -513,19 +529,28 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int) -> np.ndarray:
-    """Pack 256 × 2-bit signed deltas (-1,0,1,2) into 64 bytes per target channel."""
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2) -> np.ndarray:
+    """Pack 256 × delta_bits signed deltas per target channel.
+    delta_bits=2: packed into 64 bytes/sb (-1,0,1,2 range).
+    delta_bits=1: packed into 32 bytes/sb (0,+1 range)."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
     ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
     tgt_sb = tgt_quants.reshape(n_tgt, out, n_blocks, QK_K).astype(np.int16)
-    packed = np.zeros((n_tgt, out, n_blocks, 64), dtype=np.uint8)
+    bytes_per_sb = 32 if delta_bits == 1 else 64
+    packed = np.zeros((n_tgt, out, n_blocks, bytes_per_sb), dtype=np.uint8)
     for t in range(n_tgt):
         diff = tgt_sb[t] - ref_sb
-        delta = np.clip(diff + 1, 0, 3).astype(np.uint8)
-        for o in range(out):
-            for b in range(n_blocks):
-                packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(64)
+        if delta_bits == 1:
+            delta = (diff > 0).astype(np.uint8)
+            for o in range(out):
+                for b in range(n_blocks):
+                    packed[t, o, b] = _pack_1bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
+        else:
+            delta = np.clip(diff + 1, 0, 3).astype(np.uint8)
+            for o in range(out):
+                for b in range(n_blocks):
+                    packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
     return packed
 
 
@@ -633,6 +658,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                 if q_delta is not None:
                     save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
+                    save_kw["delta_bits"] = data.get("delta_bits", 2)
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
@@ -720,6 +746,7 @@ def quantize_model(
     quants_delta_K: int = 256,
     sm_share_K: int = 128,
     d_share_K: int = 8,
+    quants_delta_bits: int = 2,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -740,7 +767,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -798,6 +825,8 @@ def parse_args():
                         help="Scale/min sharing group size across output channels.")
     parser.add_argument("--d-share-K", type=int, default=8,
                         help="D/dmin sharing group size across output channels.")
+    parser.add_argument("--quants-delta-bits", type=int, default=2, choices=[1, 2],
+                        help="Bits per quants delta: 2=lossless(-1,0,1,2) 1=aggressive(0,+1).")
     return parser.parse_args()
 
 
@@ -859,6 +888,7 @@ def main():
         quants_delta_K=args.quants_delta_K,
         sm_share_K=args.sm_share_K,
         d_share_K=args.d_share_K,
+        quants_delta_bits=args.quants_delta_bits,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
