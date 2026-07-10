@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -279,20 +279,22 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
     else:
         quants_kw = dict(quants=quants_np)
 
-    return {
+    result = {
         **quants_kw,
         "base_packed":    base_packed,
         "delta_packed":   delta_packed,
         "scales_mins_shared": shared_sc,
         "mins_shared":    shared_m,
-        "delta_sm":       delta_sm_packed,
-        "delta_sm_encoded": True,
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
         "K":              K,
         "K_sm":           K_sm,
     }
+    if not skip_delta_sm:
+        result["delta_sm"] = delta_sm_packed
+        result["delta_sm_encoded"] = True
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +749,7 @@ def quantize_model(
     sm_share_K: int = 128,
     d_share_K: int = 8,
     quants_delta_bits: int = 2,
+    skip_delta_sm: bool = False,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -767,7 +770,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -827,6 +830,8 @@ def parse_args():
                         help="D/dmin sharing group size across output channels.")
     parser.add_argument("--quants-delta-bits", type=int, default=2, choices=[1, 2],
                         help="Bits per quants delta: 2=lossless(-1,0,1,2) 1=aggressive(0,+1).")
+    parser.add_argument("--skip-delta-sm", action="store_true",
+                        help="Skip per-channel delta_sm storage (saves ~6 MB).")
     return parser.parse_args()
 
 
@@ -889,6 +894,7 @@ def main():
         sm_share_K=args.sm_share_K,
         d_share_K=args.d_share_K,
         quants_delta_bits=args.quants_delta_bits,
+        skip_delta_sm=args.skip_delta_sm,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
