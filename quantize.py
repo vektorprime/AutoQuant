@@ -101,7 +101,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, scale_bits: int = 6) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -127,13 +127,14 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     d_sub = (w_sub_max - w_sub_min) / 15.0
     d_sub[d_sub < 1e-8] = 1e-8
 
+    sc_max = (1 << scale_bits) - 1
     sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
-    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
-    sc_norm = sc_6bit.float() / 63.0
+    sc_q = torch.clamp(torch.round(sc_ratio * sc_max), 1, sc_max).to(torch.uint8)
+    sc_norm = sc_q.float() / sc_max
 
     min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
-    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
-    m_norm = m_6bit.float() / 63.0
+    m_q = torch.clamp(torch.round(min_ratio * sc_max), 0, sc_max).to(torch.uint8)
+    m_norm = m_q.float() / sc_max
 
     eff_scale = d.unsqueeze(-1) * sc_norm         # (out, n_blocks, 8)
     eff_scale[eff_scale < 1e-8] = 1e-8
@@ -155,9 +156,9 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     return {
         "d":              d.numpy().astype(np.float16),
         "dmin":           dmin.numpy().astype(np.float16),
-        "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
-        "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
-        "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
+        "scales_6bit":    sc_q.numpy(),
+        "mins_6bit":      m_q.numpy(),
+        "quants":         quants_flat.numpy(),
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
@@ -411,7 +412,7 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                          scales_6bit=data["scales_6bit"],
                          mins_6bit=data["mins_6bit"],
                          format="q4_k_zlib")
-            elif fmt == "q4_k_zlib2":
+            elif fmt == "q4_k_zlib2" or fmt == "q4_k_zlib3":
                 q_raw = q_out.tobytes()
                 q_compressed = zlib.compress(q_raw, level=9)
                 q_compressed_arr = np.frombuffer(q_compressed, dtype=np.uint8)
@@ -543,6 +544,12 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             meta[name] = _quantize_one_layer_q4k(layer)
+        elif fmt == "q4_k_zlib3":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            meta[name] = _quantize_one_layer_q4k(layer, scale_bits=5)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -592,8 +599,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q3_kmeans=K-means 3-bit, q4_k=GGML-style 4-bit blocks, q4_k_zlib=Q4_K+zlib codes, q4_k_zlib2=Q4_K+zlib codes+meta)")
+                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_zlib3"],
+                        help="Quantization format (..., q4_k_zlib3=Q4_K 5-bit scales+mins+zlib codes+meta)")
     return parser.parse_args()
 
 
@@ -635,7 +642,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2") else (3 if args.format == "q3_kmeans" else args.bits)
+    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_zlib3") else (3 if args.format == "q3_kmeans" else args.bits)
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
