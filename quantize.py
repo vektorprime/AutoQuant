@@ -164,6 +164,88 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# AQLM-style dual 2-bit codebook quantization (novel)
+# Two 2-bit codebooks per layer → 16 combos (4-bit expressiveness)
+# Codebooks shared across all output channels; per-superblock scale+offset
+# ---------------------------------------------------------------------------
+
+def _learn_dual_codebook_2x2(W: torch.Tensor, max_iter: int = 20) -> tuple:
+    flat = W.flatten()
+    n_samples = min(20000, flat.numel())
+    idx = torch.randperm(flat.numel())[:n_samples]
+    samples = flat[idx]
+
+    vmin, vmax = samples.min(), samples.max()
+    rng = vmax - vmin
+    cb1 = torch.tensor([vmin + rng * 0.0, vmin + rng * 0.25,
+                         vmin + rng * 0.5, vmin + rng * 0.75])
+    cb2 = torch.tensor([rng * -0.15, rng * -0.05, rng * 0.05, rng * 0.15])
+
+    for _ in range(max_iter):
+        pairs = (cb1.unsqueeze(1) + cb2.unsqueeze(0)).reshape(-1)
+        dists = (samples.unsqueeze(1) - pairs.unsqueeze(0)).abs()
+        assign = dists.argmin(dim=1)
+        a1 = assign % 4
+        a2 = assign // 4
+        for j in range(4):
+            m1 = (a1 == j).float()
+            if m1.sum() > 0:
+                cb1[j] = ((samples - cb2[a2]) * m1).sum() / m1.sum()
+        assign = dists.argmin(dim=1)
+        a1 = assign % 4
+        a2 = assign // 4
+        for j in range(4):
+            m2 = (a2 == j).float()
+            if m2.sum() > 0:
+                cb2[j] = ((samples - cb1[a1]) * m2).sum() / m2.sum()
+
+    return cb1, cb2
+
+
+def _quantize_one_layer_aqlm_2x2(layer: nn.Linear, cb1: torch.Tensor, cb2: torch.Tensor) -> dict:
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0
+    n_blocks = in_features // QK_K
+
+    pairs = (cb1.unsqueeze(1) + cb2.unsqueeze(0)).reshape(-1)
+    pairs = pairs.to(W.device)
+
+    W_r = W.reshape(out_features, n_blocks, QK_K)
+    w_blk_min = W_r.amin(dim=-1)
+    w_blk_max = W_r.amax(dim=-1)
+
+    scale = (w_blk_max - w_blk_min) / (pairs.max() - pairs.min())
+    scale[scale < 1e-8] = 1e-8
+    offset = w_blk_min - scale * pairs.min()
+
+    W_norm = (W_r - offset.unsqueeze(-1)) / scale.unsqueeze(-1)
+
+    dists = (W_norm.unsqueeze(-1) - pairs.view(1, 1, 1, -1)).abs()
+    best_pair = dists.argmin(dim=-1)
+    idx1 = best_pair % 4
+    idx2 = best_pair // 4
+
+    combined = (idx1 | (idx2 << 2)).to(torch.uint8)
+
+    W_q_r = scale.unsqueeze(-1) * pairs[best_pair] + offset.unsqueeze(-1)
+    W_q = W_q_r.reshape(out_features, in_features)
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    return {
+        "codes": combined.numpy().astype(np.uint8),
+        "scale": scale.numpy().astype(np.float16),
+        "offset": offset.numpy().astype(np.float16),
+        "cb1": cb1.numpy().astype(np.float16),
+        "cb2": cb2.numpy().astype(np.float16),
+        "format": "aqlm_2x2",
+        "shape": [out_features, in_features],
+        "n_blocks": n_blocks,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Per-layer 2-bit K-means quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
 
@@ -372,7 +454,15 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
-        if data.get("format") == "q4_k":
+        if data.get("format") == "aqlm_2x2":
+            np.savez(fname,
+                     codes=data["codes"],
+                     scale=data["scale"],
+                     offset=data["offset"],
+                     cb1=data["cb1"],
+                     cb2=data["cb2"],
+                     format=data["format"])
+        elif data.get("format") == "q4_k":
             # Q4_K format: pack 4-bit quants into uint8 pairs
             quants = data["quants"]
             q_out = _pack_4bit(quants)
@@ -466,7 +556,14 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k":
+        if fmt == "aqlm_2x2":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            cb1, cb2 = _learn_dual_codebook_2x2(layer.weight.data.float())
+            meta[name] = _quantize_one_layer_aqlm_2x2(layer, cb1, cb2)
+        elif fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -521,8 +618,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+                        choices=["q2_kmeans", "q4_k", "aqlm_2x2"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks, aqlm_2x2=dual 2-bit codebooks)")
     return parser.parse_args()
 
 
@@ -564,7 +661,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format == "q4_k" else args.bits
+    effective_bits = 4 if args.format in ("q4_k", "aqlm_2x2") else args.bits
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
