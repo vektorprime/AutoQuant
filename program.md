@@ -10,6 +10,32 @@ must produce a compressed model strictly smaller than Q4_K's compressed size.
 
 ---
 
+## What counts as NOVEL
+
+This experiment is about inventing **new quantization algorithms, encoding schemes,
+and compression techniques** — not about cleverly mixing existing ones.
+
+**Valid (encouraged):**
+- A genuinely new quantization algorithm (new way to compute quantization levels)
+- A new codebook structure or encoding scheme that packs more information per bit
+- A novel entropy coding or compression method applied to quantized codes
+- A new transformation applied to weights before/after quantization (e.g. rotation)
+- A new technique for sharing or structuring metadata across layers
+- Modifying an existing quant type (e.g. Q4_K) by *changing its internal algorithm* — not just its parameters
+- Techniques that are **general**: they must work on arbitrary models, not exploit Qwen-specific architecture
+
+**NOT valid (regression, do not propose):**
+- Simply applying Q4_K to some tensors and Q3_K to others (mixed precision without novelty)
+- Assigning different bit-widths to different layers based on heuristics (trivial, not novel)
+- Parameter tuning of existing methods without algorithmic change
+- Skipping layers or quantizing only a subset
+- Techniques that only work because of Qwen3.5's specific layer layout or dimensions
+
+**Time constraint:** Quantization must complete in **≤ 5 minutes**. Avoid exhaustive
+grid searches, per-weight iterative refinement, or other super-linear algorithms.
+
+---
+
 ## Setup
 
 To set up a new experiment, work with the user to:
@@ -69,36 +95,37 @@ Before any experimentation, establish the Q4_K baseline:
 These three numbers (size, KLD, top-P) are the **quality bar**. Every proposed
 technique must be **smaller** with KLD **≤ baseline** and top-P **≥ baseline**.
 
-### Phase 1 — Bit-width frontier mapping
+### Phase 1 — Novel encoding and compression schemes
 
-Explore the size-vs-quality frontier across different bit-widths and schemes:
-
-- **3-bit quantization** with codebook compression (~340-380 MB expected)
-- **2-bit quantization** variants (already explored in prior runs — may already
-  beat Q4_K; verify against the new baseline)
-- **2.5-bit schemes** (e.g., 3-bit codes with Huffman/entropy coding)
-- **Mixed-precision**: higher bits for attention, lower for MLP
-- **Per-channel variable bit-width**: assign more bits to high-activation channels
-
-Record the Pareto frontier — for each size point, what's the best achievable KLD
-and top-P? This guides later phases toward the most promising region of the
-size/quality space.
-
-### Phase 2 — Codebook and representation innovation
-
-Go beyond simple per-group quantization:
+The core question: can we pack more information into fewer bits using novel
+algorithms (not just different bit-widths)?
 
 - **Multi-codebook additive quantization**: W ≈ Q₁ + Q₂ + ... + Qₖ where each
   Qᵢ uses a small codebook (e.g., two 2-bit codebooks = 4 bits of expressiveness
-  with less storage than a single 4-bit codebook)
-- **Learned non-uniform quantization grids**: optimize quantization levels
-  per tensor/channel via gradient descent or iterative refinement
-- **Across-layer codebook sharing**: identify layers with similar weight
-  distributions and share a single codebook pool
-- **Vector/subspace quantization**: quantize groups of weights jointly using
+  with less storage than a single 4-bit codebook). Two 2-bit codebooks cost 8 values
+  per group vs 16 for one 4-bit codebook — a storage win.
+- **Huffman/entropy coding of quantized codes**: After quantization, non-uniform
+  code distributions can be compressed losslessly. This is a pure storage win at
+  zero quality cost — applicable to ANY quantization method.
+- **2.5-bit schemes**: Use 3-bit quantization but encode two 3-bit values into
+  a 5-bit field (saves 1 bit per pair). Novel encoding, not a new quant type.
+- **Codebook deduplication across layers**: If two layers have near-identical
+  codebooks, store once and share. Reduces metadata without touching weights.
+
+### Phase 2 — Representation innovation
+
+Go beyond simple per-group quantization with genuinely new structures:
+
+- **Learned non-uniform quantization grids**: Optimize quantization levels
+  per tensor/channel via gradient descent or iterative refinement. Different from
+  fixed formula approaches (e.g., the Q4_K d/dmin formula).
+- **Vector/subspace quantization**: Quantize groups of weights jointly using
   vector quantization (e.g., 4 weights → one 8-bit index into a 256-entry
-  codebook of 4-vectors = 2 bits per weight)
-- **GPTVQ-style**: larger block sizes with optimized lattice codebooks
+  codebook of 4-vectors = 2 bits per weight effectively).
+- **GPTVQ-style**: Larger block sizes with optimized lattice codebooks.
+  Different from scalar quantization — exploits correlations between weights.
+- **Channel-shared codebooks with residual coding**: Store a base codebook plus
+  per-channel delta corrections encoded in fewer bits.
 - **Lookup-free quantization (LFQ)**: directly quantize to integer lattice
   without storing explicit codebooks
 
@@ -160,20 +187,19 @@ Symmetric quantization is **hardcoded** (always on). There is no `--symmetric` f
 ### Resource limits (enforced)
 
 - **Compressed model size**: must be **strictly less than Q4_K's compressed size**
-  (to be measured in Phase 0). `quantize.py` will enforce this limit.
+  (434.6 MB). `quantize.py` will enforce this limit.
   Smaller groupsize = more metadata = larger output.
 - **VRAM**: max **8 GB** during quantization (checked via `nvidia-smi`). No
   allocating auxiliary tensors that persist across layers.
+- **Time**: quantization must complete in **≤ 5 minutes** for all 151 layers.
+  Avoid exhaustive grid searches, per-weight iterative refinement, or other
+  super-linear algorithms.
 
 **What you CAN do:**
 - Modify `quantize.py` — this is the only file you edit.
-- Change the quantization algorithm **completely**. Invent new schemes, use
-  iterative optimisation, implement multi-codebook quantization, add rotation
-  transforms, use entropy coding, or anything else that maps float weights to
-  a compact representation with size < Q4_K's.
-- Use any bit-width (2, 3, 4, or even fractional effective bits via coding).
-- Make multiple passes over the weights — extra compute is fine as long as
-  VRAM stays under 8 GB.
+- Change the quantization algorithm **completely**. Invent genuinely new schemes:
+  new codebook structures, new encoding methods, new compression techniques.
+- Use any bit-width or even fractional effective bits via novel encoding.
 - Add new functions, classes, or imports within `quantize.py` (no new packages).
 - Vary `--groupsize` (≥ 16).
 - **Extend `main()`** to add optional quantization-internal arguments, provided
@@ -181,6 +207,20 @@ Symmetric quantization is **hardcoded** (always on). There is no `--symmetric` f
 - **Any storage format** is allowed as long as the FP16 dequantized weights
   can be reconstructed from the compressed file and loaded via
   `AutoModelForCausalLM.from_pretrained()`.
+
+**What you CANNOT do:**
+- **Mix existing quant types without novelty.** Applying Q4_K to some layers and
+  Q3_K to others is NOT a new technique — it's parameter assignment.
+- **Exploit Qwen-specific architecture.** All techniques must generalize to
+  any transformer model — no hardcoding layer shapes or names.
+- Modify `eval_perplexity.py` or `eval_topk.py`. They are read-only.
+- Modify `quantizer.py` (the `Quantizer` class and `quantize_tensor` function).
+- Modify `data_utils.py`.
+- Install new packages or add dependencies.
+- Exceed Q4_K's compressed size (434.6 MB).
+- Exceed 8 GB VRAM.
+- Use more than one GPU.
+- Use the Wikitext-2 test split during quantization (calibration only from train/val).
 
 **What you CANNOT do:**
 - Modify `eval_perplexity.py` or `eval_topk.py`. They are read-only.
@@ -243,32 +283,34 @@ Allowed diagnostics:
 ### Performance guidance
 
 **Ranked idea queue.** Try these in order — early ideas are higher-probability
-improvements:
+improvements. ALL ideas below are novel techniques, not parameter mixing.
 
-1. **Re-evaluate 2-bit K-means** — The existing 2-bit pipeline (K-means codebooks,
-   Q8 compression, error diffusion, activation weighting, channel sorting) may
-   already beat Q4_K. Verify this first.
+1. **Multi-codebook additive (AQLM-style)** — Represent W ≈ Q₁ + Q₂ where each
+   uses a small 2-bit codebook. Two 2-bit codebooks = 4 addends of expressiveness
+   but less storage than a single 4-bit codebook. Novel representation.
 
-2. **3-bit with codebook compression** — 3-bit offers 8 levels per group vs 4,
-   dramatically reducing quantization error. With Q8 codebook compression and
-   a groupsize of 64-128, the storage may still be under Q4_K's size.
-
-3. **Multi-codebook additive (AQLM-style)** — Represent W ≈ Q₁ + Q₂ where each
-   uses a small 2-bit codebook. Two 2-bit codebooks = 4-bit expressiveness but
-   less storage than 4-bit (only pay for two small codebooks per group).
-
-4. **Hadamard rotation + quantization** — For each weight matrix W (out × in),
-   apply a random Hadamard transform H: W' = W @ H. Quantize W'. At load time,
-   apply H^T during the forward pass. This makes weight distributions more
-   uniform, reducing quantization error.
-
-5. **Variable bit-width per layer** — Attention layers (q/k/v/o-proj) are more
-   sensitive than MLP layers (gate/up/down). Spend 3-4 bits on attention and
-   2 bits on MLP. The average bit-width determines total size.
-
-6. **Entropy coding of quantized codes** — After quantization, apply Huffman
+2. **Entropy coding of quantized codes** — After quantization, apply Huffman
    coding to the per-weight codes. Non-uniform code distributions (some levels
-   are more common) yield additional compression at zero quality cost.
+   are more common) yield additional compression at zero quality cost. Pure
+   storage win, applicable as a post-processing step to any quantizer.
+
+3. **Hadamard rotation + quantization** — For each weight matrix W (out × in),
+   apply a random Hadamard transform H: W' = W @ H. Quantize W'. At load time,
+   the inverse transform is fused into the next layer. Makes weight distributions
+   more uniform, reducing quantization error. Novel transform.
+
+4. **Channel-shared codebooks with delta coding** — Store a base codebook shared
+   across multiple output channels, plus small per-channel delta values encoded
+   in fewer bits. Reduces codebook storage while preserving per-channel specificity.
+
+5. **Vector quantization of weight blocks** — Quantize groups of 4 or 8 weights
+   jointly using a learned vector codebook (e.g., 4 weights → 8-bit index =
+   2 bits/weight). Exploits correlations between adjacent weights that scalar
+   quantization misses.
+
+6. **Codebook deduplication** — After quantization, identify near-identical
+   codebooks across layers and merge them. A single codebook pool shared across
+   similar layers dramatically cuts metadata overhead. Novel memory optimization.
 
 ---
 
