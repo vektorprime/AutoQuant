@@ -166,6 +166,32 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
         d = d_new.clamp(min=1e-8)
         dmin = dmin_new.abs().clamp(min=1e-8)
 
+    # Share d/dmin across K=4 output channels with 4-bit per-channel scale factors
+    K = 4
+    out_pad = ((out_features + K - 1) // K) * K
+    n_groups = out_pad // K
+
+    d_storage = d.clone()
+    dmin_storage = dmin.clone()
+
+    if out_features < out_pad:
+        d_storage = torch.nn.functional.pad(d_storage, (0, 0, 0, out_pad - out_features))
+        dmin_storage = torch.nn.functional.pad(dmin_storage, (0, 0, 0, out_pad - out_features))
+
+    d_grp = d_storage.reshape(n_groups, K, n_blocks)
+    dmin_grp = dmin_storage.reshape(n_groups, K, n_blocks)
+
+    shared_d = d_grp.amax(dim=1)
+    shared_dmin = dmin_grp.amax(dim=1)
+
+    sf_d = (d_grp / shared_d.unsqueeze(1).clamp(min=1e-8)).clamp(0.0, 1.0)
+    sf_d_4bit = torch.clamp(torch.round(sf_d * 15.0), 1, 15).to(torch.uint8)
+    sf_dm = (dmin_grp / shared_dmin.unsqueeze(1).clamp(min=1e-8)).clamp(0.0, 1.0)
+    sf_dm_4bit = torch.clamp(torch.round(sf_dm * 15.0), 1, 15).to(torch.uint8)
+
+    sf_d_packed = (sf_d_4bit[:, 0::2, :] | (sf_d_4bit[:, 1::2, :] << 4))
+    sf_dm_packed = (sf_dm_4bit[:, 0::2, :] | (sf_dm_4bit[:, 1::2, :] << 4))
+
     eff_scale = d.unsqueeze(-1) * sc_norm
     eff_scale[eff_scale < 1e-8] = 1e-8
     eff_offset = dmin.unsqueeze(-1) * m_norm
@@ -177,14 +203,17 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     quants_flat = q.reshape(out_features, in_features)
 
     return {
-        "d":              d.numpy().astype(np.float16),
-        "dmin":           dmin.numpy().astype(np.float16),
+        "shared_d":       shared_d.numpy().astype(np.float16),    # (groups, n_blocks)
+        "shared_dmin":    shared_dmin.numpy().astype(np.float16), # (groups, n_blocks)
+        "sf_d_packed":    sf_d_packed.numpy(),                    # (groups, K//2, n_blocks) uint8
+        "sf_dm_packed":   sf_dm_packed.numpy(),                   # (groups, K//2, n_blocks) uint8
         "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
         "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
         "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
+        "K":              K,
     }
 
 
@@ -428,14 +457,27 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
             quants = data["quants"]
             q_out = _pack_4bit(quants)
             sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
-            d8 = _pack_fp16_to_log8(data["d"])
-            dm8 = _pack_fp16_to_log8(data["dmin"])
-            np.savez(fname,
-                     quants=q_out,
-                     d8=d8,
-                     dm8=dm8,
-                     scales_mins_packed=sm_packed,
-                     format=data["format"])
+            if "shared_d" in data:
+                d8 = _pack_fp16_to_log8(data["shared_d"])
+                dm8 = _pack_fp16_to_log8(data["shared_dmin"])
+                np.savez(fname,
+                         quants=q_out,
+                         d8=d8,
+                         dm8=dm8,
+                         sf_d_packed=data["sf_d_packed"],
+                         sf_dm_packed=data["sf_dm_packed"],
+                         K=data.get("K", 4),
+                         scales_mins_packed=sm_packed,
+                         format=data["format"])
+            else:
+                d8 = _pack_fp16_to_log8(data["d"])
+                dm8 = _pack_fp16_to_log8(data["dmin"])
+                np.savez(fname,
+                         quants=q_out,
+                         d8=d8,
+                         dm8=dm8,
+                         scales_mins_packed=sm_packed,
+                         format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
             np.savez(fname, codes=codes_out,

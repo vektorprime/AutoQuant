@@ -32,7 +32,11 @@ Outcome: WIN — 416.9 MB, KL=0.092, Top-P=83.86%. CURRENT GLOBAL BEST.
 Hypothesis: Classify blocks BEFORE quantization, use 3-bit for 50% from the start.
 Outcome: REGRESSED — KL=0.254. 3-bit too aggressive even with LS.
 
+## exp-20260710-021 (Shared d/dmin across channels)
+Hypothesis: Share d/dmin across K=4 output channels, store shared values (float8) + 4-bit per-channel scale factors. Storage-only compression (dequantized weights use precise d/dmin).
+Outcome: WIN — 415.6 MB, KL=0.092, Top-P=83.86%. NEW GLOBAL BEST.
+
 ## Summary
-- Best: Float8 d/dmin + packed 6-bit scales/mins + 3-pass LS → 416.9 MB, KL=0.092, Top-P=83.86%
-- Storage breakdown: ~400 MB weights + ~12.4 MB packed sc/m + ~4.5 MB float8 d/dmin
-- Learned: LS refinement on d/dmin is robust (improves KL ~1.5%). Metadata packing is net savings. 3-bit substition causes catastrophic quality loss. Re-quantizing mid-LS disrupts convergence. Sub-block count is already optimal at 8.
+- Best: Shared d/dmin (K=4) + float8 shared values + 4-bit scale factors + packed 6-bit scales/mins + 3-pass LS → 415.6 MB, KL=0.092, Top-P=83.86%
+- Storage breakdown: ~398.5 MB weights + ~12.4 MB packed sc/m + ~3.4 MB shared d/dmin (float8) + ~1.3 MB sf (4-bit packed)
+- Learned: Key insight — compressed storage format can differ from dequantized weight computation. Storage-only compression preserves quality while reducing size. 4-bit scale factors for d/dmin ratios are precise enough for lossless storage reconstruction. Separate scale factors for d and dmin required (cannot share).
