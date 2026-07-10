@@ -958,16 +958,14 @@ def _pack_layer_data(data: dict, bits: int, fmt: str) -> dict:
 
 
 def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
-    """Compact binary format: dedup quants, pack arrays, no npz overhead.
-    V3: global string table + integer layer/key IDs for maximum compression."""
+    """Compact binary format V4: schema-based encoding, zero per-key overhead."""
     B = bytearray()
-    B.extend(b'AQ03')
+    B.extend(b'AQ04')
     B.extend(struct.pack('<I', 0))
 
     quants_table = []
     quants_to_idx = {}
     layer_quants_idx = {}
-
     for name, shape, arrays in packed_layers:
         if 'quants' in arrays:
             qb = arrays['quants'].tobytes()
@@ -983,116 +981,69 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         B.extend(struct.pack('<I', len(qb)))
         B.extend(qb)
 
-    str_table = []
-    str_to_idx = {}
-    def _get_str_idx(s):
-        if s not in str_to_idx:
-            str_to_idx[s] = len(str_table)
-            str_table.append(s)
-        return str_to_idx[s]
-
-    key_table = []
-    key_to_idx = {}
-    def _get_key_idx(k):
-        if k not in key_to_idx:
-            key_to_idx[k] = len(key_table)
-            key_table.append(k)
-        return key_to_idx[k]
-
-    for name, shape, arrays in packed_layers:
-        _get_str_idx(name)
-        for k in arrays:
-            _get_key_idx(k)
-
-    B.extend(struct.pack('<H', len(str_table)))
-    for s in str_table:
+    schema = ['base_packed', 'delta_packed', 'scales_mins_packed', 'ref_indices']
+    B.extend(struct.pack('<B', len(schema)))
+    for s in schema:
         sb = s.encode('utf-8')
-        B.extend(struct.pack('<H', len(sb)))
+        B.extend(struct.pack('<B', len(sb)))
         B.extend(sb)
 
-    B.extend(struct.pack('<H', len(key_table)))
-    for k in key_table:
+    defaults = {}
+    for k in ['format', 'quants_no_delta', 'K', 'ref_bits', 'Kq']:
+        vals = [a.get(k) for _, _, a in packed_layers if k in a]
+        if vals and all(v == vals[0] for v in vals):
+            defaults[k] = vals[0]
+
+    B.extend(struct.pack('<B', len(defaults)))
+    for k, v in defaults.items():
         kb = k.encode('utf-8')
         B.extend(struct.pack('<B', len(kb)))
         B.extend(kb)
-
-    global_defaults = _build_global_defaults(packed_layers)
-    B.extend(struct.pack('<H', len(global_defaults)))
-    for k, v in global_defaults.items():
-        B.extend(struct.pack('<B', key_to_idx.get(k, 0xFF)))
-        B.extend(_serialize_scalar(v))
+        B.extend(_serialize_leaf(v))
 
     B.extend(struct.pack('<H', len(packed_layers)))
     for name, shape, arrays in packed_layers:
-        name_idx = str_to_idx[name]
-        B.extend(struct.pack('<H', name_idx))
+        name_b = name.encode('utf-8')
+        B.extend(struct.pack('<B', len(name_b)))
+        B.extend(name_b)
         B.extend(struct.pack('<I', shape[0]))
         B.extend(struct.pack('<I', shape[1]))
-        n_arrays = len(arrays)
-        B.extend(struct.pack('<B', n_arrays))
-        for k, v in arrays.items():
-            kidx = key_to_idx[k]
-            is_default = (k in global_defaults and v == global_defaults[k])
-            is_shared_quants = (k == 'quants' and name in layer_quants_idx)
-            flags = 0x00
-            if is_shared_quants:
-                flags |= 0x01
-            if is_default:
-                flags |= 0x02
-            qidx = layer_quants_idx.get(name, 0xFFFF) if is_shared_quants else 0xFFFF
-            B.extend(struct.pack('<B', kidx))
-            B.extend(struct.pack('<B', flags))
-            B.extend(struct.pack('<H', qidx))
-            if is_shared_quants or is_default:
-                pass
-            else:
-                B.extend(_serialize_scalar(v))
+
+        qidx = layer_quants_idx.get(name, 0xFFFF)
+        B.extend(struct.pack('<H', qidx))
+
+        for s in schema:
+            v = arrays.get(s)
+            B.extend(_serialize_leaf(v))
 
     total_sz = len(B)
     B[4:8] = struct.pack('<I', total_sz)
     return bytes(B)
 
 
-def _serialize_scalar(v):
+def _serialize_leaf(v):
     if v is None:
         return struct.pack('<B', 0xFF)
     if isinstance(v, np.ndarray):
-        dtype_map = {np.dtype('uint8'): 0x00, np.dtype('int8'): 0x01,
-                     np.dtype('uint16'): 0x02, np.dtype('int16'): 0x03,
-                     np.dtype('uint32'): 0x04, np.dtype('int32'): 0x05,
-                     np.dtype('float32'): 0x06, np.dtype('float64'): 0x07}
-        dt = dtype_map.get(v.dtype, 0x00)
         raw = v.tobytes()
-        return struct.pack('<B', dt) + struct.pack('<I', len(raw)) + raw
+        L = len(raw)
+        if L < 256:
+            return struct.pack('<B', 0x00) + struct.pack('<B', L) + raw
+        else:
+            return struct.pack('<B', 0x00) + struct.pack('<H', L) + raw
     if isinstance(v, bool):
-        return struct.pack('<B', 0x10) + (b'\x01' if v else b'\x00')
+        return struct.pack('<B', 0x01) + (b'\x01' if v else b'\x00')
     if isinstance(v, int):
-        return struct.pack('<B', 0x11) + struct.pack('<i', v)
+        if -128 <= v <= 127:
+            return struct.pack('<B', 0x02) + struct.pack('<b', v)
+        elif -32768 <= v <= 32767:
+            return struct.pack('<B', 0x03) + struct.pack('<h', v)
+        else:
+            return struct.pack('<B', 0x04) + struct.pack('<i', v)
     if isinstance(v, str):
         b = v.encode('utf-8')
-        return struct.pack('<B', 0x12) + struct.pack('<H', len(b)) + b
+        return struct.pack('<B', 0x05) + struct.pack('<B', len(b)) + b
     return struct.pack('<B', 0xFF)
-
-
-def _build_global_defaults(packed_layers):
-    if not packed_layers:
-        return {}
-    all_keys = set()
-    for _, _, arrays in packed_layers:
-        all_keys.update(arrays.keys())
-    key_names = ['format', 'quants_no_delta', 'delta_sm_encoded', 'K', 'K_sm', 'Kq', 'ref_bits', 'n_blocks']
-    defaults = {}
-    for k in key_names:
-        if k in all_keys:
-            vals = []
-            for _, _, arrays in packed_layers:
-                if k in arrays:
-                    vals.append(arrays[k])
-            if len(vals) >= len(packed_layers) * 0.8:
-                first = vals[0]
-                if all(v == first for v in vals):
-                    defaults[k] = first
-    return defaults
 
 
 def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans", consolidated: bool = False) -> int:
