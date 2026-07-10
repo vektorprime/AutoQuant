@@ -188,90 +188,6 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     }
 
 
-def _quantize_one_layer_q4k_packed5_ls(layer: nn.Linear) -> dict:
-    """Q4_K with 5-bit scales/mins + LS refine d/dmin, packed into 10 bytes/superblock.
-    Saves 6 bytes/superblock vs baseline (4.375 bpw effective)."""
-    W = layer.weight.data.float()
-    out_features, in_features = W.shape
-
-    assert in_features % QK_K == 0
-    n_blocks = in_features // QK_K
-
-    W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
-    W_flat = W.reshape(out_features, n_blocks, QK_K)
-
-    w_sub_min = W_r.amin(dim=-1)
-    w_sub_max = W_r.amax(dim=-1)
-    w_blk_min = w_sub_min.amin(dim=-1)
-    w_blk_max = w_sub_max.amax(dim=-1)
-
-    d = (w_blk_max - w_blk_min) / 15.0
-    d[d < 1e-8] = 1e-8
-    dmin = w_blk_min.abs().clamp(min=1e-8)
-
-    d_sub = (w_sub_max - w_sub_min) / 15.0
-    d_sub[d_sub < 1e-8] = 1e-8
-
-    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
-    sc_5bit = torch.clamp(torch.round(sc_ratio * 31.0), 1, 31).to(torch.uint8)
-    sc_norm = sc_5bit.float() / 31.0
-
-    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
-    m_5bit = torch.clamp(torch.round(min_ratio * 31.0), 0, 31).to(torch.uint8)
-    m_norm = m_5bit.float() / 31.0
-
-    eff_scale = d.unsqueeze(-1) * sc_norm
-    eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm
-
-    q = torch.round(
-        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
-    )
-    q = torch.clamp(q, 0, 15).to(torch.uint8)
-
-    for _ in range(3):
-        s = sc_norm.unsqueeze(-1) * q.float()
-        s_flat = s.flatten(start_dim=2)
-        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
-        m_flat = m.flatten(start_dim=2)
-
-        s_sq = (s_flat * s_flat).sum(dim=-1)
-        m_sq = (m_flat * m_flat).sum(dim=-1)
-        sm = (s_flat * m_flat).sum(dim=-1)
-        ws = (W_flat * s_flat).sum(dim=-1)
-        wm = (W_flat * m_flat).sum(dim=-1)
-
-        det = s_sq * m_sq - sm * sm
-        det[det.abs() < 1e-12] = 1e-12
-        d_new = (ws * m_sq - wm * sm) / det
-        dmin_new = (ws * sm - wm * s_sq) / det
-
-        d = d_new.clamp(min=1e-8)
-        dmin = dmin_new.abs().clamp(min=1e-8)
-
-    eff_scale = d.unsqueeze(-1) * sc_norm
-    eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm
-
-    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
-    W_q = W_q_r.reshape(out_features, in_features)
-    layer.weight.data = W_q.to(layer.weight.dtype)
-
-    quants_flat = q.reshape(out_features, in_features)
-
-    sm_packed = _pack_5bit_sm(sc_5bit.numpy(), m_5bit.numpy())
-
-    return {
-        "d":              d.numpy().astype(np.float16),
-        "dmin":           dmin.numpy().astype(np.float16),
-        "scales_mins_5bit_packed": sm_packed,
-        "quants":         quants_flat.numpy(),
-        "format":         "q4_k_packed5_ls",
-        "shape":          [out_features, in_features],
-        "n_blocks":       n_blocks,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Per-layer 2-bit K-means quantization (vectorised, CPU)
 # ---------------------------------------------------------------------------
@@ -490,21 +406,6 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_5bit_sm(scales_5bit: np.ndarray, mins_5bit: np.ndarray) -> np.ndarray:
-    """Pack 8 × (5-bit scale + 5-bit min) = 80 bits → 10 bytes per superblock.
-    Saves 6 bytes/superblock vs separate uint8 arrays."""
-    out, nb, nsub = scales_5bit.shape
-    assert nsub == 8
-    sm = (scales_5bit.astype(np.uint64) << 5) | mins_5bit.astype(np.uint64)
-    combined = (sm[:, :, 0] | (sm[:, :, 1] << 10) | (sm[:, :, 2] << 20) |
-                (sm[:, :, 3] << 30) | (sm[:, :, 4] << 40) | (sm[:, :, 5] << 50) |
-                (sm[:, :, 6] << 60) | (sm[:, :, 7] << 70))
-    packed = np.zeros((out, nb, 10), dtype=np.uint8)
-    for b in range(10):
-        packed[:, :, b] = (combined >> (b * 8)) & 0xFF
-    return packed
-
-
 def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans") -> int:
     os.makedirs(save_dir, exist_ok=True)
     total_bytes = 0
@@ -523,15 +424,6 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                      d=data["d"],
                      dmin=data["dmin"],
                      scales_mins_packed=sm_packed,
-                     format=data["format"])
-        elif data.get("format") == "q4_k_packed5_ls":
-            quants = data["quants"]
-            q_out = _pack_4bit(quants)
-            np.savez(fname,
-                     quants=q_out,
-                     d=data["d"],
-                     dmin=data["dmin"],
-                     scales_mins_5bit_packed=data["scales_mins_5bit_packed"],
                      format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
@@ -622,12 +514,6 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             meta[name] = _quantize_one_layer_q4k(layer)
-        elif fmt == "q4_k_packed5_ls":
-            if layer.weight.shape[1] % QK_K != 0:
-                logger.warning("Skipping %s: in_features %d not divisible by %d",
-                               name, layer.weight.shape[1], QK_K)
-                continue
-            meta[name] = _quantize_one_layer_q4k_packed5_ls(layer)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -677,7 +563,7 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k", "q4_k_packed5_ls"],
+                        choices=["q2_kmeans", "q4_k"],
                         help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
     return parser.parse_args()
 
@@ -720,13 +606,8 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    if args.format == "q4_k":
-        effective_bits = 4.5
-    elif args.format == "q4_k_packed5_ls":
-        effective_bits = 4.44
-    else:
-        effective_bits = args.bits
-    logger.info("Quantizing  format=%s  bits=%.2f  groupsize=%d  symmetric=True",
+    effective_bits = 4 if args.format == "q4_k" else args.bits
+    logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
         model,
