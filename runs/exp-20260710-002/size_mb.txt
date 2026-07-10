@@ -1,0 +1,1 @@
+405	quantized_models/q4k_zlib/compressed
