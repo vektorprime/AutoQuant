@@ -252,7 +252,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
     delta_sc = delta_sc.reshape(out_pad_sm, n_blocks, 8)[:out_features]
     delta_m = delta_m.reshape(out_pad_sm, n_blocks, 8)[:out_features]
 
-    delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
+    delta_sm_packed = _pack_q4k_sm_deltas_block_delta(delta_sc, delta_m)
 
     # Inter-channel quants delta compression: store 1 ref + (Kq-1) delta channels
     Kq = min(quants_delta_K, out_features)
@@ -281,6 +281,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         "scales_mins_shared": shared_sc,
         "mins_shared":    shared_m,
         "delta_sm":       delta_sm_packed,
+        "delta_sm_encoded": True,
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
@@ -561,6 +562,31 @@ def _pack_q4k_sm_deltas(delta_sc: np.ndarray, delta_m: np.ndarray) -> np.ndarray
     return packed
 
 
+def _pack_q4k_sm_deltas_block_delta(delta_sc: np.ndarray, delta_m: np.ndarray) -> np.ndarray:
+    """Delta-encode packed delta_sm across superblocks: 4+2*(nb-1) bytes/channel vs 4*nb."""
+    out, nb, nsub = delta_sc.shape
+    assert nsub == 8
+    if nb <= 1:
+        return _pack_q4k_sm_deltas(delta_sc, delta_m)
+
+    packed = _pack_q4k_sm_deltas(delta_sc, delta_m)  # (out, nb, 4)
+    ref = packed[:, 0:1, :].copy()  # (out, 1, 4) — first block reference
+    result = np.zeros((out, nb, 2), dtype=np.uint8)
+    result[:, 0, :2] = ref[:, 0, :2]
+
+    for b in range(1, nb):
+        for p in range(4):
+            cur = packed[:, b, p].astype(np.int16)
+            prv = packed[:, b - 1, p].astype(np.int16)
+            delta = np.clip(cur - prv, -8, 7).astype(np.int8)
+            nibble = (delta + 8).clip(0, 15).astype(np.uint8)
+            if p < 2:
+                result[:, b, 0] |= nibble << (p * 4)
+            else:
+                result[:, b, 1] |= nibble << ((p - 2) * 4)
+    return result
+
+
 def _pack_fp16_to_log8(arr: np.ndarray) -> np.ndarray:
     """Pack fp16 d/dmin into uint8 log-scale. ~6 MB savings per model."""
     arr = arr.astype(np.float32)
@@ -605,6 +631,8 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
+                    if data.get("delta_sm_encoded"):
+                        save_kw["delta_sm_encoded"] = True
                 np.savez(fname, **save_kw)
             else:
                 d8 = _pack_fp16_to_log8(data["d"])
