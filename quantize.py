@@ -1011,9 +1011,6 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
     B.extend(struct.pack('<B', len(dedup_schema)))
     for dt in dedup_schema:
         entries = dedup_tables[dt]
-        key_b = dt.encode('utf-8')
-        B.extend(struct.pack('<B', len(key_b)))
-        B.extend(key_b)
         n = len(entries)
         idx_bits = 16 if n >= 256 else 8
         B.extend(struct.pack('<B', idx_bits // 8))
@@ -1023,16 +1020,15 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
             B.extend(entry)
 
     defaults = {}
-    for k in ['format', 'quants_no_delta', 'K', 'ref_bits', 'Kq']:
+    default_order = ['format', 'quants_no_delta', 'K', 'ref_bits', 'Kq']
+    for k in default_order:
         vals = [a.get(k) for _, _, a in packed_layers if k in a]
         if vals and all(v == vals[0] for v in vals):
             defaults[k] = vals[0]
 
-    B.extend(struct.pack('<B', len(defaults)))
-    for k, v in defaults.items():
-        kb = k.encode('utf-8')
-        B.extend(struct.pack('<B', len(kb)))
-        B.extend(kb)
+    present_defaults = [(k, defaults[k]) for k in default_order if k in defaults]
+    B.extend(struct.pack('<B', len(present_defaults)))
+    for k, v in present_defaults:
         B.extend(_serialize_leaf(v))
 
     B.extend(struct.pack('<H', len(packed_layers)))
