@@ -274,14 +274,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         q_ref = q_grp[:, 0, :]
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
         quants_ref_packed = _pack_4bit(q_ref)
-        quants_delta_result = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, adaptive=True)
-        if isinstance(quants_delta_result, tuple):
-            quants_delta_packed, quants_delta_mask = quants_delta_result
-            quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed,
-                           quants_delta_mask=quants_delta_mask, Kq=Kq, delta_bits=quants_delta_bits, delta_adaptive=True)
-        else:
-            quants_delta_packed = quants_delta_result
-            quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits)
+        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits)
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -537,65 +531,29 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2, adaptive: bool = False):
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2) -> np.ndarray:
     """Pack 256 × delta_bits signed deltas per target channel.
     delta_bits=2: packed into 64 bytes/sb (-1,0,1,2 range).
-    delta_bits=1: packed into 32 bytes/sb (0,+1 range).
-    If adaptive=True, returns (packed_data, mask) — skip zero-delta blocks."""
+    delta_bits=1: packed into 32 bytes/sb (0,+1 range)."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
     ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
     tgt_sb = tgt_quants.reshape(n_tgt, out, n_blocks, QK_K).astype(np.int16)
     bytes_per_sb = 32 if delta_bits == 1 else 64
-
-    if not adaptive:
-        packed = np.zeros((n_tgt, out, n_blocks, bytes_per_sb), dtype=np.uint8)
-        for t in range(n_tgt):
-            diff = tgt_sb[t] - ref_sb
-            if delta_bits == 1:
-                delta = (diff > 0).astype(np.uint8)
-                for o in range(out):
-                    for b in range(n_blocks):
-                        packed[t, o, b] = _pack_1bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
-            else:
-                delta = np.clip(diff + 1, 0, 3).astype(np.uint8)
-                for o in range(out):
-                    for b in range(n_blocks):
-                        packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
-        return packed
-
-    total_blocks = n_tgt * out * n_blocks
-    mask_words = (total_blocks + 7) // 8
-    mask = np.zeros(mask_words, dtype=np.uint8)
-    data_chunks = []
-    nonzero_count = 0
-    block_idx = 0
-
+    packed = np.zeros((n_tgt, out, n_blocks, bytes_per_sb), dtype=np.uint8)
     for t in range(n_tgt):
         diff = tgt_sb[t] - ref_sb
         if delta_bits == 1:
             delta = (diff > 0).astype(np.uint8)
+            for o in range(out):
+                for b in range(n_blocks):
+                    packed[t, o, b] = _pack_1bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
         else:
             delta = np.clip(diff + 1, 0, 3).astype(np.uint8)
-        for o in range(out):
-            for b in range(n_blocks):
-                d_block = delta[o, b]
-                is_zero = not d_block.any()
-                if not is_zero:
-                    if delta_bits == 1:
-                        packed_b = _pack_1bit(d_block.reshape(1, QK_K)).reshape(bytes_per_sb)
-                    else:
-                        packed_b = _pack_2bit(d_block.reshape(1, QK_K)).reshape(bytes_per_sb)
-                    data_chunks.append(packed_b)
-                    mask[block_idx // 8] |= (1 << (block_idx % 8))
-                    nonzero_count += 1
-                block_idx += 1
-
-    data = np.concatenate(data_chunks) if data_chunks else np.zeros((0, bytes_per_sb), dtype=np.uint8)
-    logger.info("Adaptive delta: %d/%d blocks non-zero (%.1f%% savings)",
-                nonzero_count, total_blocks,
-                (1.0 - nonzero_count / max(total_blocks, 1)) * 100)
-    return data, mask
+            for o in range(out):
+                for b in range(n_blocks):
+                    packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
+    return packed
 
 
 def _pack_q4k_sm_joint(shared_sc: np.ndarray, shared_m: np.ndarray) -> np.ndarray:
@@ -703,9 +661,6 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
                     save_kw["delta_bits"] = data.get("delta_bits", 2)
-                    if data.get("delta_adaptive"):
-                        save_kw["quants_delta_mask"] = data["quants_delta_mask"]
-                        save_kw["delta_adaptive"] = True
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
