@@ -101,7 +101,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, bias_correct: bool = False) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -148,17 +148,11 @@ def _quantize_one_layer_q4k(layer: nn.Linear, bias_correct: bool = False) -> dic
     # Dequantize back into the weight tensor
     W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
     W_q = W_q_r.reshape(out_features, in_features)
-
-    channel_bias = None
-    if bias_correct:
-        channel_bias = (W - W_q).mean(dim=-1)  # per-output-channel mean error
-        W_q += channel_bias.unsqueeze(-1)
-
     layer.weight.data = W_q.to(layer.weight.dtype)
 
     quants_flat = q.reshape(out_features, in_features)
 
-    result = {
+    return {
         "d":              d.numpy().astype(np.float16),
         "dmin":           dmin.numpy().astype(np.float16),
         "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
@@ -168,9 +162,6 @@ def _quantize_one_layer_q4k(layer: nn.Linear, bias_correct: bool = False) -> dic
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
     }
-    if channel_bias is not None:
-        result["channel_bias"] = channel_bias.numpy().astype(np.float16)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -440,27 +431,6 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                          mins_zlib=m_arr,
                          mins_shape=data["mins_6bit"].shape,
                          format="q4_k_zlib2")
-            elif fmt == "q4_k_bias_zlib2":
-                q_raw = q_out.tobytes()
-                q_compressed = zlib.compress(q_raw, level=9)
-                q_arr = np.frombuffer(q_compressed, dtype=np.uint8)
-                s_raw = data["scales_6bit"].tobytes()
-                s_compressed = zlib.compress(s_raw, level=9)
-                s_arr = np.frombuffer(s_compressed, dtype=np.uint8)
-                m_raw = data["mins_6bit"].tobytes()
-                m_compressed = zlib.compress(m_raw, level=9)
-                m_arr = np.frombuffer(m_compressed, dtype=np.uint8)
-                np.savez(fname,
-                         quants_zlib=q_arr,
-                         quants_shape=q_out.shape,
-                         d=data["d"],
-                         dmin=data["dmin"],
-                         scales_zlib=s_arr,
-                         scales_shape=data["scales_6bit"].shape,
-                         mins_zlib=m_arr,
-                         mins_shape=data["mins_6bit"].shape,
-                         channel_bias=data.get("channel_bias"),
-                         format="q4_k_bias_zlib2")
             else:
                 np.savez(fname,
                          quants=q_out,
@@ -573,12 +543,6 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             meta[name] = _quantize_one_layer_q4k(layer)
-        elif fmt == "q4_k_bias_zlib2":
-            if layer.weight.shape[1] % QK_K != 0:
-                logger.warning("Skipping %s: in_features %d not divisible by %d",
-                               name, layer.weight.shape[1], QK_K)
-                continue
-            meta[name] = _quantize_one_layer_q4k(layer, bias_correct=True)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -628,8 +592,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_bias_zlib2"],
-                        help="Quantization format (..., q4_k_bias_zlib2=Q4_K+bias correction+zlib codes+meta)")
+                        choices=["q2_kmeans", "q3_kmeans", "q4_k", "q4_k_zlib", "q4_k_zlib2"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q3_kmeans=K-means 3-bit, q4_k=GGML-style 4-bit blocks, q4_k_zlib=Q4_K+zlib codes, q4_k_zlib2=Q4_K+zlib codes+meta)")
     return parser.parse_args()
 
 
@@ -671,7 +635,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2", "q4_k_bias_zlib2") else (3 if args.format == "q3_kmeans" else args.bits)
+    effective_bits = 4 if args.format in ("q4_k", "q4_k_zlib", "q4_k_zlib2") else (3 if args.format == "q3_kmeans" else args.bits)
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
