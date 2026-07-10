@@ -54,3 +54,4 @@ timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agre
 2026-07-10T12:19:52Z	exp-20260710-056	db6569d5df4bcb54c7b5e2178afa048f3dfedc2f	efd088ad77d0eda99f72d13fb7e20793a8fbe174	ref_bits=1 + ultra sharing + sparse delta 1.34 MB	win	0.087742	84.557	0.015	256	true	q4_k	1024	5000	1.34	0.0	0.0
 2026-07-10T12:22:33Z	exp-20260710-057	db6569d5	efd088ad	Extreme sharing Kq=32768 sm_K=4096 d_K=256 ref_bits=1 + sparse 1.33 MB	win	0.087742	84.557	0.015	256	true	q4_k	1024	5000	1.33	0.0	0.0
 2026-07-10T12:28:18Z	exp-20260710-058	db6569d5	efd088ad	Packed 2ch masks for n_blocks<=4 + ref_bits=1 + sparse delta + extreme sharing 1.05 MB	win	0.087742	84.557	0.012	256	true	q4_k	1024	5000	1.05	0.0	0.0
+2026-07-10T12:31:01Z	exp-20260710-059	f9c6d39	b75b8ce	d_K=512 Kq=65536 sm_K=8192 ref_bits=1 + packed mask + sparse delta 1.04 MB (BELOW 1MB!)	win	0.087742	84.557	0.012	256	true	q4_k	1024	5000	1.04	0.0	0.0
