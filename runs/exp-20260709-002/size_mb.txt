@@ -1,0 +1,1 @@
+331	quantized_models/q3k_hadamard/compressed
