@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 64) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -254,30 +254,33 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
     delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
 
-    # Inter-channel quants delta compression: Kq=4, store 1 ref + 3 delta channels
-    Kq = 64
-    out_pad_q = ((out_features + Kq - 1) // Kq) * Kq
+    # Inter-channel quants delta compression: store 1 ref + (Kq-1) delta channels
+    Kq = min(quants_delta_K, out_features)
     quants_np = quants_flat.numpy()
-    if out_features < out_pad_q:
-        q_pad = np.pad(quants_np, ((0, out_pad_q - out_features), (0, 0)), mode='constant', constant_values=0)
+
+    if Kq >= 2:
+        out_pad_q = ((out_features + Kq - 1) // Kq) * Kq
+        if out_features < out_pad_q:
+            q_pad = np.pad(quants_np, ((0, out_pad_q - out_features), (0, 0)), mode='constant', constant_values=0)
+        else:
+            q_pad = quants_np
+        n_groups_q = out_pad_q // Kq
+        q_grp = q_pad.reshape(n_groups_q, Kq, -1)
+        q_ref = q_grp[:, 0, :]
+        q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
+        quants_ref_packed = _pack_4bit(q_ref)
+        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq)
     else:
-        q_pad = quants_np
-    n_groups_q = out_pad_q // Kq
-    q_grp = q_pad.reshape(n_groups_q, Kq, -1)
-    q_ref = q_grp[:, 0, :]
-    q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
-    quants_ref_packed = _pack_4bit(q_ref)
-    quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1)
+        quants_kw = dict(quants=quants_np)
 
     return {
+        **quants_kw,
         "base_packed":    base_packed,
         "delta_packed":   delta_packed,
         "scales_mins_shared": shared_sc,
         "mins_shared":    shared_m,
         "delta_sm":       delta_sm_packed,
-        "quants_ref":     quants_ref_packed,
-        "quants_delta":   quants_delta_packed,
-        "Kq":             Kq,
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
@@ -681,6 +684,7 @@ def quantize_model(
     save_compressed_dir: str | None = None,
     act_stats: dict | None = None,
     fmt: str = "q2_kmeans",
+    quants_delta_K: int = 64,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -700,7 +704,7 @@ def quantize_model(
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
-            meta[name] = _quantize_one_layer_q4k(layer)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -752,6 +756,8 @@ def parse_args():
     parser.add_argument("--format", default="q2_kmeans",
                         choices=["q2_kmeans", "q4_k"],
                         help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+    parser.add_argument("--quants-delta-K", type=int, default=64,
+                        help="Inter-channel quants delta group size (Kq). 1=full quants, >=2=1 ref + (Kq-1) 2-bit deltas.")
     return parser.parse_args()
 
 
@@ -803,6 +809,7 @@ def main():
         save_compressed_dir=compressed_dir,
         act_stats=act_stats,
         fmt=args.format,
+        quants_delta_K=args.quants_delta_K,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
