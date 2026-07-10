@@ -963,27 +963,10 @@ def _pack_layer_data(data: dict, bits: int, fmt: str) -> dict:
 
 
 def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
-    """Compact binary format V6: schema-based + all-array dedup + compact layer encoding."""
+    """Compact binary format V8: schema-based + all-array dedup + nameless layers."""
     B = bytearray()
-    B.extend(b'AQ06')
+    B.extend(b'AQ08')
     B.extend(struct.pack('<I', 0))
-
-    import re
-    _LAYER_TYPES = {'q_proj': 0, 'k_proj': 1, 'v_proj': 2, 'o_proj': 3,
-                    'gate_proj': 4, 'up_proj': 5, 'down_proj': 6}
-    _LAYER_RE = re.compile(r'model\.layers\.(\d+)\.(?:self_attn|mlp)\.(\w+_proj)')
-    _EMBED_RE = re.compile(r'model\.embed_tokens')
-    _LMHEAD_RE = re.compile(r'^lm_head$')
-
-    def _encode_name(name):
-        m = _LAYER_RE.match(name)
-        if m:
-            return 0, int(m.group(1)), _LAYER_TYPES.get(m.group(2), 255)
-        if _EMBED_RE.match(name):
-            return 1, 0, 7
-        if _LMHEAD_RE.match(name):
-            return 2, 0, 8
-        return 3, 0, 255
 
     dedup_tables = {}
     table_data = {}
@@ -1054,17 +1037,6 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
 
     B.extend(struct.pack('<H', len(packed_layers)))
     for name, shape, arrays in packed_layers:
-        enc_type, block_idx, layer_type = _encode_name(name)
-        B.extend(struct.pack('<B', enc_type))
-        if enc_type == 0:
-            B.extend(struct.pack('<B', block_idx))
-            B.extend(struct.pack('<B', layer_type))
-        elif enc_type <= 2:
-            B.extend(struct.pack('<B', layer_type))
-        else:
-            name_b = name.encode('utf-8')
-            B.extend(struct.pack('<B', len(name_b)))
-            B.extend(name_b)
         B.extend(struct.pack('<I', shape[0]))
         B.extend(struct.pack('<I', shape[1]))
         qidx = layer_quants_idx.get(name, 0xFFFF)
