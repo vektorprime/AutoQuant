@@ -799,26 +799,31 @@ def _pack_quants_delta_subblock(ref_sb, tgt_sb, n_tgt, out, n_blocks, subblock_d
     return packed
 
 
-def _pack_q4k_sm_joint(shared_sc: np.ndarray, shared_m: np.ndarray) -> np.ndarray:
-    """Pack 8 × (5+5 bit joint scale+min) = 80 bits → 10 bytes per superblock."""
+def _pack_q4k_sm_joint(shared_sc: np.ndarray, shared_m: np.ndarray, bits: int = 5) -> np.ndarray:
+    """Pack 8 x (bits+bits joint scale+min) → bytes per superblock.
+    bits=5: 10 bytes/sb, bits=4: 8 bytes/sb."""
     ng, nb, nsub = shared_sc.shape
     assert nsub == 8
-    sc5 = np.clip(np.round(shared_sc.astype(np.float32) / 2.0), 0, 31).astype(np.uint16)
-    m5 = np.clip(np.round(shared_m.astype(np.float32) / 2.0), 0, 31).astype(np.uint16)
-    joint = (sc5 << 5) | m5
-    packed = np.zeros((ng, nb, 10), dtype=np.uint8)
-    for p in range(2):
-        i = p * 4
-        v0 = joint[:, :, i]
-        v1 = joint[:, :, i + 1]
-        v2 = joint[:, :, i + 2]
-        v3 = joint[:, :, i + 3]
-        b = p * 5
-        packed[:, :, b] = v0 & 0xFF
-        packed[:, :, b + 1] = ((v0 >> 8) & 0x3) | ((v1 & 0x3F) << 2)
-        packed[:, :, b + 2] = ((v1 >> 6) & 0xF) | ((v2 & 0xF) << 4)
-        packed[:, :, b + 3] = ((v2 >> 4) & 0x3F) | ((v3 & 0x3) << 6)
-        packed[:, :, b + 4] = (v3 >> 2) & 0xFF
+    maxv = (1 << bits) - 1
+    sc_q = np.clip(np.round(shared_sc.astype(np.float32) / (2 ** (6 - bits))), 0, maxv).astype(np.uint16)
+    m_q = np.clip(np.round(shared_m.astype(np.float32) / (2 ** (6 - bits))), 0, maxv).astype(np.uint16)
+    joint = (sc_q << bits) | m_q
+    bpw = bits * 2
+    bytes_per_sb = bpw
+    packed = np.zeros((ng, nb, bytes_per_sb), dtype=np.uint8)
+    if bits == 5:
+        for p in range(2):
+            i = p * 4
+            v0 = joint[:, :, i]; v1 = joint[:, :, i + 1]
+            v2 = joint[:, :, i + 2]; v3 = joint[:, :, i + 3]
+            b = p * 5
+            packed[:, :, b] = v0 & 0xFF
+            packed[:, :, b + 1] = ((v0 >> 8) & 0x3) | ((v1 & 0x3F) << 2)
+            packed[:, :, b + 2] = ((v1 >> 6) & 0xF) | ((v2 & 0xF) << 4)
+            packed[:, :, b + 3] = ((v2 >> 4) & 0x3F) | ((v3 & 0x3) << 6)
+            packed[:, :, b + 4] = (v3 >> 2) & 0xFF
+    else:
+        packed = joint.astype(np.uint8)
     return packed
 
 
@@ -882,7 +887,7 @@ def _pack_layer_data(data: dict, bits: int, fmt: str) -> dict:
             q_out = _pack_4bit(quants)
             q_delta = None
         if "scales_mins_shared" in data:
-            sm_packed = _pack_q4k_sm_joint(data["scales_mins_shared"], data["mins_shared"])
+            sm_packed = _pack_q4k_sm_joint(data["scales_mins_shared"], data["mins_shared"], bits=4)
         else:
             sm_packed = _pack_q4k_sm(data["scales_6bit"], data["mins_6bit"])
         if "base_packed" in data:
