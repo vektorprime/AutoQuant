@@ -46,7 +46,82 @@ def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Activation statistics collection (calibration data)
+# Q4_K with shared quantization levels: groups of output channels share
+# 16 optimized levels trained via 1D K-means. ~4.03 bpw vs Q4_K's 4.5.
+# ---------------------------------------------------------------------------
+
+SHARE_Q4K_CHANNELS = 16  # output channels sharing one set of 16 levels
+
+def _quantize_one_layer_q4k_shared(layer: nn.Linear) -> dict:
+    """Q4_K variant: groups of SHARE_Q4K_CHANNELS output channels share 16
+    optimized quantization levels (learned via 1D K-means) per 256-col block.
+    Storage: fp16 levels + 4-bit codes. ~4.03 bpw."""
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0, (
+        f"in_features ({in_features}) must be divisible by {QK_K}")
+    n_blocks = in_features // QK_K
+
+    assert out_features % SHARE_Q4K_CHANNELS == 0, (
+        f"out_features ({out_features}) must be divisible by {SHARE_Q4K_CHANNELS}")
+    n_groups = out_features // SHARE_Q4K_CHANNELS
+
+    W_r = W.reshape(n_groups, SHARE_Q4K_CHANNELS, n_blocks, QK_K)
+
+    quants = torch.zeros(n_groups, SHARE_Q4K_CHANNELS, n_blocks, QK_K, dtype=torch.uint8)
+    levels = torch.zeros(n_groups, n_blocks, 16, dtype=torch.float32)
+
+    for g in range(n_groups):
+        for b in range(n_blocks):
+            w_block = W_r[g, :, b, :].reshape(-1)
+            n_vals = w_block.numel()
+
+            w_min = w_block.min()
+            w_max = w_block.max()
+            init_levels = torch.linspace(w_min, w_max, 16)
+
+            for _ in range(5):
+                dists = (w_block.unsqueeze(-1) - init_levels).abs()
+                assign = dists.argmin(dim=-1)
+                counts = torch.zeros(16)
+                new_levels = torch.zeros(16)
+                new_levels = new_levels.index_add(0, assign, w_block)
+                counts = counts.index_add(0, assign, torch.ones(n_vals))
+                empty_mask = counts == 0
+                counts[empty_mask] = 1
+                init_levels = new_levels / counts
+
+            dists = (w_block.unsqueeze(-1) - init_levels).abs()
+            assign = dists.argmin(dim=-1).to(torch.uint8)
+            quants[g, :, b, :] = assign.reshape(SHARE_Q4K_CHANNELS, QK_K)
+            levels[g, b, :] = init_levels
+
+    W_q = torch.zeros_like(W)
+    for g in range(n_groups):
+        for b in range(n_blocks):
+            lvl = levels[g, b, :]
+            q = quants[g, :, b, :].long()
+            idx_g = g * SHARE_Q4K_CHANNELS
+            start_b = b * QK_K
+            W_q[idx_g:idx_g + SHARE_Q4K_CHANNELS, start_b:start_b + QK_K] = lvl[q]
+
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    quants_flat = quants.reshape(out_features, in_features).numpy()
+
+    return {
+        "levels":         levels.numpy().astype(np.float16),
+        "quants":         quants_flat,
+        "format":         "q4_k_shared",
+        "shape":          [out_features, in_features],
+        "n_blocks":       n_blocks,
+        "n_groups":       n_groups,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Act�vation statistics collection (calibration data)
 # ---------------------------------------------------------------------------
 
 def _collect_input_stats(
@@ -372,7 +447,14 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
-        if data.get("format") == "q4_k":
+        if data.get("format") == "q4_k_shared":
+            quants = data["quants"]
+            q_out = _pack_4bit(quants)
+            np.savez(fname,
+                     quants=q_out,
+                     levels=data["levels"],
+                     format=data["format"])
+        elif data.get("format") == "q4_k":
             # Q4_K format: pack 4-bit quants into uint8 pairs
             quants = data["quants"]
             q_out = _pack_4bit(quants)
@@ -466,7 +548,17 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k":
+        if fmt == "q4_k_shared":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            if layer.out_features % SHARE_Q4K_CHANNELS != 0:
+                logger.warning("Skipping %s: out_features %d not divisible by %d",
+                               name, layer.out_features, SHARE_Q4K_CHANNELS)
+                continue
+            meta[name] = _quantize_one_layer_q4k_shared(layer)
+        elif fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -521,8 +613,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+                        choices=["q2_kmeans", "q4_k", "q4_k_shared"],
+                        help="Quantization format")
     return parser.parse_args()
 
 
@@ -564,7 +656,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format == "q4_k" else args.bits
+    effective_bits = 4.03 if args.format == "q4_k_shared" else (4 if args.format == "q4_k" else args.bits)
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
