@@ -88,11 +88,16 @@ Outcome: **WIN** — 213.9 MB, same quality. **NEW GLOBAL BEST**.
 Hypothesis: Kq=64 very close to 0.25 bytes/weight theoretical limit.
 Outcome: **WIN** — 211.0 MB, KL=0.092, Top-P=83.86%. **FINAL GLOBAL BEST**.
 
+## exp-20260710-033 (Kq=128 quants delta)
+Hypothesis: Kq=128 further reduces quants storage toward 2-bit/weight theoretical limit (64 bytes/channel/sb).
+Algorithm family: quants_delta
+Outcome: **WIN** — 209.5 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**.
+
 ## Summary
-- Baseline: 434.6 MB → Final: 211.0 MB (51.4% reduction)
+- Baseline: 434.6 MB → Final: 209.5 MB (51.8% reduction)
 - Quality: KL=0.092076, Top-P=83.857% — IDENTICAL throughout all wins
 - Key innovations:
   1. K=4 shared d/dmin + delta-encoded across blocks
   2. K=4 shared scales/mins with 2-bit deltas + 10-bit joint coding
-  3. Kq=64 inter-channel quants delta: 4-bit ref + 63× 2-bit deltas
-- Theoretical limit: ~206 MB. Kq=64 very close (211.0 MB)
+  3. Kq=128 inter-channel quants delta: 4-bit ref + 127× 2-bit deltas (adaptive per-layer cap)
+- Theoretical limit: ~206 MB. Kq=128 at 209.5 MB — very close.
