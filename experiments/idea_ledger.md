@@ -44,6 +44,10 @@ Outcome: WIN — 411.8 MB, KL=0.092, Top-P=83.86%. NEW GLOBAL BEST.
 Hypothesis: Weight LS error by activation importance from calibration data.
 Outcome: REGRESSED — KL=0.090 (improved), Top-P=83.60% (degraded). Weighting improves KL but harms Top-P agreement.
 
+## exp-shared-sm (Shared scales/mins across channels)
+Hypothesis: Share 6-bit scales/mins across K_sc=2 output channels with 4-bit per-channel scale factors (storage-only).
+Outcome: REGRESSED — 417.8 MB (larger). sf arrays add more overhead than shared sm_packed saves.
+
 ## Summary
 - Best: K=4 shared d/dmin + delta-encoded base/deltas (6+4 bit) + packed 6-bit scales/mins + 3-pass LS → 411.8 MB, KL=0.092, Top-P=83.86%
 - Storage breakdown: ~398.5 MB weights + ~12.4 MB packed sc/m + ~0.9 MB delta-encoded d/dmin
