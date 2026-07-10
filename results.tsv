@@ -1,3 +1,4 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
 2026-07-10T03:36:39Z	exp-q4k-baseline	d46e0892c499a7db83496b25468508464b108535	c055a86b14cbef322a09ca717384f389a701e807	Q4_K baseline: 4-bit block quantization (GGML-style) on Qwen3.5-0.8B	success	0.093508	83.557	4.5	256	true	q4_k	1024	5000	434.6	0.0	327.0
 2026-07-10T04:04:08Z	exp-20260709-002	f704406abe8541e0f1ff86a5e1a00d506b3b4392	a8d247e08caa797c386ebcf594079e8c4aab72af	Hadamard-rotated Q3_K: random Hadamard rotation before 3-bit block quantization	success	0.511187	62.072	3.5	256	true	q3_k_hadamard	1024	5000	331.0	0.0	375.5
+2026-07-10T04:24:25Z	exp-20260709-003	933d37108fb0ab897f7739c15f0601e91c0bc006	55aaf694c4e1311e888cc03579856a4def3b2a86	Q4_K sub4: 4 sub-blocks of 64 (reduced metadata)	success	0.139124	79.916	4.3125	256	true	q4_k_sub4	1024	5000	393.0	0.0	379.2
