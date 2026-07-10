@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, subblock_delta_bits: int = 0) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -274,8 +274,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         q_ref = q_grp[:, 0, :]
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
         quants_ref_packed = _pack_4bit(q_ref)
-        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits)
-        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits)
+        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
+        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -531,14 +531,20 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2) -> np.ndarray:
-    """Pack 256 × delta_bits signed deltas per target channel.
-    delta_bits=2: packed into 64 bytes/sb (-1,0,1,2 range).
-    delta_bits=1: packed into 32 bytes/sb (0,+1 range)."""
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2, subblock_delta_bits: int = 0):
+    """Pack delta between ref and target quants.
+    delta_bits=1: 32 bytes/sb per-weight (0,+1).
+    delta_bits=2: 64 bytes/sb per-weight (-1,0,1,2).
+    subblock_delta_bits>0: per-sub-block encoding, subblock_delta_bits bytes/sb per 8 sub-blocks."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
     ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
     tgt_sb = tgt_quants.reshape(n_tgt, out, n_blocks, QK_K).astype(np.int16)
+
+    if subblock_delta_bits > 0:
+        packed = _pack_quants_delta_subblock(ref_sb, tgt_sb, n_tgt, out, n_blocks, subblock_delta_bits, delta_bits)
+        return packed
+
     bytes_per_sb = 32 if delta_bits == 1 else 64
     packed = np.zeros((n_tgt, out, n_blocks, bytes_per_sb), dtype=np.uint8)
     for t in range(n_tgt):
@@ -553,6 +559,44 @@ def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: in
             for o in range(out):
                 for b in range(n_blocks):
                     packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
+    return packed
+
+
+def _pack_quants_delta_subblock(ref_sb, tgt_sb, n_tgt, out, n_blocks, subblock_delta_bits, delta_bits):
+    """Encode quants delta at sub-block (32-weight) granularity.
+    subblock_delta_bits: bits per sub-block (2, 3, or 4). Returns (n_tgt, out, n_blocks, bytes_per_sb)."""
+    max_val = (1 << subblock_delta_bits) - 1
+    bytes_per_sb = subblock_delta_bits  # bits_per_subblock * 8 sub_blocks / 8 = subblock_delta_bits
+    packed = np.zeros((n_tgt, out, n_blocks, bytes_per_sb), dtype=np.uint8)
+
+    for t in range(n_tgt):
+        diff = tgt_sb[t].astype(np.int16) - ref_sb.astype(np.int16)
+        diff_sb = diff.reshape(out, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+
+        if delta_bits == 1:
+            delta = (diff_sb > 0).astype(np.float32)
+        else:
+            delta = np.clip(diff_sb.astype(np.float32) + 1, 0, 3) / 3.0
+
+        mean_delta = delta.mean(axis=-1)
+        sub_q = np.clip(np.round(mean_delta * max_val), 0, max_val).astype(np.uint8)
+
+        for o in range(out):
+            for b in range(n_blocks):
+                vals = sub_q[o, b]  # (8,) uint8
+                if subblock_delta_bits == 2:
+                    packed[t, o, b, 0] = (vals[0] | (vals[1] << 2) | (vals[2] << 4) | (vals[3] << 6))
+                    packed[t, o, b, 1] = (vals[4] | (vals[5] << 2) | (vals[6] << 4) | (vals[7] << 6))
+                elif subblock_delta_bits == 3:
+                    packed[t, o, b, 0] = (vals[0] | (vals[1] << 3))
+                    packed[t, o, b, 0] |= ((vals[2] & 0x3) << 6)
+                    packed[t, o, b, 1] = ((vals[2] >> 2) | (vals[3] << 1) | (vals[4] << 4) | ((vals[5] & 0x1) << 7))
+                    packed[t, o, b, 2] = ((vals[5] >> 1) | (vals[6] << 2) | (vals[7] << 5))
+                elif subblock_delta_bits == 4:
+                    packed[t, o, b, 0] = (vals[0] | (vals[1] << 4))
+                    packed[t, o, b, 1] = (vals[2] | (vals[3] << 4))
+                    packed[t, o, b, 2] = (vals[4] | (vals[5] << 4))
+                    packed[t, o, b, 3] = (vals[6] | (vals[7] << 4))
     return packed
 
 
@@ -661,6 +705,8 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
                     save_kw["delta_bits"] = data.get("delta_bits", 2)
+                    if data.get("subblock_delta_bits", 0) > 0:
+                        save_kw["subblock_delta_bits"] = data["subblock_delta_bits"]
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
@@ -750,6 +796,7 @@ def quantize_model(
     d_share_K: int = 8,
     quants_delta_bits: int = 2,
     skip_delta_sm: bool = False,
+    subblock_delta_bits: int = 0,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -770,7 +817,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, subblock_delta_bits=subblock_delta_bits)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -832,6 +879,8 @@ def parse_args():
                         help="Bits per quants delta: 2=lossless(-1,0,1,2) 1=aggressive(0,+1).")
     parser.add_argument("--skip-delta-sm", action="store_true",
                         help="Skip per-channel delta_sm storage (saves ~6 MB).")
+    parser.add_argument("--quants-delta-subblock", type=int, default=0,
+                        help="Sub-block delta bits (0=per-weight deltas, 2/3/4=sub-block granularity).")
     return parser.parse_args()
 
 
@@ -895,6 +944,7 @@ def main():
         d_share_K=args.d_share_K,
         quants_delta_bits=args.quants_delta_bits,
         skip_delta_sm=args.skip_delta_sm,
+        subblock_delta_bits=args.quants_delta_subblock,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
