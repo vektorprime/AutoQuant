@@ -170,35 +170,6 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     eff_scale[eff_scale < 1e-8] = 1e-8
     eff_offset = dmin.unsqueeze(-1) * m_norm
 
-    q = torch.round(
-        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
-    )
-    q = torch.clamp(q, 0, 15).to(torch.uint8)
-
-    for _ in range(2):
-        s = sc_norm.unsqueeze(-1) * q.float()
-        s_flat = s.flatten(start_dim=2)
-        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
-        m_flat = m.flatten(start_dim=2)
-
-        s_sq = (s_flat * s_flat).sum(dim=-1)
-        m_sq = (m_flat * m_flat).sum(dim=-1)
-        sm = (s_flat * m_flat).sum(dim=-1)
-        ws = (W_flat * s_flat).sum(dim=-1)
-        wm = (W_flat * m_flat).sum(dim=-1)
-
-        det = s_sq * m_sq - sm * sm
-        det[det.abs() < 1e-12] = 1e-12
-        d_new = (ws * m_sq - wm * sm) / det
-        dmin_new = (ws * sm - wm * s_sq) / det
-
-        d = d_new.clamp(min=1e-8)
-        dmin = dmin_new.abs().clamp(min=1e-8)
-
-    eff_scale = d.unsqueeze(-1) * sc_norm
-    eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm
-
     W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
     W_q = W_q_r.reshape(out_features, in_features)
     layer.weight.data = W_q.to(layer.weight.dtype)
