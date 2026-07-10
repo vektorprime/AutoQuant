@@ -9,6 +9,7 @@ CPU-based, vectorised quantization.  No GPU sync per layer.
 import argparse
 import json
 import logging
+import math
 import os
 
 import numpy as np
@@ -160,6 +161,135 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hadamard rotation + Q3_K quantization (novel: QuaRot-inspired 3-bit blocks)
+# ---------------------------------------------------------------------------
+
+def _next_power_of_2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
+def _hadamard_matrix(n: int) -> torch.Tensor:
+    assert n > 0 and (n & (n - 1)) == 0, "n must be a power of 2"
+    if n == 1:
+        return torch.tensor([[1.0]])
+    H_half = _hadamard_matrix(n // 2)
+    top = torch.cat([H_half, H_half], dim=1)
+    bot = torch.cat([H_half, -H_half], dim=1)
+    return torch.cat([top, bot], dim=0)
+
+
+def _fwht(x: torch.Tensor) -> torch.Tensor:
+    n = x.shape[-1]
+    assert n > 0 and (n & (n - 1)) == 0, "n must be a power of 2"
+    x = x.clone()
+    h = 1
+    while h < n:
+        shape = x.shape[:-1] + (n // (2 * h), 2, h)
+        x_r = x.reshape(shape)
+        a = x_r[..., 0, :].clone()
+        b = x_r[..., 1, :].clone()
+        x_r[..., 0, :] = a + b
+        x_r[..., 1, :] = a - b
+        x = x_r.reshape(x.shape)
+        h *= 2
+    return x / math.sqrt(n)
+
+
+def _random_signs(n: int, seed: int) -> torch.Tensor:
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.where(
+        torch.randn(n, generator=g) > 0,
+        torch.tensor(1.0), torch.tensor(-1.0),
+    )
+
+
+def _pack_3bit(codes: np.ndarray) -> np.ndarray:
+    out, inp = codes.shape
+    assert inp % 8 == 0
+    codes = codes.reshape(out, inp // 8, 8)
+    w = codes.astype(np.uint64)
+    b0 = (w[..., 0] & 0x7) | ((w[..., 1] & 0x7) << 3) | ((w[..., 2] & 0x3) << 6)
+    b1 = ((w[..., 2] >> 2) & 0x1) | ((w[..., 3] & 0x7) << 1) | ((w[..., 4] & 0x7) << 4) | ((w[..., 5] & 0x1) << 7)
+    b2 = ((w[..., 5] >> 1) & 0x3) | ((w[..., 6] & 0x7) << 2) | ((w[..., 7] & 0x7) << 5)
+    packed = np.stack([b0, b1, b2], axis=-1).astype(np.uint8)
+    return packed.reshape(out, -1)
+
+
+def _quantize_one_layer_q3k_hadamard(layer: nn.Linear, layer_seed: int) -> dict:
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    pad_n = _next_power_of_2(in_features)
+    need_pad = pad_n != in_features
+
+    assert pad_n % QK_K == 0
+    n_blocks = pad_n // QK_K
+
+    s = _random_signs(in_features, layer_seed)
+    W_signed = W * s.unsqueeze(0)
+
+    if need_pad:
+        pad = torch.zeros(out_features, pad_n - in_features)
+        W_pad = torch.cat([W_signed, pad], dim=1)
+    else:
+        W_pad = W_signed
+
+    W_rot = _fwht(W_pad)
+
+    W_r = W_rot.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+
+    w_sub_min = W_r.amin(dim=-1)
+    w_sub_max = W_r.amax(dim=-1)
+    w_blk_min = w_sub_min.amin(dim=-1)
+    w_blk_max = w_sub_max.amax(dim=-1)
+
+    d = (w_blk_max - w_blk_min) / 7.0
+    d[d < 1e-8] = 1e-8
+    dmin = w_blk_min.abs().clamp(min=1e-8)
+
+    d_sub = (w_sub_max - w_sub_min) / 7.0
+    d_sub[d_sub < 1e-8] = 1e-8
+
+    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
+    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
+    sc_norm = sc_6bit.float() / 63.0
+
+    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
+    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
+    m_norm = m_6bit.float() / 63.0
+
+    eff_scale = d.unsqueeze(-1) * sc_norm
+    eff_scale[eff_scale < 1e-8] = 1e-8
+    eff_offset = dmin.unsqueeze(-1) * m_norm
+
+    q = torch.round(
+        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
+    )
+    q = torch.clamp(q, 0, 7).to(torch.uint8)
+
+    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
+    W_rot_deq = W_q_r.reshape(out_features, pad_n)
+
+    W_deq_signed = _fwht(W_rot_deq)[:, :in_features]
+    W_deq = W_deq_signed * s.unsqueeze(0)
+    layer.weight.data = W_deq.to(layer.weight.dtype)
+
+    quants_flat = q.reshape(out_features, pad_n)
+
+    return {
+        "d": d.numpy().astype(np.float16),
+        "dmin": dmin.numpy().astype(np.float16),
+        "scales_6bit": sc_6bit.numpy(),
+        "mins_6bit": m_6bit.numpy(),
+        "quants": quants_flat.numpy(),
+        "format": "q3_k_hadamard",
+        "shape": [out_features, in_features],
+        "n_blocks": n_blocks,
     }
 
 
@@ -372,7 +502,17 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
-        if data.get("format") == "q4_k":
+        if data.get("format") == "q3_k_hadamard":
+            quants = data["quants"]
+            q_out = _pack_3bit(quants)
+            np.savez(fname,
+                     quants=q_out,
+                     d=data["d"],
+                     dmin=data["dmin"],
+                     scales_6bit=data["scales_6bit"],
+                     mins_6bit=data["mins_6bit"],
+                     format=data["format"])
+        elif data.get("format") == "q4_k":
             # Q4_K format: pack 4-bit quants into uint8 pairs
             quants = data["quants"]
             q_out = _pack_4bit(quants)
@@ -466,7 +606,14 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k":
+        if fmt == "q3_k_hadamard":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            layer_seed = hash(name) & 0x7FFFFFFF
+            meta[name] = _quantize_one_layer_q3k_hadamard(layer, layer_seed)
+        elif fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -521,8 +668,8 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k"],
-                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
+                        choices=["q2_kmeans", "q4_k", "q3_k_hadamard"],
+                        help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks, q3_k_hadamard=Hadamard-rotated 3-bit)")
     return parser.parse_args()
 
 
@@ -564,7 +711,7 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format == "q4_k" else args.bits
+    effective_bits = 4 if args.format in ("q4_k", "q3_k_hadamard") else args.bits
     logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
