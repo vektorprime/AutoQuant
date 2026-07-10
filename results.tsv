@@ -7,3 +7,4 @@ timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agre
 2026-07-10T03:14:01Z	exp-20260710-006	b15f68dbbf8d296e9655f1f7a2ccfcf9ce909b69	e471dda132f517c0dc3d06792acd89ffaa5ec8d3	Q4_K + bz2 on packed codes	success	0.093508	83.557	4.5	256	true	q4_k_bz2	1024	5000	432.5	0.0	0.0
 2026-07-10T03:17:27Z	exp-20260710-007	2f56256	186adf7	3-bit Q4_K with 16 sub-blocks (q3_k_16sb)	success	0.338211	69.434	3.875	256	true	q3_k_16sb	1024	5000	387.6	0.0	386.2
 2026-07-10T03:20:55Z	exp-20260710-008	68ee2ab	c47487b	Q4_K + per-channel bias correction + zlib2	success	0.093755	83.337	4.5	256	true	q4_k_bias_zlib2	1024	5000	409.9	0.0	379.8
+2026-07-10T03:23:42Z	exp-20260710-009	8bcd014	bc466b2	Q4_K 5-bit scales/mins + zlib2	success	0.096605	83.117	4.44	256	true	q4_k_zlib3	1024	5000	404.3	0.0	371.4

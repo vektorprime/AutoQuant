@@ -1,0 +1,5 @@
+22:21:56  INFO  Quantizing  format=q4_k_zlib3  bits=4  groupsize=256  symmetric=True
+22:22:21  INFO  Compressed storage: 404.3 MB (151 layers)
+22:22:21  INFO  Quantized 151 linear layers.
+22:22:21  INFO  Peak VRAM: 0.0 MB (limit 8192 MB)
+22:22:23  INFO  Saved dequantised model to 'quantized_models/q4k_z3'
