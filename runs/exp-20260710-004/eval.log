@@ -4,11 +4,11 @@ Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/user/
 [transformers] `torch_dtype` is deprecated! Use `dtype` instead!
 Using cached reference logits: cache/ref_logits_0.8B.mmap
 Loading Wikitext-2 (test split)
-Loading quantized model: quantized_models/q4k_lb
+Loading quantized model: quantized_models/vq_exp
 [ERROR] `loss` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
 [ERROR] `logits` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
-Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  42%|████▏     | 133/320 [00:00<00:00, 1324.45it/s]Loading weights:  90%|████████▉ | 287/320 [00:00<00:00, 1449.29it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 1450.98it/s]
-Evaluating KL:   0%|          | 0/9 [00:00<?, ?it/s]Evaluating KL:  11%|█         | 1/9 [00:04<00:35,  4.45s/it]Evaluating KL:  22%|██▏       | 2/9 [00:05<00:17,  2.52s/it]Evaluating KL:  33%|███▎      | 3/9 [00:06<00:11,  1.89s/it]Evaluating KL:  44%|████▍     | 4/9 [00:07<00:07,  1.60s/it]Evaluating KL:  56%|█████▌    | 5/9 [00:09<00:05,  1.44s/it]Evaluating KL:  67%|██████▋   | 6/9 [00:10<00:04,  1.34s/it]Evaluating KL:  78%|███████▊  | 7/9 [00:11<00:02,  1.28s/it]Evaluating KL:  89%|████████▉ | 8/9 [00:12<00:01,  1.24s/it]Evaluating KL: 100%|██████████| 9/9 [00:13<00:00,  1.14s/it]Evaluating KL: 100%|██████████| 9/9 [00:13<00:00,  1.49s/it]
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  46%|████▌     | 147/320 [00:00<00:00, 1468.96it/s]Loading weights:  94%|█████████▍| 300/320 [00:00<00:00, 1497.84it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 1502.15it/s]
+Evaluating KL:   0%|          | 0/9 [00:00<?, ?it/s]Evaluating KL:  11%|█         | 1/9 [00:04<00:32,  4.12s/it]Evaluating KL:  22%|██▏       | 2/9 [00:05<00:16,  2.36s/it]Evaluating KL:  33%|███▎      | 3/9 [00:06<00:10,  1.80s/it]Evaluating KL:  44%|████▍     | 4/9 [00:07<00:07,  1.53s/it]Evaluating KL:  56%|█████▌    | 5/9 [00:08<00:05,  1.38s/it]Evaluating KL:  67%|██████▋   | 6/9 [00:09<00:03,  1.29s/it]Evaluating KL:  78%|███████▊  | 7/9 [00:10<00:02,  1.24s/it]Evaluating KL:  89%|████████▉ | 8/9 [00:11<00:01,  1.18s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.07s/it]Evaluating KL: 100%|██████████| 9/9 [00:12<00:00,  1.42s/it]
 
-Mean KL divergence (ref → quant): 0.139124
-Tokens/sec: 371.6
+Mean KL divergence (ref → quant): 6.161618
+Tokens/sec: 391.6
