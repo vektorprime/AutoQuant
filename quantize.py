@@ -455,9 +455,8 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
         if data.get("format") == "aqlm_2x2":
-            codes_packed = _pack_4bit(data["codes"])
             np.savez(fname,
-                     codes=codes_packed,
+                     codes=data["codes"],
                      scale=data["scale"],
                      offset=data["offset"],
                      cb1=data["cb1"],
