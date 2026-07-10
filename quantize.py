@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, subblock_delta_bits: int = 0, ref_bits: int = 4) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_share_K: int = 128, d_share_K: int = 8, act_stats: torch.Tensor | None = None, quants_delta_bits: int = 2, skip_delta_sm: bool = False, subblock_delta_bits: int = 0, ref_bits: int = 4, sparse_delta: bool = False) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -284,8 +284,19 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
             quants_ref_packed = _pack_2bit(q_ref)
         else:
             quants_ref_packed = _pack_4bit(q_ref)
-        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits)
-        quants_kw = dict(quants_ref=quants_ref_packed, quants_delta=quants_delta_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits, ref_indices=ref_indices)
+        quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits, sparse_delta=sparse_delta)
+        quants_kw = dict(quants_ref=quants_ref_packed, Kq=Kq, delta_bits=quants_delta_bits, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits, ref_indices=ref_indices)
+        if isinstance(quants_delta_packed, dict):
+            quants_kw["quants_delta"] = quants_delta_packed["data"]
+            quants_kw["delta_format"] = quants_delta_packed["format"]
+            if quants_delta_packed["format"] == "sparse":
+                quants_kw["delta_mask"] = quants_delta_packed["delta_mask"]
+                quants_kw["delta_data"] = quants_delta_packed["delta_data"]
+                quants_kw["delta_nz_counts"] = quants_delta_packed["nz_counts"]
+            quants_kw["sparse_delta"] = True
+        else:
+            quants_kw["quants_delta"] = quants_delta_packed
+            quants_kw["sparse_delta"] = False
     else:
         quants_kw = dict(quants=quants_np)
 
@@ -541,11 +552,12 @@ def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     return packed
 
 
-def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2, subblock_delta_bits: int = 0):
+def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: int, delta_bits: int = 2, subblock_delta_bits: int = 0, sparse_delta: bool = False):
     """Pack delta between ref and target quants.
     delta_bits=1: 32 bytes/sb per-weight (0,+1).
     delta_bits=2: 64 bytes/sb per-weight (-1,0,1,2).
-    subblock_delta_bits>0: per-sub-block encoding, subblock_delta_bits bytes/sb per 8 sub-blocks."""
+    subblock_delta_bits>0: per-sub-block encoding, subblock_delta_bits bytes/sb per 8 sub-blocks.
+    sparse_delta=True: skip all-zero superblocks, storing mask + non-zero data only."""
     out, inp = ref_quants.shape
     n_blocks = inp // QK_K
     ref_sb = ref_quants.reshape(out, n_blocks, QK_K).astype(np.int16)
@@ -553,6 +565,9 @@ def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: in
 
     if subblock_delta_bits > 0:
         packed = _pack_quants_delta_subblock(ref_sb, tgt_sb, n_tgt, out, n_blocks, subblock_delta_bits, delta_bits)
+        if sparse_delta:
+            result = _pack_quants_delta_subblock_sparse(packed, n_tgt, out, n_blocks)
+            return result
         return packed
 
     bytes_per_sb = 32 if delta_bits == 1 else 64
@@ -570,6 +585,60 @@ def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: in
                 for b in range(n_blocks):
                     packed[t, o, b] = _pack_2bit(delta[o, b].reshape(1, QK_K)).reshape(bytes_per_sb)
     return packed
+
+
+def _pack_quants_delta_subblock_sparse(dense_packed: np.ndarray, n_tgt: int, out: int, n_blocks: int) -> dict:
+    """Convert dense sub-block delta to sparse: skip all-zero superblocks.
+    Returns dict with 'format'='dense' or 'sparse', plus the relevant arrays."""
+    bytes_per_sb = dense_packed.shape[-1]
+    n_channels = n_tgt * out
+    mask_bytes = (n_blocks + 7) // 8
+
+    dense_flat = dense_packed.reshape(n_channels, n_blocks, bytes_per_sb)
+    nz_mask = np.zeros(n_channels, dtype=np.bool_)
+    nz_sb_per_ch = np.zeros(n_channels, dtype=np.int32)
+    nz_list = []
+
+    for c in range(n_channels):
+        ch_data = dense_flat[c]
+        zero_rows = (ch_data == 0).all(axis=1)
+        nz = np.where(~zero_rows)[0]
+        if len(nz) > 0:
+            nz_mask[c] = True
+            nz_sb_per_ch[c] = len(nz)
+            for sb_idx in nz:
+                nz_list.append(ch_data[sb_idx].copy())
+
+    total_nz = int(nz_sb_per_ch.sum())
+    sparse_mask_size = n_channels * mask_bytes
+    sparse_data_size = total_nz * bytes_per_sb
+    dense_size = dense_packed.nbytes
+
+    if sparse_mask_size + sparse_data_size >= dense_size:
+        return dict(format='dense', data=dense_packed)
+
+    masks = np.zeros((n_tgt, out, mask_bytes), dtype=np.uint8)
+    masks_flat = masks.reshape(n_channels, mask_bytes)
+    for c in range(n_channels):
+        if not nz_mask[c]:
+            continue
+        ch_data = dense_flat[c]
+        zero_rows = (ch_data == 0).all(axis=1)
+        for sb_idx in range(n_blocks):
+            if not zero_rows[sb_idx]:
+                byte_idx = sb_idx // 8
+                bit_idx = sb_idx % 8
+                masks_flat[c, byte_idx] |= (1 << bit_idx)
+
+    if nz_list:
+        nz_data = np.concatenate([b.reshape(1, -1) for b in nz_list], axis=0).reshape(-1)
+    else:
+        nz_data = np.zeros(0, dtype=np.uint8)
+
+    np.testing.assert_equal(nz_data.nbytes, sparse_data_size,
+                            err_msg=f"nz_data size mismatch: {nz_data.nbytes} vs {sparse_data_size}")
+
+    return dict(format='sparse', data=dense_packed, delta_mask=masks, delta_data=nz_data, nz_counts=nz_sb_per_ch.reshape(n_tgt, out))
 
 
 def _select_best_reference(q_grp: np.ndarray, n_blocks: int, Kq: int, out_features: int) -> np.ndarray:
@@ -732,7 +801,13 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     scales_mins_packed=sm_packed,
                     format=data["format"])
                 if q_delta is not None:
-                    save_kw["quants_delta"] = q_delta
+                    if data.get("sparse_delta") and data.get("delta_format") == "sparse":
+                        save_kw["delta_mask"] = data["delta_mask"]
+                        save_kw["delta_data"] = data["delta_data"]
+                        save_kw["sparse_delta"] = True
+                        save_kw["delta_format"] = "sparse"
+                    else:
+                        save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
                     save_kw["delta_bits"] = data.get("delta_bits", 2)
                     save_kw["ref_bits"] = data.get("ref_bits", 4)
@@ -831,6 +906,7 @@ def quantize_model(
     skip_delta_sm: bool = False,
     subblock_delta_bits: int = 0,
     ref_bits: int = 4,
+    sparse_delta: bool = False,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -851,7 +927,7 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             layer_act = act_stats.get(name) if act_stats is not None else None
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K, act_stats=layer_act, quants_delta_bits=quants_delta_bits, skip_delta_sm=skip_delta_sm, subblock_delta_bits=subblock_delta_bits, ref_bits=ref_bits, sparse_delta=sparse_delta)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -917,6 +993,8 @@ def parse_args():
                         help="Sub-block delta bits (0=per-weight deltas, 1/2/3/4=sub-block granularity).")
     parser.add_argument("--quants-ref-bits", type=int, default=4, choices=[2, 4],
                         help="Reference quants packing: 4=pack_4bit (2/byte), 2=pack_2bit (4/byte).")
+    parser.add_argument("--sparse-delta", action="store_true",
+                        help="Sparse sub-block delta encoding: skip all-zero superblocks.")
     return parser.parse_args()
 
 
@@ -982,6 +1060,7 @@ def main():
         skip_delta_sm=args.skip_delta_sm,
         subblock_delta_bits=args.quants_delta_subblock,
         ref_bits=args.quants_ref_bits,
+        sparse_delta=args.sparse_delta,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
