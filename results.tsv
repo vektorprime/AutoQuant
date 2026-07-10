@@ -1,1 +1,2 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	symmetric	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+2026-07-10T02:19:33Z	exp-q4k-baseline	d46e0892c499a7db83496b25468508464b108535	c055a86b14cbef322a09ca717384f389a701e807	Q4_K baseline: 4-bit block quantization (GGML-style) on Qwen3.5-0.8B	success	0.093508	83.557	4.5	256	true	q4_k	1024	5000	434.6	0.0	327.0
