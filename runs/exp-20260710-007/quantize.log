@@ -1,0 +1,5 @@
+22:15:49  INFO  Quantizing  format=q3_k_16sb  bits=3  groupsize=256  symmetric=True
+22:16:01  INFO  Compressed storage: 387.6 MB (151 layers)
+22:16:01  INFO  Quantized 151 linear layers.
+22:16:01  INFO  Peak VRAM: 0.0 MB (limit 8192 MB)
+22:16:03  INFO  Saved dequantised model to 'quantized_models/q3k16sb'
