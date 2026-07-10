@@ -1,0 +1,17 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading quantized model: quantized_models/q4k_lb
+[ERROR] `loss` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+[ERROR] `logits` is part of Qwen3_5CausalLMOutputWithPast.__init__'s signature, but not documented. Make sure to add it to the docstring of the function in /home/user/llm/AutoQuant/.venv/lib/python3.14/site-packages/transformers/models/qwen3_5/modeling_qwen3_5.py.
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 3646.82it/s]
+Using the latest cached version of the dataset since Salesforce/wikitext couldn't be found on the Hugging Face Hub (offline mode is enabled).
+Found the latest cached dataset configuration 'wikitext-2-raw-v1' at /home/user/.cache/huggingface/datasets/Salesforce___wikitext/wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3 (last modified on Wed Jul  1 13:40:14 2026).
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (297193 > 262144). Running this sequence through the model will result in indexing errors
+Loading reference logits from: cache/ref_logits_0.8B.mmap
+  4999 tokens cached, vocab=248320
+Loading Wikitext-2 (test split)
+Loading Wikitext-2 (test split)
+  9 windows, 4999 eval tokens
+Same top-p:   0%|          | 0/9 [00:00<?, ?it/s]Same top-p:  11%|█         | 1/9 [00:04<00:34,  4.34s/it]Same top-p:  22%|██▏       | 2/9 [00:05<00:17,  2.44s/it]Same top-p:  33%|███▎      | 3/9 [00:06<00:11,  1.84s/it]Same top-p:  44%|████▍     | 4/9 [00:07<00:07,  1.56s/it]Same top-p:  56%|█████▌    | 5/9 [00:08<00:05,  1.39s/it]Same top-p:  67%|██████▋   | 6/9 [00:09<00:03,  1.30s/it]Same top-p:  78%|███████▊  | 7/9 [00:11<00:02,  1.24s/it]Same top-p:  89%|████████▉ | 8/9 [00:12<00:01,  1.19s/it]Same top-p: 100%|██████████| 9/9 [00:13<00:00,  1.10s/it]Same top-p: 100%|██████████| 9/9 [00:13<00:00,  1.45s/it]
+
+Same top-p: 3995/4999 = 79.916%
+Tokens/sec: 384.1
