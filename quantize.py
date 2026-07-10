@@ -1031,7 +1031,10 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         key_b = dt.encode('utf-8')
         B.extend(struct.pack('<B', len(key_b)))
         B.extend(key_b)
-        B.extend(struct.pack('<H', len(entries)))
+        n = len(entries)
+        idx_bits = 16 if n >= 256 else 8
+        B.extend(struct.pack('<B', idx_bits // 8))
+        B.extend(struct.pack('<H', n))
         for entry in entries:
             B.extend(struct.pack('<H', len(entry)))
             B.extend(entry)
@@ -1071,7 +1074,11 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
             v = arrays.get(s)
             if s in dedup_tables and isinstance(v, np.ndarray):
                 didx = layer_dedup[name][s]
-                B.extend(struct.pack('<H', didx))
+                n_entries = len(dedup_tables[s])
+                if n_entries < 256:
+                    B.extend(struct.pack('<B', didx))
+                else:
+                    B.extend(struct.pack('<H', didx))
             else:
                 B.extend(_serialize_leaf(v))
 
