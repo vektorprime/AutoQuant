@@ -37,6 +37,14 @@ QK_K = 256
 QK_K_SUB_BLOCKS = 8
 QK_K_SUB_SIZE = QK_K // QK_K_SUB_BLOCKS  # 32
 
+# Sub-4 variant: 4 sub-blocks of 64 (reduced metadata → 4.31 bpw)
+QK_K_SUB4_BLOCKS = 4
+QK_K_SUB4_SIZE = QK_K // QK_K_SUB4_BLOCKS  # 64
+
+# Sub-6 variant: 6 irregular sub-blocks within 256 (reduced metadata → 4.41 bpw)
+QK_K_SUB6_BLOCKS = 6
+QK_K_SUB6_SIZES = [43, 43, 43, 43, 42, 42]  # sums to 256
+
 
 def _get_layer_groupsize(name: str, default_groupsize: int) -> int:
     attn_keywords = ("q_proj", "k_proj", "v_proj", "o_proj", "lm_head")
@@ -109,20 +117,17 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     n_blocks = in_features // QK_K
 
     W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
-    # shape: (out, n_blocks, 8, 32)
+    W_flat = W.reshape(out_features, n_blocks, QK_K)
 
-    # Per-sub-block min/max → per-block (superblock) min/max
-    w_sub_min = W_r.amin(dim=-1)      # (out, n_blocks, 8)
+    w_sub_min = W_r.amin(dim=-1)
     w_sub_max = W_r.amax(dim=-1)
-    w_blk_min = w_sub_min.amin(dim=-1)  # (out, n_blocks)
+    w_blk_min = w_sub_min.amin(dim=-1)
     w_blk_max = w_sub_max.amax(dim=-1)
 
-    # Global scale d and min-offset base dmin (positive magnitude)
     d = (w_blk_max - w_blk_min) / 15.0
     d[d < 1e-8] = 1e-8
     dmin = w_blk_min.abs().clamp(min=1e-8)
 
-    # Per-sub-block effective scale and min
     d_sub = (w_sub_max - w_sub_min) / 15.0
     d_sub[d_sub < 1e-8] = 1e-8
 
@@ -134,17 +139,39 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
     m_norm = m_6bit.float() / 63.0
 
-    eff_scale = d.unsqueeze(-1) * sc_norm         # (out, n_blocks, 8)
+    eff_scale = d.unsqueeze(-1) * sc_norm
     eff_scale[eff_scale < 1e-8] = 1e-8
-    eff_offset = dmin.unsqueeze(-1) * m_norm       # (out, n_blocks, 8)
+    eff_offset = dmin.unsqueeze(-1) * m_norm
 
-    # Quantize:  w ≈ eff_scale * q - eff_offset,   q ∈ {0..15}
     q = torch.round(
         (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
     )
     q = torch.clamp(q, 0, 15).to(torch.uint8)
 
-    # Dequantize back into the weight tensor
+    for _ in range(3):
+        s = sc_norm.unsqueeze(-1) * q.float()
+        s_flat = s.flatten(start_dim=2)
+        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
+        m_flat = m.flatten(start_dim=2)
+
+        s_sq = (s_flat * s_flat).sum(dim=-1)
+        m_sq = (m_flat * m_flat).sum(dim=-1)
+        sm = (s_flat * m_flat).sum(dim=-1)
+        ws = (W_flat * s_flat).sum(dim=-1)
+        wm = (W_flat * m_flat).sum(dim=-1)
+
+        det = s_sq * m_sq - sm * sm
+        det[det.abs() < 1e-12] = 1e-12
+        d_new = (ws * m_sq - wm * sm) / det
+        dmin_new = (ws * sm - wm * s_sq) / det
+
+        d = d_new.clamp(min=1e-8)
+        dmin = dmin_new.abs().clamp(min=1e-8)
+
+        eff_scale = d.unsqueeze(-1) * sc_norm
+        eff_scale[eff_scale < 1e-8] = 1e-8
+        eff_offset = dmin.unsqueeze(-1) * m_norm
+
     W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
     W_q = W_q_r.reshape(out_features, in_features)
     layer.weight.data = W_q.to(layer.weight.dtype)
@@ -154,10 +181,299 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
     return {
         "d":              d.numpy().astype(np.float16),
         "dmin":           dmin.numpy().astype(np.float16),
-        "scales_6bit":    sc_6bit.numpy(),          # (out, n_blocks, 8)
-        "mins_6bit":      m_6bit.numpy(),           # (out, n_blocks, 8)
-        "quants":         quants_flat.numpy(),      # (out, in_features) raw 0-15
+        "scales_6bit":    sc_6bit.numpy(),
+        "mins_6bit":      m_6bit.numpy(),
+        "quants":         quants_flat.numpy(),
         "format":         "q4_k",
+        "shape":          [out_features, in_features],
+        "n_blocks":       n_blocks,
+    }
+
+
+def _quantize_one_layer_q4k_sub4(layer: nn.Linear) -> dict:
+    """Q4_K with 4 sub-blocks of 64 + 3 LS refinement on d/dmin.
+    Saves 6 bytes metadata per superblock vs standard Q4_K (4.31 bpw vs 4.5)."""
+    ns = QK_K_SUB4_BLOCKS
+    ss = QK_K_SUB4_SIZE
+
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0, (
+        f"in_features ({in_features}) must be divisible by QK_K ({QK_K})")
+    n_blocks = in_features // QK_K
+
+    W_r = W.reshape(out_features, n_blocks, ns, ss)
+    W_flat = W.reshape(out_features, n_blocks, QK_K)
+
+    w_sub_min = W_r.amin(dim=-1)
+    w_sub_max = W_r.amax(dim=-1)
+    w_blk_min = w_sub_min.amin(dim=-1)
+    w_blk_max = w_sub_max.amax(dim=-1)
+
+    d = (w_blk_max - w_blk_min) / 15.0
+    d[d < 1e-8] = 1e-8
+    dmin = w_blk_min.abs().clamp(min=1e-8)
+
+    d_sub = (w_sub_max - w_sub_min) / 15.0
+    d_sub[d_sub < 1e-8] = 1e-8
+
+    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
+    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
+    sc_norm = sc_6bit.float() / 63.0
+
+    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
+    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
+    m_norm = m_6bit.float() / 63.0
+
+    eff_scale = d.unsqueeze(-1) * sc_norm
+    eff_scale[eff_scale < 1e-8] = 1e-8
+    eff_offset = dmin.unsqueeze(-1) * m_norm
+
+    q = torch.round(
+        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
+    )
+    q = torch.clamp(q, 0, 15).to(torch.uint8)
+
+    for _ in range(3):
+        s = sc_norm.unsqueeze(-1) * q.float()
+        s_flat = s.flatten(start_dim=2)
+        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, ss)
+        m_flat = m.flatten(start_dim=2)
+
+        s_sq = (s_flat * s_flat).sum(dim=-1)
+        m_sq = (m_flat * m_flat).sum(dim=-1)
+        sm = (s_flat * m_flat).sum(dim=-1)
+        ws = (W_flat * s_flat).sum(dim=-1)
+        wm = (W_flat * m_flat).sum(dim=-1)
+
+        det = s_sq * m_sq - sm * sm
+        det[det.abs() < 1e-12] = 1e-12
+        d_new = (ws * m_sq - wm * sm) / det
+        dmin_new = (ws * sm - wm * s_sq) / det
+
+        d = d_new.clamp(min=1e-8)
+        dmin = dmin_new.abs().clamp(min=1e-8)
+
+        eff_scale = d.unsqueeze(-1) * sc_norm
+        eff_scale[eff_scale < 1e-8] = 1e-8
+        eff_offset = dmin.unsqueeze(-1) * m_norm
+
+    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
+    W_q = W_q_r.reshape(out_features, in_features)
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    quants_flat = q.reshape(out_features, in_features)
+
+    return {
+        "d":              d.numpy().astype(np.float16),
+        "dmin":           dmin.numpy().astype(np.float16),
+        "scales_6bit":    sc_6bit.numpy(),
+        "mins_6bit":      m_6bit.numpy(),
+        "quants":         quants_flat.numpy(),
+        "format":         "q4_k_sub4_ls",
+        "shape":          [out_features, in_features],
+        "n_blocks":       n_blocks,
+    }
+
+
+def _quantize_one_layer_q4k_sub6_ls(layer: nn.Linear) -> dict:
+    """Q4_K with 6 irregular sub-blocks [43,43,43,43,42,42] + LS refinement.
+    Saves 3 bytes metadata per superblock vs standard Q4_K (4.41 bpw vs 4.5)."""
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0, (
+        f"in_features ({in_features}) must be divisible by QK_K ({QK_K})")
+    n_blocks = in_features // QK_K
+
+    SUB_SIZES = QK_K_SUB6_SIZES
+    N_SUB = QK_K_SUB6_BLOCKS
+
+    W_r = W.reshape(out_features, n_blocks, QK_K)
+
+    w_sub_min_list = []
+    w_sub_max_list = []
+    offset = 0
+    for sz in SUB_SIZES:
+        W_sub = W_r[:, :, offset:offset + sz]
+        w_sub_min_list.append(W_sub.amin(dim=-1))
+        w_sub_max_list.append(W_sub.amax(dim=-1))
+        offset += sz
+
+    w_sub_min = torch.stack(w_sub_min_list, dim=-1)
+    w_sub_max = torch.stack(w_sub_max_list, dim=-1)
+    w_blk_min = w_sub_min.amin(dim=-1)
+    w_blk_max = w_sub_max.amax(dim=-1)
+
+    d = (w_blk_max - w_blk_min) / 15.0
+    d[d < 1e-8] = 1e-8
+    dmin = w_blk_min.abs().clamp(min=1e-8)
+
+    d_sub = (w_sub_max - w_sub_min) / 15.0
+    d_sub[d_sub < 1e-8] = 1e-8
+
+    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
+    sc_6bit = torch.clamp(torch.round(sc_ratio * 63.0), 1, 63).to(torch.uint8)
+    sc_norm = sc_6bit.float() / 63.0
+
+    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
+    m_6bit = torch.clamp(torch.round(min_ratio * 63.0), 0, 63).to(torch.uint8)
+    m_norm = m_6bit.float() / 63.0
+
+    q_list = []
+    offset = 0
+    for i, sz in enumerate(SUB_SIZES):
+        W_sub = W_r[:, :, offset:offset + sz]
+        eff_scale_sub = d.unsqueeze(-1) * sc_norm[:, :, i:i + 1]
+        eff_scale_sub[eff_scale_sub < 1e-8] = 1e-8
+        eff_offset_sub = dmin.unsqueeze(-1) * m_norm[:, :, i:i + 1]
+        q_sub = torch.round(
+            (W_sub + eff_offset_sub.unsqueeze(-1)) / eff_scale_sub.unsqueeze(-1)
+        )
+        q_sub = torch.clamp(q_sub, 0, 15).to(torch.uint8)
+        q_list.append(q_sub)
+        offset += sz
+
+    q = torch.cat(q_list, dim=-1)
+
+    W_flat = W_r
+
+    for _ in range(3):
+        s_parts = []
+        m_parts = []
+        offset2 = 0
+        for i, sz in enumerate(SUB_SIZES):
+            s_part = sc_norm[:, :, i:i + 1].unsqueeze(-1) * q[:, :, offset2:offset2 + sz].float()
+            s_parts.append(s_part)
+            m_part = m_norm[:, :, i:i + 1].unsqueeze(-1).expand(-1, -1, sz)
+            m_parts.append(m_part)
+            offset2 += sz
+        s_flat = torch.cat(s_parts, dim=-1)
+        m_flat = torch.cat(m_parts, dim=-1)
+
+        s_sq = (s_flat * s_flat).sum(dim=-1)
+        m_sq = (m_flat * m_flat).sum(dim=-1)
+        sm = (s_flat * m_flat).sum(dim=-1)
+        ws = (W_flat * s_flat).sum(dim=-1)
+        wm = (W_flat * m_flat).sum(dim=-1)
+
+        det = s_sq * m_sq - sm * sm
+        det[det.abs() < 1e-12] = 1e-12
+        d_new = (ws * m_sq - wm * sm) / det
+        dmin_new = (ws * sm - wm * s_sq) / det
+
+        d = d_new.clamp(min=1e-8)
+        dmin = dmin_new.abs().clamp(min=1e-8)
+
+    W_q_parts = []
+    offset3 = 0
+    for i, sz in enumerate(SUB_SIZES):
+        eff_scale_sub = d.unsqueeze(-1) * sc_norm[:, :, i:i + 1]
+        eff_scale_sub[eff_scale_sub < 1e-8] = 1e-8
+        eff_offset_sub = dmin.unsqueeze(-1) * m_norm[:, :, i:i + 1]
+        W_q_part = (eff_scale_sub.unsqueeze(-1) * q[:, :, offset3:offset3 + sz].float()
+                    - eff_offset_sub.unsqueeze(-1))
+        W_q_parts.append(W_q_part)
+        offset3 += sz
+
+    W_q_r = torch.cat(W_q_parts, dim=-1)
+    W_q = W_q_r.reshape(out_features, in_features)
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    quants_flat = q.reshape(out_features, in_features)
+
+    return {
+        "d":              d.numpy().astype(np.float16),
+        "dmin":           dmin.numpy().astype(np.float16),
+        "scales_6bit":    sc_6bit.numpy(),
+        "mins_6bit":      m_6bit.numpy(),
+        "quants":         quants_flat.numpy(),
+        "format":         "q4_k_sub6_ls",
+        "shape":          [out_features, in_features],
+        "n_blocks":       n_blocks,
+    }
+
+
+def _quantize_one_layer_q4k_ls5(layer: nn.Linear) -> dict:
+    """Q4_K with 5-bit scales/mins + LS refinement on d/dmin (no re-quantize).
+    Saves 2 bytes metadata per superblock vs standard Q4_K (4.44 bpw vs 4.5)."""
+    W = layer.weight.data.float()
+    out_features, in_features = W.shape
+
+    assert in_features % QK_K == 0, (
+        f"in_features ({in_features}) must be divisible by QK_K ({QK_K})")
+    n_blocks = in_features // QK_K
+
+    W_r = W.reshape(out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+    W_flat = W.reshape(out_features, n_blocks, QK_K)
+
+    w_sub_min = W_r.amin(dim=-1)
+    w_sub_max = W_r.amax(dim=-1)
+    w_blk_min = w_sub_min.amin(dim=-1)
+    w_blk_max = w_sub_max.amax(dim=-1)
+
+    d = (w_blk_max - w_blk_min) / 15.0
+    d[d < 1e-8] = 1e-8
+    dmin = w_blk_min.abs().clamp(min=1e-8)
+
+    d_sub = (w_sub_max - w_sub_min) / 15.0
+    d_sub[d_sub < 1e-8] = 1e-8
+
+    sc_ratio = d_sub / d.unsqueeze(-1).clamp(min=1e-8)
+    sc_5bit = torch.clamp(torch.round(sc_ratio * 31.0), 1, 31).to(torch.uint8)
+    sc_norm = sc_5bit.float() / 31.0
+
+    min_ratio = w_sub_min.abs() / dmin.unsqueeze(-1).clamp(min=1e-8)
+    m_5bit = torch.clamp(torch.round(min_ratio * 31.0), 0, 31).to(torch.uint8)
+    m_norm = m_5bit.float() / 31.0
+
+    eff_scale = d.unsqueeze(-1) * sc_norm
+    eff_scale[eff_scale < 1e-8] = 1e-8
+    eff_offset = dmin.unsqueeze(-1) * m_norm
+
+    q = torch.round(
+        (W_r + eff_offset.unsqueeze(-1)) / eff_scale.unsqueeze(-1)
+    )
+    q = torch.clamp(q, 0, 15).to(torch.uint8)
+
+    for _ in range(3):
+        s = sc_norm.unsqueeze(-1) * q.float()
+        s_flat = s.flatten(start_dim=2)
+        m = m_norm.unsqueeze(-1).expand(-1, -1, -1, QK_K_SUB_SIZE)
+        m_flat = m.flatten(start_dim=2)
+
+        s_sq = (s_flat * s_flat).sum(dim=-1)
+        m_sq = (m_flat * m_flat).sum(dim=-1)
+        sm = (s_flat * m_flat).sum(dim=-1)
+        ws = (W_flat * s_flat).sum(dim=-1)
+        wm = (W_flat * m_flat).sum(dim=-1)
+
+        det = s_sq * m_sq - sm * sm
+        det[det.abs() < 1e-12] = 1e-12
+        d_new = (ws * m_sq - wm * sm) / det
+        dmin_new = (ws * sm - wm * s_sq) / det
+
+        d = d_new.clamp(min=1e-8)
+        dmin = dmin_new.abs().clamp(min=1e-8)
+
+        eff_scale = d.unsqueeze(-1) * sc_norm
+        eff_scale[eff_scale < 1e-8] = 1e-8
+        eff_offset = dmin.unsqueeze(-1) * m_norm
+
+    W_q_r = eff_scale.unsqueeze(-1) * q.float() - eff_offset.unsqueeze(-1)
+    W_q = W_q_r.reshape(out_features, in_features)
+    layer.weight.data = W_q.to(layer.weight.dtype)
+
+    quants_flat = q.reshape(out_features, in_features)
+
+    return {
+        "d":              d.numpy().astype(np.float16),
+        "dmin":           dmin.numpy().astype(np.float16),
+        "scales_5bit":    sc_5bit.numpy(),
+        "mins_5bit":      m_5bit.numpy(),
+        "quants":         quants_flat.numpy(),
+        "format":         "q4_k_ls5",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
     }
@@ -372,16 +688,17 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         fname = os.path.join(save_dir, name + ".npz")
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
-        if data.get("format") == "q4_k":
-            # Q4_K format: pack 4-bit quants into uint8 pairs
+        if data.get("format") in ("q4_k", "q4_k_sub4_ls", "q4_k_ls5", "q4_k_sub6_ls"):
             quants = data["quants"]
             q_out = _pack_4bit(quants)
+            sc_key = "scales_5bit" if "scales_5bit" in data else "scales_6bit"
+            m_key = "mins_5bit" if "mins_5bit" in data else "mins_6bit"
             np.savez(fname,
                      quants=q_out,
                      d=data["d"],
                      dmin=data["dmin"],
-                     scales_6bit=data["scales_6bit"],
-                     mins_6bit=data["mins_6bit"],
+                     scales_6bit=data[sc_key],
+                     mins_6bit=data[m_key],
                      format=data["format"])
         elif bits == 4 and data["shape"][1] % 2 == 0:
             codes_out = _pack_4bit(data["codes"])
@@ -466,7 +783,25 @@ def quantize_model(
             skipped_small += 1
             continue
 
-        if fmt == "q4_k":
+        if fmt == "q4_k_sub6_ls":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            meta[name] = _quantize_one_layer_q4k_sub6_ls(layer)
+        elif fmt == "q4_k_ls5":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            meta[name] = _quantize_one_layer_q4k_ls5(layer)
+        elif fmt == "q4_k_sub4_ls":
+            if layer.weight.shape[1] % QK_K != 0:
+                logger.warning("Skipping %s: in_features %d not divisible by %d",
+                               name, layer.weight.shape[1], QK_K)
+                continue
+            meta[name] = _quantize_one_layer_q4k_sub4(layer)
+        elif fmt == "q4_k":
             if layer.weight.shape[1] % QK_K != 0:
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
@@ -521,7 +856,7 @@ def parse_args():
     parser.add_argument("--calibration-cache", default=None,
                         help="Path to cache/load calibration stats (.npz file)")
     parser.add_argument("--format", default="q2_kmeans",
-                        choices=["q2_kmeans", "q4_k"],
+                        choices=["q2_kmeans", "q4_k", "q4_k_sub4_ls", "q4_k_ls5", "q4_k_sub6_ls"],
                         help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
     return parser.parse_args()
 
@@ -564,8 +899,17 @@ def main():
 
     compressed_dir = os.path.join(args.save, "compressed") if args.save else None
 
-    effective_bits = 4 if args.format == "q4_k" else args.bits
-    logger.info("Quantizing  format=%s  bits=%d  groupsize=%d  symmetric=True",
+    if args.format == "q4_k_sub4_ls":
+        effective_bits = 4.3125
+    elif args.format == "q4_k_sub6_ls":
+        effective_bits = 4.40625
+    elif args.format == "q4_k_ls5":
+        effective_bits = 4.4375
+    elif args.format == "q4_k":
+        effective_bits = 4.5
+    else:
+        effective_bits = args.bits
+    logger.info("Quantizing  format=%s  bits=%.2f  groupsize=%d  symmetric=True",
                 args.format, effective_bits, args.groupsize)
     meta = quantize_model(
         model,
