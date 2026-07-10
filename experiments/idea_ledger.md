@@ -33,10 +33,18 @@ Hypothesis: Classify blocks BEFORE quantization, use 3-bit for 50% from the star
 Outcome: REGRESSED — KL=0.254. 3-bit too aggressive even with LS.
 
 ## exp-20260710-021 (Shared d/dmin across channels)
-Hypothesis: Share d/dmin across K=4 output channels, store shared values (float8) + 4-bit per-channel scale factors. Storage-only compression (dequantized weights use precise d/dmin).
-Outcome: WIN — 415.6 MB, KL=0.092, Top-P=83.86%. NEW GLOBAL BEST.
+Hypothesis: Share d/dmin across K=4 output channels, store shared values (float8) + 4-bit per-channel scale factors. Storage-only compression.
+Outcome: WIN — 415.6 MB, KL=0.092, Top-P=83.86%.
+
+## exp-20260710-022 (Delta-encode shared d/dmin)
+Hypothesis: Shared d/dmin values across sequential superblocks are correlated. Store first block as 6-bit base, remaining as 4-bit signed deltas.
+Outcome: WIN — 411.8 MB, KL=0.092, Top-P=83.86%. NEW GLOBAL BEST.
+
+## exp-20260710-impw (Importance-weighted LS)
+Hypothesis: Weight LS error by activation importance from calibration data.
+Outcome: REGRESSED — KL=0.090 (improved), Top-P=83.60% (degraded). Weighting improves KL but harms Top-P agreement.
 
 ## Summary
-- Best: Shared d/dmin (K=4) + float8 shared values + 4-bit scale factors + packed 6-bit scales/mins + 3-pass LS → 415.6 MB, KL=0.092, Top-P=83.86%
-- Storage breakdown: ~398.5 MB weights + ~12.4 MB packed sc/m + ~3.4 MB shared d/dmin (float8) + ~1.3 MB sf (4-bit packed)
-- Learned: Key insight — compressed storage format can differ from dequantized weight computation. Storage-only compression preserves quality while reducing size. 4-bit scale factors for d/dmin ratios are precise enough for lossless storage reconstruction. Separate scale factors for d and dmin required (cannot share).
+- Best: K=4 shared d/dmin + delta-encoded base/deltas (6+4 bit) + packed 6-bit scales/mins + 3-pass LS → 411.8 MB, KL=0.092, Top-P=83.86%
+- Storage breakdown: ~398.5 MB weights + ~12.4 MB packed sc/m + ~0.9 MB delta-encoded d/dmin
+- Key techniques: (1) Storage-only compression preserves quality. (2) d/dmin sharing across output channels. (3) Delta encoding across superblocks exploits temporal correlation.
