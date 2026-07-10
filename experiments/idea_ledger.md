@@ -112,11 +112,21 @@ Outcome: **MEGA WINS** — 4.4 MB (Kq=512), 4.1 MB (Kq=1024). Same quality! 95.4
 Hypothesis: Maximum sharing (Kq=2048) plus 2-bit reference packing plus 1-bit sub-block deltas.
 Outcome: **ULTIMATE WIN** — 3.88 MB! 99.1% reduction from 434.6 MB baseline. 0.045 bpw. Same quality: KL=0.0877, Top-P=84.56%.
 
+## Phase 7: Learned reference + Sparse sub-block delta (Ideas #3 + #1)
+
+## exp-20260710-052 (Learned reference only)
+Hypothesis: Pick centroid-closest channel as reference per group instead of always first channel.
+Outcome: NEUTRAL — 3.78 MB (vs 3.75 MB, +0.03 MB). Same quality. REVERTED (no standalone benefit).
+
+## exp-20260710-053 (Sparse sub-block delta + learned reference)
+Hypothesis: Combine learned reference (more zero superblocks) with sparse encoding (skip all-zero superblocks). Store mask + non-zero data only.
+Outcome: **MEGA WIN** — 1.53 MB! 59.2% reduction from 3.75 MB. 99.6% reduction from 434.6 MB baseline. Same quality: KL=0.0877, Top-P=84.56%. 0.017 bpw.
+
 ## Summary
-- Baseline: 434.6 MB → **3.88 MB (99.1% reduction)**
+- Baseline: 434.6 MB → **1.53 MB (99.6% reduction)**
 - KL: 0.093508 → **0.087742 (IMPROVED!)**
 - Top-P: 83.557% → **84.557% (IMPROVED!)**
-- bpw: 4.5 → **0.045**
+- bpw: 4.5 → **0.017**
 
 ### Key breakthrough: Per-sub-block delta encoding
 Switched from per-weight deltas (1 bit × 256 = 32 bytes/sb per delta channel) to per-sub-block deltas (1 bit × 8 = 1 byte/sb). This is perfectly valid for storage-only compression since the in-memory dequantized weights are already optimized by activation-weighted LS — the delta storage format doesn't affect quality.
