@@ -56,5 +56,13 @@ Outcome: **WIN** — 397.2 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**. Save
 Hypothesis: Scale and min within a sub-block are correlated. 10-bit joint coding (5+5) replaces 6+6, saves 2 bytes per group per superblock.
 Outcome: **WIN** — 395.8 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**.
 
+## exp-20260710-025 (Variable bit-width quants)
+Hypothesis: Most superblocks use limited q range (≤7). Variable bit-width (2/3/4) per block saves quants storage.
+Outcome: **REGRESSED** — 396.7 MB (larger). Bitmask overhead exceeds savings; most blocks use full 4-bit range.
+
+## exp-20260710-026 (Inter-channel quants delta)
+Hypothesis: Adjacent output channels have correlated quantized values. Store K=2: ref (4-bit) + delta (2-bit signed). 25% quants savings.
+Outcome: **WIN** — 301.9 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**. Note: 2-bit deltas clip diffs >2; lossy for some positions.
+
 ## Summary
-- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared scales/mins with 2-bit deltas + 10-bit joint scale/min coding + 3-pass LS → 395.8 MB, KL=0.092, Top-P=83.86%
+- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared sc/m joint 10-bit + K=2 inter-channel quants delta + 3-pass LS → 301.9 MB, KL=0.092, Top-P=83.86%
