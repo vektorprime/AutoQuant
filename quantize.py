@@ -958,15 +958,30 @@ def _pack_layer_data(data: dict, bits: int, fmt: str) -> dict:
 
 
 def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
-    """Compact binary format V4: schema-based encoding, zero per-key overhead."""
+    """Compact binary format V5: schema-based + all-array dedup."""
     B = bytearray()
-    B.extend(b'AQ04')
+    B.extend(b'AQ05')
     B.extend(struct.pack('<I', 0))
+
+    dedup_tables = {}
+    table_data = {}
+    def _dedup(dtype, raw_bytes):
+        h = raw_bytes  # use raw bytes directly as key
+        if dtype not in dedup_tables:
+            dedup_tables[dtype] = []
+            table_data[dtype] = {}
+        if h not in table_data[dtype]:
+            table_data[dtype][h] = len(dedup_tables[dtype])
+            dedup_tables[dtype].append(raw_bytes)
+        return table_data[dtype][h]
 
     quants_table = []
     quants_to_idx = {}
     layer_quants_idx = {}
+    layer_dedup = {}
+
     for name, shape, arrays in packed_layers:
+        layer_dedup[name] = {}
         if 'quants' in arrays:
             qb = arrays['quants'].tobytes()
             qhash = hashlib.md5(qb).hexdigest()
@@ -974,6 +989,10 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
                 quants_to_idx[qhash] = len(quants_table)
                 quants_table.append((shape[1], qb))
             layer_quants_idx[name] = quants_to_idx[qhash]
+        for k, v in arrays.items():
+            if k != 'quants' and isinstance(v, np.ndarray):
+                raw = v.tobytes()
+                layer_dedup[name][k] = _dedup(k, raw)
 
     B.extend(struct.pack('<H', len(quants_table)))
     for in_feat, qb in quants_table:
@@ -982,11 +1001,18 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         B.extend(qb)
 
     schema = ['base_packed', 'delta_packed', 'scales_mins_packed', 'ref_indices']
-    B.extend(struct.pack('<B', len(schema)))
-    for s in schema:
-        sb = s.encode('utf-8')
-        B.extend(struct.pack('<B', len(sb)))
-        B.extend(sb)
+    dedup_schema = [s for s in schema if s in dedup_tables]
+
+    B.extend(struct.pack('<B', len(dedup_schema)))
+    for dt in dedup_schema:
+        entries = dedup_tables[dt]
+        key_b = dt.encode('utf-8')
+        B.extend(struct.pack('<B', len(key_b)))
+        B.extend(key_b)
+        B.extend(struct.pack('<H', len(entries)))
+        for entry in entries:
+            B.extend(struct.pack('<H', len(entry)))
+            B.extend(entry)
 
     defaults = {}
     for k in ['format', 'quants_no_delta', 'K', 'ref_bits', 'Kq']:
@@ -1008,13 +1034,20 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         B.extend(name_b)
         B.extend(struct.pack('<I', shape[0]))
         B.extend(struct.pack('<I', shape[1]))
-
         qidx = layer_quants_idx.get(name, 0xFFFF)
         B.extend(struct.pack('<H', qidx))
 
         for s in schema:
             v = arrays.get(s)
-            B.extend(_serialize_leaf(v))
+            if s in dedup_tables and isinstance(v, np.ndarray):
+                didx = layer_dedup[name][s]
+                B.extend(struct.pack('<H', didx))
+            else:
+                B.extend(_serialize_leaf(v))
+
+    total_sz = len(B)
+    B[4:8] = struct.pack('<I', total_sz)
+    return bytes(B)
 
     total_sz = len(B)
     B[4:8] = struct.pack('<I', total_sz)
