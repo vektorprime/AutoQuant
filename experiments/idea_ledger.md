@@ -1,59 +1,12 @@
-# Idea Ledger — Q4_K experiment
+# Idea Ledger — AutoQuant Q4_K experiments
 
-## exp-q4k-baseline
+## exp-20260710-013
 
-Hypothesis: Q4_K (GGML-style 4-bit block quantization) provides baseline to beat
-Algorithm family: baseline
-Outcome: KL=0.093508, top-P=83.557%, size=434.6 MB — BASELINE
-
-## exp-20260709-002
-
-Hypothesis: Hadamard rotation before Q3_K quantization reduces weight distribution non-uniformity enabling 3-bit to match Q4_K quality
-Algorithm family: rotation+quantization
-Outcome: KL=0.511 regressed 5.5x, top-P=62.07% regressed 21.5pp
-
-## exp-20260709-003
-
-Hypothesis: Hadamard-rotated Q4_K will make weight distribution uniform improving Q4_K block quantization
-Algorithm family: rotation+quantization
-Outcome: KL=0.435 regressed 4.7x, top-P=not evaluated (KL > 0.09, experiment failed)
-
-## Invalid experiments (reverted)
-- zlib/bz2 post-hoc compression — NOT a quantization technique, just file compression
-- XOR delta + zlib — same issue
-- Larger sub-blocks (4 vs 8) — quality regression
-- 3-bit Q4_K variant — quality regression
-- Per-channel bias correction — slight regression
-- 5-bit scales/mins — slight regression
-- Hadamard-rotated Q3_K — severe quality regression (KL 0.511)
-- AQLM dual 2-bit codebook — catastrophic quality (KL 4.51), too slow (3.5 min)
-- Q4_K sub4 (4 sub-blocks of 64) — KL 0.139, top-P 79.92% both regressed
-- Hadamard-rotated Q4_K (256×256 Hadamard per block) — KL 0.435 massive regression
-- Q4_K symmetric (no dmin/offset) — KL 0.523 massive regression, 405.2 MB
-- NF4 (QLoRA levels, groupsize=64, 4.25 bpw) — KL 0.475 massive regression, 408.6 MB
-- Q4_K quantile clipping (5%/95% percentiles instead of min/max) — KL 1.078 worst yet
-- Q4_K sub4 + LS refinement (4 sub-blocks of 64, LS-optimized d/dmin, 4.31 bpw) — KL 0.511, 411.1 MB
-
-## exp-20260710-004
-
-Hypothesis: Vector quantization — global 256-entry 4-vector codebook trained once on first layer and shared across all layers, 2.03 bpw
-Algorithm family: vector-quantization
-Outcome: KL=6.162 catastrophic regression 66x, top-P=6.36% regressed 77.2pp, size=189.0 MB (smaller but unusable quality). VQ with per-block codebooks too slow (>5min). Global codebook fails because weight distributions vary across layers. Time: 7:20 > 5min limit.
-
-## exp-20260710-005
-
-Hypothesis: Groups of 16 output channels share 16 optimized quantization levels (1D K-means trained) → 4.03 bpw vs Q4_K 4.5 bpw
-Algorithm family: shared-quantization-levels
-Outcome: KL=0.437 regressed 4.7x (vs 0.093), top-P=65.23% regressed 18.3pp, size=381.6 MB (smaller but not matching quality). Sharing levels across channels degrades per-channel precision too much. Time: 8:19 > 5min.
-
-## exp-20260710-006
-
-Hypothesis: Non-uniform quantization levels (normal-quantile spaced) in Q4_K framework improve quality vs uniform {0..15} without increasing storage
-Algorithm family: non-uniform-quantization
-Outcome: KL=0.114 regressed 22% (vs 0.093), top-P=82.74% regressed 0.8pp (vs 83.56%), size=434.6 MB (same). Non-uniform levels don't compensate for scale/min quantization errors. The d/dmin+scales/mins framework already adapts well enough.
-
-## exp-20260710-007
-
-Hypothesis: LS refinement of d/dmin combined with 5-bit scales/mins can match Q4_K quality at 4.44 bpw (slightly smaller)
-Algorithm family: least-squares-refinement
-Outcome: KL=0.101 regressed 8% (vs 0.093), top-P=82.12% regressed 1.4pp, size=434.6 MB (same — 5-bit not packed). LS refinement helps quality (best KL so far at 0.101) but doesn't beat Q4_K baseline. Packing 5-bit scales to save space requires tight encoding.
+Hypothesis: Reducing sub-blocks from 8 to 6 (irregular sizes [43,43,43,43,42,42]) saves 3 bytes metadata per superblock (~2.1% smaller) and LS refinement can compensate for the coarser sub-block granularity.
+Algorithm family: Q4_K sub-block reduction
+Changed code: _quantize_one_layer_q4k_sub6_ls (new function), constants QK_K_SUB6_BLOCKS/SIZES, routing in quantize_model
+Representation change: 6 sub-blocks instead of 8 within QK_K=256 superblock
+Storage risk: saves ~11.8 MB (3 bytes per 256 weights)
+VRAM risk: none
+Expected win: smaller size with LS compensating quality
+Outcome: REGRESSED — KL 0.107867 (vs baseline 0.093508), Top-P 82.34% (vs 83.56%). 6 sub-blocks lose too much sub-block granularity; LS cannot compensate.
