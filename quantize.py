@@ -100,7 +100,7 @@ def _collect_input_stats(
 # Total: 144 bytes per 256 weights → 4.5 bits/weight.
 # ---------------------------------------------------------------------------
 
-def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 128) -> dict:
+def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 128, sm_share_K: int = 4, d_share_K: int = 4) -> dict:
     W = layer.weight.data.float()
     out_features, in_features = W.shape
 
@@ -167,7 +167,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 128) -> dict
         dmin = dmin_new.abs().clamp(min=1e-8)
 
     # Share d/dmin across K=4 output channels with 4-bit per-channel scale factors
-    K = 4
+    K = d_share_K
     out_pad = ((out_features + K - 1) // K) * K
     n_groups = out_pad // K
 
@@ -222,7 +222,7 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 128) -> dict
     quants_flat = q.reshape(out_features, in_features)
 
     # Share scales/mins across K_sm=4 output channels with 2-bit multiplicative deltas
-    K_sm = 4
+    K_sm = sm_share_K
     out_pad_sm = ((out_features + K_sm - 1) // K_sm) * K_sm
     n_groups_sm = out_pad_sm // K_sm
 
@@ -685,6 +685,8 @@ def quantize_model(
     act_stats: dict | None = None,
     fmt: str = "q2_kmeans",
     quants_delta_K: int = 128,
+    sm_share_K: int = 4,
+    d_share_K: int = 4,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -704,7 +706,7 @@ def quantize_model(
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
-            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K)
+            meta[name] = _quantize_one_layer_q4k(layer, quants_delta_K, sm_share_K, d_share_K)
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -756,8 +758,12 @@ def parse_args():
     parser.add_argument("--format", default="q2_kmeans",
                         choices=["q2_kmeans", "q4_k"],
                         help="Quantization format (q2_kmeans=K-means 2-bit, q4_k=GGML-style 4-bit blocks)")
-    parser.add_argument("--quants-delta-K", type=int, default=64,
+    parser.add_argument("--quants-delta-K", type=int, default=128,
                         help="Inter-channel quants delta group size (Kq). 1=full quants, >=2=1 ref + (Kq-1) 2-bit deltas.")
+    parser.add_argument("--sm-share-K", type=int, default=4,
+                        help="Scale/min sharing group size across output channels.")
+    parser.add_argument("--d-share-K", type=int, default=4,
+                        help="D/dmin sharing group size across output channels.")
     return parser.parse_args()
 
 
@@ -810,6 +816,8 @@ def main():
         act_stats=act_stats,
         fmt=args.format,
         quants_delta_K=args.quants_delta_K,
+        sm_share_K=args.sm_share_K,
+        d_share_K=args.d_share_K,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
