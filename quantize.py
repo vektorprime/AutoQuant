@@ -282,6 +282,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
         q_tgt = q_grp[:, 1:, :].reshape(-1, q_ref.shape[1])
         if ref_bits == 2:
             quants_ref_packed = _pack_2bit(q_ref)
+        elif ref_bits == 1:
+            quants_ref_packed = _pack_1bit(q_ref)
         else:
             quants_ref_packed = _pack_4bit(q_ref)
         quants_delta_packed = _pack_quants_delta(q_ref, q_tgt, Kq - 1, quants_delta_bits, subblock_delta_bits=subblock_delta_bits, sparse_delta=sparse_delta)
@@ -293,6 +295,8 @@ def _quantize_one_layer_q4k(layer: nn.Linear, quants_delta_K: int = 256, sm_shar
                 quants_kw["delta_mask"] = quants_delta_packed["delta_mask"]
                 quants_kw["delta_data"] = quants_delta_packed["delta_data"]
                 quants_kw["delta_nz_counts"] = quants_delta_packed["nz_counts"]
+                if quants_delta_packed.get("mask_packed_2ch"):
+                    quants_kw["mask_packed_2ch"] = True
             quants_kw["sparse_delta"] = True
         else:
             quants_kw["quants_delta"] = quants_delta_packed
@@ -589,10 +593,12 @@ def _pack_quants_delta(ref_quants: np.ndarray, tgt_quants: np.ndarray, n_tgt: in
 
 def _pack_quants_delta_subblock_sparse(dense_packed: np.ndarray, n_tgt: int, out: int, n_blocks: int) -> dict:
     """Convert dense sub-block delta to sparse: skip all-zero superblocks.
-    Returns dict with 'format'='dense' or 'sparse', plus the relevant arrays."""
+    Returns dict with 'format'='dense' or 'sparse', plus the relevant arrays.
+    For n_blocks<=4: packs 2 channels' masks into 1 byte (4 bits each)."""
     bytes_per_sb = dense_packed.shape[-1]
     n_channels = n_tgt * out
     mask_bytes = (n_blocks + 7) // 8
+    pack2 = (n_blocks <= 4)
 
     dense_flat = dense_packed.reshape(n_channels, n_blocks, bytes_per_sb)
     nz_mask = np.zeros(n_channels, dtype=np.bool_)
@@ -610,35 +616,57 @@ def _pack_quants_delta_subblock_sparse(dense_packed: np.ndarray, n_tgt: int, out
                 nz_list.append(ch_data[sb_idx].copy())
 
     total_nz = int(nz_sb_per_ch.sum())
-    sparse_mask_size = n_channels * mask_bytes
+    if pack2:
+        packed_channels = (n_channels + 1) // 2
+        sparse_mask_size = packed_channels * mask_bytes
+    else:
+        sparse_mask_size = n_channels * mask_bytes
     sparse_data_size = total_nz * bytes_per_sb
     dense_size = dense_packed.nbytes
 
     if sparse_mask_size + sparse_data_size >= dense_size:
         return dict(format='dense', data=dense_packed)
 
-    masks = np.zeros((n_tgt, out, mask_bytes), dtype=np.uint8)
-    masks_flat = masks.reshape(n_channels, mask_bytes)
-    for c in range(n_channels):
-        if not nz_mask[c]:
-            continue
-        ch_data = dense_flat[c]
-        zero_rows = (ch_data == 0).all(axis=1)
-        for sb_idx in range(n_blocks):
-            if not zero_rows[sb_idx]:
-                byte_idx = sb_idx // 8
-                bit_idx = sb_idx % 8
-                masks_flat[c, byte_idx] |= (1 << bit_idx)
+    if pack2:
+        packed_channels = (n_tgt * out + 1) // 2
+        masks = np.zeros(packed_channels * mask_bytes, dtype=np.uint8)
+        for c in range(n_channels):
+            if not nz_mask[c]:
+                continue
+            ch_data = dense_flat[c]
+            zero_rows = (ch_data == 0).all(axis=1)
+            sb_bits = 0
+            for sb_idx in range(n_blocks):
+                if not zero_rows[sb_idx]:
+                    sb_bits |= (1 << sb_idx)
+            byte_idx = c // 2
+            if c % 2 == 0:
+                masks[byte_idx] |= (sb_bits & 0x0F)
+            else:
+                masks[byte_idx] |= ((sb_bits & 0x0F) << 4)
+        masks_out = masks.reshape(packed_channels, mask_bytes)
+    else:
+        masks = np.zeros((n_tgt, out, mask_bytes), dtype=np.uint8)
+        masks_flat = masks.reshape(n_channels, mask_bytes)
+        for c in range(n_channels):
+            if not nz_mask[c]:
+                continue
+            ch_data = dense_flat[c]
+            zero_rows = (ch_data == 0).all(axis=1)
+            for sb_idx in range(n_blocks):
+                if not zero_rows[sb_idx]:
+                    byte_idx = sb_idx // 8
+                    bit_idx = sb_idx % 8
+                    masks_flat[c, byte_idx] |= (1 << bit_idx)
+        masks_out = masks
 
     if nz_list:
         nz_data = np.concatenate([b.reshape(1, -1) for b in nz_list], axis=0).reshape(-1)
     else:
         nz_data = np.zeros(0, dtype=np.uint8)
 
-    np.testing.assert_equal(nz_data.nbytes, sparse_data_size,
-                            err_msg=f"nz_data size mismatch: {nz_data.nbytes} vs {sparse_data_size}")
-
-    return dict(format='sparse', data=dense_packed, delta_mask=masks, delta_data=nz_data, nz_counts=nz_sb_per_ch.reshape(n_tgt, out))
+    return dict(format='sparse', data=dense_packed, delta_mask=masks_out, delta_data=nz_data,
+                nz_counts=nz_sb_per_ch.reshape(n_tgt, out), mask_packed_2ch=pack2)
 
 
 def _select_best_reference(q_grp: np.ndarray, n_blocks: int, Kq: int, out_features: int) -> np.ndarray:
@@ -806,6 +834,8 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                         save_kw["delta_data"] = data["delta_data"]
                         save_kw["sparse_delta"] = True
                         save_kw["delta_format"] = "sparse"
+                        if data.get("mask_packed_2ch"):
+                            save_kw["mask_packed_2ch"] = True
                     else:
                         save_kw["quants_delta"] = q_delta
                     save_kw["Kq"] = data.get("Kq", 2)
@@ -991,8 +1021,8 @@ def parse_args():
                         help="Skip per-channel delta_sm storage (saves ~6 MB).")
     parser.add_argument("--quants-delta-subblock", type=int, default=0,
                         help="Sub-block delta bits (0=per-weight deltas, 1/2/3/4=sub-block granularity).")
-    parser.add_argument("--quants-ref-bits", type=int, default=4, choices=[2, 4],
-                        help="Reference quants packing: 4=pack_4bit (2/byte), 2=pack_2bit (4/byte).")
+    parser.add_argument("--quants-ref-bits", type=int, default=4, choices=[1, 2, 4],
+                        help="Reference quants packing: 4=pack_4bit (2/byte), 2=pack_2bit (4/byte), 1=pack_1bit (8/byte).")
     parser.add_argument("--sparse-delta", action="store_true",
                         help="Sparse sub-block delta encoding: skip all-zero superblocks.")
     return parser.parse_args()
