@@ -39,3 +39,9 @@ Outcome: KL=0.435 regressed 4.7x, top-P=not evaluated (KL > 0.09, experiment fai
 Hypothesis: Vector quantization — global 256-entry 4-vector codebook trained once on first layer and shared across all layers, 2.03 bpw
 Algorithm family: vector-quantization
 Outcome: KL=6.162 catastrophic regression 66x, top-P=6.36% regressed 77.2pp, size=189.0 MB (smaller but unusable quality). VQ with per-block codebooks too slow (>5min). Global codebook fails because weight distributions vary across layers. Time: 7:20 > 5min limit.
+
+## exp-20260710-005
+
+Hypothesis: Groups of 16 output channels share 16 optimized quantization levels (1D K-means trained) → 4.03 bpw vs Q4_K 4.5 bpw
+Algorithm family: shared-quantization-levels
+Outcome: KL=0.437 regressed 4.7x (vs 0.093), top-P=65.23% regressed 18.3pp, size=381.6 MB (smaller but not matching quality). Sharing levels across channels degrades per-channel precision too much. Time: 8:19 > 5min.
