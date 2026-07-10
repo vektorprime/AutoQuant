@@ -52,7 +52,9 @@ Outcome: REGRESSED — 417.8 MB (larger). sf arrays add more overhead than share
 Hypothesis: Share 6-bit scales/mins across K_sc=4 channels with 2-bit multiplicative deltas packed into 4 bytes/superblock/channel (vs previous 12). Storage-only.
 Outcome: **WIN** — 397.2 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**. Saves 14.6 MB vs previous best (14.6/411.8 = 3.5%). Key improvement: K=4 sharing halved shared sm cost, 2-bit deltas only 4 bytes/channel vs 12 saved.
 
+## exp-20260710-024 (Combined 10-bit scale+min)
+Hypothesis: Scale and min within a sub-block are correlated. 10-bit joint coding (5+5) replaces 6+6, saves 2 bytes per group per superblock.
+Outcome: **WIN** — 395.8 MB, KL=0.092, Top-P=83.86%. **NEW GLOBAL BEST**.
+
 ## Summary
-- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared scales/mins with 2-bit deltas + 3-pass LS → 397.2 MB, KL=0.092, Top-P=83.86%
-- Storage breakdown: ~398.5 MB weights + ~3.2 MB shared sc/m + deltas + ~0.9 MB delta-encoded d/dmin (total ~397.2)
-- Key techniques: (1) Storage-only compression preserves quality. (2) Sharing across output channels saves on per-channel metadata. (3) Delta encoding exploits correlation.
+- Best: K=4 shared d/dmin + delta-encoded d/dmin + K=4 shared scales/mins with 2-bit deltas + 10-bit joint scale/min coding + 3-pass LS → 395.8 MB, KL=0.092, Top-P=83.86%
