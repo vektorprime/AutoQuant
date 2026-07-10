@@ -982,6 +982,26 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
         B.extend(struct.pack('<I', len(qb)))
         B.extend(qb)
 
+    def _serialize_value(v):
+        if v is None:
+            return struct.pack('<B', 0xFF)
+        if isinstance(v, np.ndarray):
+            dtype_map = {np.dtype('uint8'): 0x00, np.dtype('int8'): 0x01,
+                         np.dtype('uint16'): 0x02, np.dtype('int16'): 0x03,
+                         np.dtype('uint32'): 0x04, np.dtype('int32'): 0x05,
+                         np.dtype('float32'): 0x06, np.dtype('float64'): 0x07}
+            dt = dtype_map.get(v.dtype, 0x00)
+            raw = v.tobytes()
+            return struct.pack('<B', dt) + struct.pack('<I', len(raw)) + raw
+        if isinstance(v, bool):
+            return struct.pack('<B', 0x10) + (b'\x01' if v else b'\x00')
+        if isinstance(v, int):
+            return struct.pack('<B', 0x11) + struct.pack('<i', v)
+        if isinstance(v, str):
+            b = v.encode('utf-8')
+            return struct.pack('<B', 0x12) + struct.pack('<H', len(b)) + b
+        return struct.pack('<B', 0xFF)
+
     B.extend(struct.pack('<H', len(packed_layers)))
     for name, shape, arrays in packed_layers:
         name_b = name.encode('utf-8')
@@ -995,19 +1015,16 @@ def _serialize_compact(meta: dict, packed_layers: list) -> bytes:
             k_b = k.encode('utf-8')
             B.extend(struct.pack('<B', len(k_b)))
             B.extend(k_b)
-            v_b = v.tobytes()
             is_shared_quants = (k == 'quants' and name in layer_quants_idx)
             flags = 0x01 if is_shared_quants else 0x00
             qidx = layer_quants_idx.get(name, 0xFFFF) if is_shared_quants else 0xFFFF
+            B.extend(struct.pack('<B', flags))
+            B.extend(struct.pack('<H', qidx))
             if is_shared_quants:
-                B.extend(struct.pack('<B', flags))
-                B.extend(struct.pack('<H', qidx))
+                B.extend(struct.pack('<B', 0x00))
                 B.extend(struct.pack('<I', 0))
             else:
-                B.extend(struct.pack('<B', flags))
-                B.extend(struct.pack('<H', qidx))
-                B.extend(struct.pack('<I', len(v_b)))
-                B.extend(v_b)
+                B.extend(_serialize_value(v))
 
     total_sz = len(B)
     B[4:8] = struct.pack('<I', total_sz)
