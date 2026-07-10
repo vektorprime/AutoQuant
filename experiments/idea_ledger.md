@@ -45,3 +45,9 @@ Outcome: KL=6.162 catastrophic regression 66x, top-P=6.36% regressed 77.2pp, siz
 Hypothesis: Groups of 16 output channels share 16 optimized quantization levels (1D K-means trained) → 4.03 bpw vs Q4_K 4.5 bpw
 Algorithm family: shared-quantization-levels
 Outcome: KL=0.437 regressed 4.7x (vs 0.093), top-P=65.23% regressed 18.3pp, size=381.6 MB (smaller but not matching quality). Sharing levels across channels degrades per-channel precision too much. Time: 8:19 > 5min.
+
+## exp-20260710-006
+
+Hypothesis: Non-uniform quantization levels (normal-quantile spaced) in Q4_K framework improve quality vs uniform {0..15} without increasing storage
+Algorithm family: non-uniform-quantization
+Outcome: KL=0.114 regressed 22% (vs 0.093), top-P=82.74% regressed 0.8pp (vs 83.56%), size=434.6 MB (same). Non-uniform levels don't compensate for scale/min quantization errors. The d/dmin+scales/mins framework already adapts well enough.
