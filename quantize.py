@@ -329,7 +329,7 @@ def _quantize_one_layer_q4k_sub6_ls(layer: nn.Linear) -> dict:
         eff_scale_sub[eff_scale_sub < 1e-8] = 1e-8
         eff_offset_sub = dmin.unsqueeze(-1) * m_norm[:, :, i:i + 1]
         q_sub = torch.round(
-            (W_sub + eff_offset_sub.unsqueeze(-1)) / eff_scale_sub.unsqueeze(-1)
+            (W_sub + eff_offset_sub) / eff_scale_sub
         )
         q_sub = torch.clamp(q_sub, 0, 15).to(torch.uint8)
         q_list.append(q_sub)
@@ -344,9 +344,9 @@ def _quantize_one_layer_q4k_sub6_ls(layer: nn.Linear) -> dict:
         m_parts = []
         offset2 = 0
         for i, sz in enumerate(SUB_SIZES):
-            s_part = sc_norm[:, :, i:i + 1].unsqueeze(-1) * q[:, :, offset2:offset2 + sz].float()
+            s_part = sc_norm[:, :, i:i + 1] * q[:, :, offset2:offset2 + sz].float()
             s_parts.append(s_part)
-            m_part = m_norm[:, :, i:i + 1].unsqueeze(-1).expand(-1, -1, sz)
+            m_part = m_norm[:, :, i:i + 1].expand(-1, -1, sz)
             m_parts.append(m_part)
             offset2 += sz
         s_flat = torch.cat(s_parts, dim=-1)
@@ -372,8 +372,8 @@ def _quantize_one_layer_q4k_sub6_ls(layer: nn.Linear) -> dict:
         eff_scale_sub = d.unsqueeze(-1) * sc_norm[:, :, i:i + 1]
         eff_scale_sub[eff_scale_sub < 1e-8] = 1e-8
         eff_offset_sub = dmin.unsqueeze(-1) * m_norm[:, :, i:i + 1]
-        W_q_part = (eff_scale_sub.unsqueeze(-1) * q[:, :, offset3:offset3 + sz].float()
-                    - eff_offset_sub.unsqueeze(-1))
+        W_q_part = (eff_scale_sub * q[:, :, offset3:offset3 + sz].float()
+                    - eff_offset_sub)
         W_q_parts.append(W_q_part)
         offset3 += sz
 
