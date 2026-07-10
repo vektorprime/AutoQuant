@@ -228,14 +228,13 @@ def _quantize_one_layer_aqlm_2x2(layer: nn.Linear, cb1: torch.Tensor, cb2: torch
     idx2 = best_pair // 4
 
     combined = (idx1 | (idx2 << 2)).to(torch.uint8)
-    combined_flat = combined.reshape(out_features, in_features)
 
     W_q_r = scale.unsqueeze(-1) * pairs[best_pair] + offset.unsqueeze(-1)
     W_q = W_q_r.reshape(out_features, in_features)
     layer.weight.data = W_q.to(layer.weight.dtype)
 
     return {
-        "codes": combined_flat.numpy().astype(np.uint8),
+        "codes": combined.numpy().astype(np.uint8),
         "scale": scale.numpy().astype(np.float16),
         "offset": offset.numpy().astype(np.float16),
         "cb1": cb1.numpy().astype(np.float16),
