@@ -254,13 +254,22 @@ def _quantize_one_layer_q4k(layer: nn.Linear) -> dict:
 
     delta_sm_packed = _pack_q4k_sm_deltas(delta_sc, delta_m)
 
+    quants_np = quants_flat.numpy()
+    quants_bitmask = _build_quants_bitmask(quants_np.reshape(out_features, n_blocks, QK_K))
+    quants_packed, quants_bm_packed = _pack_quants_variable(quants_np, quants_bitmask)
+
     return {
         "base_packed":    base_packed,
         "delta_packed":   delta_packed,
         "scales_mins_shared": shared_sc,
         "mins_shared":    shared_m,
         "delta_sm":       delta_sm_packed,
-        "quants":         quants_flat.numpy(),
+        "quants_packed":  quants_packed,
+        "quants_bitmask": quants_bm_packed,
+        "quants_bitmask_full": quants_bitmask,
+        "n_BW2":          int((quants_bitmask == 0).sum()),
+        "n_BW3":          int((quants_bitmask == 1).sum()),
+        "n_BW4":          int((quants_bitmask == 2).sum()),
         "format":         "q4_k",
         "shape":          [out_features, in_features],
         "n_blocks":       n_blocks,
@@ -469,6 +478,80 @@ def _pack_4bit(codes: np.ndarray) -> np.ndarray:
     return packed.astype(np.uint8)
 
 
+def _pack_2bit_256(data: np.ndarray) -> np.ndarray:
+    """Pack 256 × 2-bit values → 64 bytes."""
+    assert data.size == 256
+    return _pack_2bit(data.reshape(1, 256)).reshape(64)
+
+
+def _pack_3bit_256(data: np.ndarray) -> np.ndarray:
+    """Pack 256 × 3-bit values → 96 bytes (8 vals in 3 bytes)."""
+    assert data.size == 256
+    data = data.reshape(32, 8).astype(np.uint8)
+    packed = np.zeros(96, dtype=np.uint8)
+    for g in range(32):
+        v = data[g]
+        b = g * 3
+        packed[b] = v[0] | (v[1] << 3) | ((v[2] & 0x3) << 6)
+        packed[b + 1] = (v[2] >> 2) | (v[3] << 1) | (v[4] << 4) | ((v[5] & 0x1) << 7)
+        packed[b + 2] = (v[5] >> 1) | (v[6] << 2) | (v[7] << 5)
+    return packed
+
+
+def _bitwidth_byte_size(bw: int) -> int:
+    return [64, 96, 128][bw]
+
+
+def _build_quants_bitmask(q_sb: np.ndarray) -> np.ndarray:
+    """Build 2-bit per-superblock bitmask: 0=2bit, 1=3bit, 2=4bit."""
+    maxq = q_sb.max(axis=-1)
+    bm = np.full(maxq.shape, 2, dtype=np.uint8)
+    bm[maxq <= 3] = 0
+    bm[(maxq > 3) & (maxq <= 7)] = 1
+    return bm
+
+
+def _pack_quants_variable(quants_flat: np.ndarray, bitmask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pack quants with per-superblock variable bit width. Returns (packed_data, packed_bitmask)."""
+    out, inp = quants_flat.shape
+    n_blocks = inp // QK_K
+    q_sb = quants_flat.reshape(out, n_blocks, QK_K)
+
+    total_bytes = 0
+    for bw in range(3):
+        count = (bitmask == bw).sum()
+        total_bytes += count * _bitwidth_byte_size(bw)
+
+    packed_data = np.zeros(total_bytes, dtype=np.uint8)
+    pos = 0
+    for o in range(out):
+        for b in range(n_blocks):
+            bw = int(bitmask[o, b])
+            data = q_sb[o, b].astype(np.uint8)
+            if bw == 0:
+                p = _pack_2bit_256(data)
+            elif bw == 1:
+                p = _pack_3bit_256(data)
+            else:
+                p = _pack_4bit(data.reshape(1, 256)).reshape(128)
+            sz = p.size
+            packed_data[pos:pos + sz] = p
+            pos += sz
+
+    bm_rows = (n_blocks + 3) // 4
+    bm_packed = np.zeros((out, bm_rows), dtype=np.uint8)
+    for b in range(0, n_blocks, 4):
+        val = bitmask[:, b].astype(np.uint8) & 0x3
+        if b + 1 < n_blocks:
+            val |= (bitmask[:, b + 1].astype(np.uint8) & 0x3) << 2
+        if b + 2 < n_blocks:
+            val |= (bitmask[:, b + 2].astype(np.uint8) & 0x3) << 4
+        if b + 3 < n_blocks:
+            val |= (bitmask[:, b + 3].astype(np.uint8) & 0x3) << 6
+        bm_packed[:, b // 4] = val
+    return packed_data, bm_packed
+
+
 def _pack_q4k_sm(scales_6bit: np.ndarray, mins_6bit: np.ndarray) -> np.ndarray:
     """Pack 8 × (6-bit scale + 6-bit min) = 96 bits → 12 bytes per superblock.
     Saves 4 bytes/superblock vs separate uint8 arrays."""
@@ -544,8 +627,15 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
         os.makedirs(os.path.dirname(fname), exist_ok=True)
 
         if data.get("format") == "q4_k":
-            quants = data["quants"]
-            q_out = _pack_4bit(quants)
+            if "quants_packed" in data:
+                q_out = data["quants_packed"]
+                q_bm = data["quants_bitmask"]
+                q_bm_full = data.get("quants_bitmask_full")
+            else:
+                quants = data["quants"]
+                q_out = _pack_4bit(quants)
+                q_bm = None
+                q_bm_full = None
             if "scales_mins_shared" in data:
                 sm_packed = _pack_q4k_sm_joint(data["scales_mins_shared"], data["mins_shared"])
             else:
@@ -558,6 +648,13 @@ def _save_compressed(meta: dict, save_dir: str, bits: int, fmt: str = "q2_kmeans
                     K=data.get("K", 4),
                     scales_mins_packed=sm_packed,
                     format=data["format"])
+                if q_bm is not None:
+                    save_kw["quants_bitmask"] = q_bm
+                    save_kw["quants_variable"] = True
+                    if q_bm_full is not None:
+                        save_kw["n_BW2"] = int(data.get("n_BW2", 0))
+                        save_kw["n_BW3"] = int(data.get("n_BW3", 0))
+                        save_kw["n_BW4"] = int(data.get("n_BW4", 0))
                 if "delta_sm" in data:
                     save_kw["delta_sm"] = data["delta_sm"]
                     save_kw["K_sm"] = data.get("K_sm", 4)
