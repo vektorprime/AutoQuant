@@ -32,7 +32,6 @@ produce a model **smaller** than Q4_K's packed size with **no quality regression
 ### Files you edit
 - `quantize.py` — quantization algorithm, encode/decode, safetensors save
 - `inference.py` — packed-only GPU loader, `QuantizedLinear` with tiled dequant
-- `GOALS.md` — current goal and baseline metrics
 
 ### Files you read
 - `eval_perplexity.py` — KL divergence evaluation (routes through `load_quantized_model`)
@@ -101,7 +100,7 @@ Experiments are run by sub-agents. Each sub-agent:
 2. Quantizes: `CUDA_VISIBLE_DEVICES=2 .venv/bin/python quantize.py --model Qwen/Qwen3.5-9B --format q4_k --q4k-scale-dtype float32 --q4k-refine-mode legacy_exact [--new-flags] --save quantized_models/qwen35-9b-<tag>`
 3. Evals KL: `CUDA_VISIBLE_DEVICES=2 Q4K_TILE_ROWS=512 .venv/bin/python eval_perplexity.py --model quantized_models/qwen35-9b-<tag> --reference Qwen/Qwen3.5-9B --context-length 256 --max-tokens 4000 --reference-cache cache/ref_logits_9B.mmap`
 4. Evals top-P: `CUDA_VISIBLE_DEVICES=2 Q4K_TILE_ROWS=512 .venv/bin/python eval_topk.py --model quantized_models/qwen35-9b-<tag> --reference Qwen/Qwen3.5-9B --reference-cache cache/ref_logits_9B.mmap --context-length 256 --max-tokens 4000 --stride 128`
-5. Records results in `results.tsv` and `GOALS.md`
+5. Records results in `results.tsv`
 6. Commits and pushes
 
 ### Sub-agent rules
@@ -128,7 +127,7 @@ Experiments are run by sub-agents. Each sub-agent:
 - Commit code before evaling
 - Revert failed experiments (git reset --hard) — do NOT merge broken code
 - Push after each working commit
-- Keep `results.tsv` clean — one row per successful experiment
+- Record every experiment in `results.tsv` — include regressions
 
 ---
 
