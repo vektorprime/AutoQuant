@@ -1,5 +1,23 @@
 # Idea Ledger
 
+## q4k-9b-fp16embed — Explicit bf16 embedding storage for residual
+
+**Hypothesis:** Storing embed_tokens and lm_head at half-precision in residual.safetensors saves space vs fp32 while preserving quality since the model natively runs in bf16.
+**Status:** success (no-op)
+**KL divergence:** 0.059  |  **Top-P:** 88.12%  |  **Size:** 6.63 GB
+
+**Implementation:**
+- In `_save_packed_q4k()` (quantize.py ~line 556): cast tensors containing "embed_tokens" or "lm_head" to torch.bfloat16 before saving
+- 3-line change to residual saving loop; no inference.py modifications
+
+**Result:**
+Model already loads in bf16 (via `torch_dtype=bfloat16`), so embeddings were already 2 bytes/element. The bf16→bf16 cast is a no-op — no space savings. Quality is identical to baseline (0.058838 KL, 88.122% top-P) since quantization weights are unchanged. The `load_state_dict(assign=True)` in inference.py does NOT automatically cast dtypes — an initial fp16 attempt caused a dtype mismatch error.
+
+**Lesson:**
+Embedding dtype is determined by the model loading dtype (`--dtype bfloat16` by default). To actually save space, the model would need to be loaded in fp32. The explicit bf16 cast is harmless (preserves baseline quality) but provides no benefit under current loading config. Future experiments aiming for space reduction should target the packed quantization weights, not residual tensors.
+
+---
+
 ## q4k-9b-cb8 — Codebook-based scale/min encoding (8-bit, per-layer)
 
 **Hypothesis:** Replacing 12-byte packed scale/min pairs with an 8-bit index into a layer-level codebook of 256 most common (scale,min) pairs saves ~0.12 GB while preserving quality through LS compensation.

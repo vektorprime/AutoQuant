@@ -553,8 +553,9 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
     for key, tensor in model.state_dict().items():
         if key in quantized_weight_keys:
             continue
-        # clone() also breaks shared-storage aliases, which safetensors rejects.
         stored = tensor.detach().cpu().contiguous().clone()
+        if "embed_tokens" in key or "lm_head" in key:
+            stored = stored.to(torch.bfloat16)
         residual_state[key] = stored
         residual_bytes += stored.numel() * stored.element_size()
 
