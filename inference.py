@@ -197,11 +197,11 @@ class QuantizedLinear(nn.Module):
                 bi = i + 1
                 sd = ((sm[:, :, bi] >> 3) & 0x0F) - 8
                 if i < 6:
-                    md = ((sm[:, :, bi] >> 7) & 0x01)
-                    md = md | ((sm[:, :, bi + 1] & 0x07) << 1)
+                    md = ((sm[:, :, bi] >> 7) & 0x01) << 3
+                    md = md | (sm[:, :, bi + 1] & 0x07)
                 else:
-                    md = ((sm[:, :, 7] >> 7) & 0x01)
-                    md = md | ((sm[:, :, 8] & 0x07) << 1)
+                    md = ((sm[:, :, 7] >> 7) & 0x01) << 3
+                    md = md | (sm[:, :, 8] & 0x07)
                 md = md - 8
                 scales[:, :, i + 1] = torch.clamp(
                     scale_ref + sd, 1, 63

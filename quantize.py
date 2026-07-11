@@ -138,11 +138,11 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
             bi = i + 1
             scale_d = ((s[:, :, bi] >> 3) & 0x0F) - 8
             if i < 6:
-                min_d = ((s[:, :, bi] >> 7) & 0x01)
-                min_d = min_d | ((s[:, :, bi + 1] & 0x07) << 1)
+                min_d = ((s[:, :, bi] >> 7) & 0x01) << 3
+                min_d = min_d | (s[:, :, bi + 1] & 0x07)
             else:
-                min_d = ((s[:, :, 7] >> 7) & 0x01)
-                min_d = min_d | ((s[:, :, 8] & 0x07) << 1)
+                min_d = ((s[:, :, 7] >> 7) & 0x01) << 3
+                min_d = min_d | (s[:, :, 8] & 0x07)
             min_d = min_d - 8
             sc_norm[:, :, i + 1] = torch.clamp(
                 scale_ref + scale_d, 1, 63
@@ -292,7 +292,7 @@ def _delta_encode_scales_mins_9byte(
         packed[..., bi] = (
             lo
             | (sd_i[..., i] << 3)
-            | (((md_i[..., i] >> 1) & 0x01) << 7)
+            | (((md_i[..., i] >> 3) & 0x01) << 7)
         )
     packed[..., 8] = md_i[..., 6] & 0x07
 
