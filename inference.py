@@ -129,11 +129,12 @@ class QuantizedLinear(nn.Module):
 
         expected_quants = (self.out_features, self.in_features // 2)
         sm_shape = tuple(self.scales_mins_packed.shape)
-        if sm_shape[-1] not in (10, 11, 12):
+        if sm_shape[-1] not in (9, 10, 11, 12):
             raise RuntimeError(
-                f"Bad scale/min packed shape {sm_shape}; expected last dim 10, 11, or 12"
+                f"Bad scale/min packed shape {sm_shape}; expected last dim 9, 10, 11, or 12"
             )
-        self._sm_asymmetric = sm_shape[-1] in (10, 11)
+        self._sm_asymmetric = sm_shape[-1] in (9, 10, 11)
+        self._sm_delta = sm_shape[-1] == 9
         expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
@@ -179,6 +180,38 @@ class QuantizedLinear(nn.Module):
         self, begin: int, end: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = end - begin
+        if self._sm_delta:
+            sm = self.scales_mins_packed[begin:end].to(dtype=torch.int64)
+            device = sm.device
+
+            scale_ref = sm[:, :, 0] & 0x3F
+            min_ref = ((sm[:, :, 0] >> 6) & 0x03) << 3
+            min_ref = min_ref | (sm[:, :, 1] & 0x07)
+
+            scales = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            minima = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            scales[:, :, 0] = scale_ref.to(torch.int32)
+            minima[:, :, 0] = min_ref.to(torch.int32)
+
+            for i in range(7):
+                bi = i + 1
+                sd = ((sm[:, :, bi] >> 3) & 0x0F) - 8
+                if i < 6:
+                    md = ((sm[:, :, bi] >> 7) & 0x01)
+                    md = md | ((sm[:, :, bi + 1] & 0x07) << 1)
+                else:
+                    md = ((sm[:, :, 7] >> 7) & 0x01)
+                    md = md | ((sm[:, :, 8] & 0x07) << 1)
+                md = md - 8
+                scales[:, :, i + 1] = torch.clamp(
+                    scale_ref + sd, 1, 63
+                ).to(torch.int32)
+                minima[:, :, i + 1] = torch.clamp(
+                    min_ref + md, 0, 31
+                ).to(torch.int32)
+
+            return scales.float() / 63.0, minima.float() / 31.0
+
         if not self._sm_asymmetric:
             packed = self.scales_mins_packed[begin:end].to(dtype=torch.int32)
             values = torch.empty(
