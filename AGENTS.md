@@ -74,25 +74,6 @@ quantized_models/<tag>/
 
 ---
 
-## What we've learned (9B-specific)
-
-### Metadata compression (safe — doesn't touch quants)
-- fp16 d/dmin: saves ~0.12 GB, KL +0.006 (acceptable)
-- Shared d/dmin K=32: saves ~0.19 GB, KL 0.059→0.177 (FAILED — 4-bit factors too coarse)
-- Shared scales/mins K_sm=256: saves ~0.25 GB, UNTESTED on 9B
-
-### Quants compression (risky — modifies weight codes)
-- 2-bit inter-channel delta Kq=512: saved ~2 GB, KL 0.059→38.1 (FAILED — 84% of codes clipped)
-- 3-bit inter-channel delta Kq=512: saved ~0.3 GB, KL 0.059→28.8 (FAILED — still too much clipping)
-- **Conclusion**: 9B output channels lack the correlation needed for narrow deltas.
-  This worked on 0.8B because of overparameterization creating channel redundancy.
-
-### Current best approach for VRAM savings
-- Metadata-only techniques (fp16 or shared) give small savings (≤0.5 GB) at low quality risk
-- Quants compression is a dead end at 9B scale unless a fundamentally different approach is found
-
----
-
 ## Sub-agent experiment protocol
 
 Experiments are run by sub-agents. Each sub-agent:
@@ -100,7 +81,7 @@ Experiments are run by sub-agents. Each sub-agent:
 2. Quantizes: `CUDA_VISIBLE_DEVICES=2 .venv/bin/python quantize.py --model Qwen/Qwen3.5-9B --format q4_k --q4k-scale-dtype float32 --q4k-refine-mode legacy_exact [--new-flags] --save quantized_models/qwen35-9b-<tag>`
 3. Evals KL: `CUDA_VISIBLE_DEVICES=2 Q4K_TILE_ROWS=512 .venv/bin/python eval_perplexity.py --model quantized_models/qwen35-9b-<tag> --reference Qwen/Qwen3.5-9B --context-length 256 --max-tokens 4000 --reference-cache cache/ref_logits_9B.mmap`
 4. Evals top-P: `CUDA_VISIBLE_DEVICES=2 Q4K_TILE_ROWS=512 .venv/bin/python eval_topk.py --model quantized_models/qwen35-9b-<tag> --reference Qwen/Qwen3.5-9B --reference-cache cache/ref_logits_9B.mmap --context-length 256 --max-tokens 4000 --stride 128`
-5. Records results in `results.tsv`
+5. Records results in `results.tsv` and `idea_ledger.md`
 6. Commits and pushes
 
 ### Sub-agent rules
@@ -128,6 +109,33 @@ Experiments are run by sub-agents. Each sub-agent:
 - Revert failed experiments (git reset --hard) — do NOT merge broken code
 - Push after each working commit
 - Record every experiment in `results.tsv` — include regressions
+- Update `idea_ledger.md` after each experiment with hypothesis, implementation details, and failure analysis (see format below)
+
+---
+
+## Idea ledger (`idea_ledger.md`)
+
+Every experiment — success or failure — must record a structured entry:
+
+```markdown
+## <exp_id> — <technique name>
+
+**Hypothesis:** <one sentence>
+**Status:** success | regression | failure
+**KL divergence:** <value>  |  **Top-P:** <value>  |  **Size:** <value> GB
+
+**Implementation:**
+- <how it works, what changes were made to quantize.py / inference.py>
+- <key parameters (Kq, K_sm, bit widths, sharing factors)>
+
+**Result:**
+<why it succeeded or failed — root cause analysis>
+
+**Lesson:**
+<what this teaches us for future experiments>
+```
+
+After each experiment, the sub-agent appends a new entry to the top of `idea_ledger.md`.
 
 ---
 
