@@ -128,16 +128,22 @@ class QuantizedLinear(nn.Module):
         self.n_blocks = self.in_features // QK_K
 
         expected_quants = (self.out_features, self.in_features // 2)
-        expected_sm = (self.out_features, self.n_blocks, 12)
+        sm_shape = tuple(self.scales_mins_packed.shape)
+        if sm_shape[-1] not in (11, 12):
+            raise RuntimeError(
+                f"Bad scale/min packed shape {sm_shape}; expected last dim 11 or 12"
+            )
+        self._sm_asymmetric = sm_shape[-1] == 11
+        expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
             raise RuntimeError(
                 f"Bad quants shape {tuple(self.quants_packed.shape)}; "
                 f"expected {expected_quants}"
             )
-        if tuple(self.scales_mins_packed.shape) != expected_sm:
+        if sm_shape != expected_sm:
             raise RuntimeError(
-                f"Bad scale/min shape {tuple(self.scales_mins_packed.shape)}; "
+                f"Bad scale/min shape {sm_shape}; "
                 f"expected {expected_sm}"
             )
         if tuple(self.d.shape) != expected_scale or tuple(self.dmin.shape) != expected_scale:
@@ -172,28 +178,58 @@ class QuantizedLinear(nn.Module):
     def _unpack_scale_min_rows(
         self, begin: int, end: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        packed = self.scales_mins_packed[begin:end].to(dtype=torch.int32)
         rows = end - begin
-        values = torch.empty(
-            rows,
-            self.n_blocks,
-            QK_K_SUB_BLOCKS,
-            dtype=torch.int32,
-            device=packed.device,
-        )
-        for pair in range(4):
-            i = pair * 2
-            byte = pair * 3
-            values[:, :, i] = (
-                packed[:, :, byte]
-                | ((packed[:, :, byte + 1] & 0x0F) << 8)
+        if not self._sm_asymmetric:
+            packed = self.scales_mins_packed[begin:end].to(dtype=torch.int32)
+            values = torch.empty(
+                rows,
+                self.n_blocks,
+                QK_K_SUB_BLOCKS,
+                dtype=torch.int32,
+                device=packed.device,
             )
-            values[:, :, i + 1] = (
-                (packed[:, :, byte + 1] >> 4)
-                | (packed[:, :, byte + 2] << 4)
-            )
-        scales = ((values >> 6) & 0x3F).float() / 63.0
-        minima = (values & 0x3F).float() / 63.0
+            for pair in range(4):
+                i = pair * 2
+                byte = pair * 3
+                values[:, :, i] = (
+                    packed[:, :, byte]
+                    | ((packed[:, :, byte + 1] & 0x0F) << 8)
+                )
+                values[:, :, i + 1] = (
+                    (packed[:, :, byte + 1] >> 4)
+                    | (packed[:, :, byte + 2] << 4)
+                )
+            scales = ((values >> 6) & 0x3F).float() / 63.0
+            minima = (values & 0x3F).float() / 63.0
+            return scales, minima
+
+        scale_bytes = self.scales_mins_packed[begin:end, :, :6].to(dtype=torch.int32)
+        min_bytes = self.scales_mins_packed[begin:end, :, 6:11].to(dtype=torch.int32)
+        device = scale_bytes.device
+
+        sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+        b = scale_bytes
+        sc[:, :, 0] = (b[:, :, 0] & 0x3F)
+        sc[:, :, 1] = ((b[:, :, 0] >> 6) | ((b[:, :, 1] & 0x0F) << 2))
+        sc[:, :, 2] = ((b[:, :, 1] >> 4) | ((b[:, :, 2] & 0x03) << 4))
+        sc[:, :, 3] = (b[:, :, 2] >> 2) & 0x3F
+        sc[:, :, 4] = (b[:, :, 3] & 0x3F)
+        sc[:, :, 5] = ((b[:, :, 3] >> 6) | ((b[:, :, 4] & 0x0F) << 2))
+        sc[:, :, 6] = ((b[:, :, 4] >> 4) | ((b[:, :, 5] & 0x03) << 4))
+        sc[:, :, 7] = (b[:, :, 5] >> 2) & 0x3F
+        scales = sc.float() / 63.0
+
+        bm = min_bytes.to(torch.int64)
+        packed_40 = bm[:, :, 0]
+        packed_40 |= bm[:, :, 1] << 8
+        packed_40 |= bm[:, :, 2] << 16
+        packed_40 |= bm[:, :, 3] << 24
+        packed_40 |= bm[:, :, 4] << 32
+        mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+        for i in range(8):
+            mn[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
+        minima = mn.float() / 31.0
+
         return scales, minima
 
     def _dequantize_rows(

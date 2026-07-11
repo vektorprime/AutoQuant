@@ -1,5 +1,72 @@
 # Idea Ledger
 
+## q4k-9b-asym65 — Asymmetric precision: 6-bit scales + 5-bit mins + fp16 d/dmin
+
+**Hypothesis:** Scales multiply codes (affecting ranking = Top-P) while mins add offsets (affecting distribution bias = KL). Reducing mins to 5-bit while keeping scales at 6-bit preserves Top-P better than symmetric 5-bit reduction.
+**Status:** success
+**KL divergence:** 0.059674  |  **Top-P:** 88.172%  |  **Size:** 6.48 GB
+
+**Implementation:**
+- Added `sm_bits_min` parameter to `_encode_q4k()` (default 6, can be 5)
+- Mins quantized to 31 levels (5-bit) instead of 63 (6-bit); scales stay at 6-bit/63 levels
+- Separate packing: 8 × 6-bit scales in 6 bytes + 8 × 5-bit mins in 5 bytes = 11 bytes per superblock (saves 1 byte vs standard 12-byte interleaved)
+- Helper functions: `_pack_values_6bit()` and `_pack_values_5bit()` for bit-packing
+- `decode_q4k()` updated to detect format from `scales_mins_packed` last dim (12=standard, 11=asymmetric)
+- `QuantizedLinear._unpack_scale_min_rows()` in inference.py updated with asymmetric unpacking path
+- `_sm_asymmetric` flag auto-detected from packed tensor shape
+- Combined with `--q4k-ddmin-fp16` for cumulative savings
+
+**Result:**
+KL (0.0597) is only 0.0008 above baseline (0.0588) and well below the 0.065 threshold. Top-P (88.17%) is within 0.05% of baseline (88.12%) and above the 88.0% threshold — very close to ddfp16 (88.20%). 5-bit mins cause minimal quality loss because additive offsets affect the distribution mean (KL) more than ranking (Top-P). LS refinement absorbs most of the rounding error. Size is 6.48 GB, beating ddfp16's 6.51 GB by ~32 MB.
+
+**Lesson:**
+Asymmetric precision works: mins are less sensitive to bit reduction than scales. This validates the hypothesis that multiplicative factors (scales) dominate Top-P while additive factors (mins) affect KL more. The 1-byte/superblock savings is modest but meaningful. The technique is general and could be extended to 4-bit mins (saving another byte) or combined with other compression methods. The key design principle for future experiments: preserve multiplicative precision (scales, d) at the expense of additive precision (mins, biases) when Top-P margin is tight.
+
+---
+
+## q4k-9b-smshare4 — Sub-block scale/min sharing (G=4)
+
+**Hypothesis:** Halving the number of scale/min pairs by sharing across pairs of sub-blocks saves 0.185 GB while LS re-optimization absorbs the spatial resolution loss.
+**Status:** regression
+**KL divergence:** 0.095  |  **Top-P:** (not run; KL fails by wide margin)  |  **Size:** 6.18 GB
+
+**Implementation:**
+- Added `sm_groups` parameter to `_encode_q4k()` and downstream plumbing
+- Before quantizing scales/mins: merge raw sub-block statistics (min/max) by taking group-level min/max over 64-weight groups
+- Expand merged values back to 8 sub-blocks for code assignment and LS
+- Pack only G=4 scale/min pairs (6 bits each) using separate packable format → 6 bytes per superblock (50% savings)
+- Auto-detect sm_groups from packed tensor shape in inference.py, expand back to 8 sub-blocks
+
+**Result:**
+The group-level min/max over 64 weights gives a wider range than any individual 32-weight sub-block. This increases the effective quantization step (d_sub) for both sub-blocks, causing higher quantization error. LS at the superblock level (d/dmin) cannot compensate for per-2-sub-block errors. KL regressed massively from 0.059 to 0.095.
+
+**Lesson:**
+Sub-block scale/min sharing fundamentally fails because the combined range of multiple sub-blocks is wider than individual ranges, increasing quantization error everywhere. LS only has 2 DOF per superblock (d/dmin) vs 8 sub-blocks, so it cannot absorb spatial resolution loss. This same failure mode would apply to any sharing scheme (G=2, G=4).
+
+---
+
+## q4k-9b-sm5bit — 5-bit scale/min precision
+
+**Hypothesis:** Reducing scale/min precision from 6-bit to 5-bit, with LS solving for optimal d/dmin given the coarser values, saves 0.062 GB while maintaining quality close to baseline.
+**Status:** regression (near-pass)
+**KL divergence:** 0.062346  |  **Top-P:** 87.347%  |  **Size:** 6.45 GB
+
+**Implementation:**
+- Added `sm_bits` parameter to `_encode_q4k()` (4, 5, or 6)
+- Quantize scales/mins to 31 levels (5-bit) instead of 63 (6-bit)
+- Single LS pass with the 5-bit values (no post-LS re-quantization — found to be harmful)
+- Pack 8 × 5-bit scales + 8 × 5-bit mins = 10 bytes per superblock using `_pack_values_Nbit`
+- Auto-detect bit width from packed tensor shape in inference.py
+- Post-LS re-quantization was explored but removed: it perturbed codes and degraded quality (KL=0.068 with it vs 0.062 without)
+
+**Result:**
+KL divergence (0.0623) is within the ≤0.065 threshold and close to baseline (0.059). However, Top-P agreement (87.35%) falls below the 88.0% threshold by 0.65 percentage points. The pattern suggests that 5-bit precision introduces small per-sub-block perturbations that maintain the overall output distribution (KL good) but flip specific argmax decisions (Top-P failing). The fundamental limitation: scales/mins have per-sub-block errors (one per 32 weights) but LS can only optimize d/dmin (one pair per 256 weights), so the error cannot be fully absorbed.
+
+**Lesson:**
+Scale/min precision reduction is a viable compression target but the current 5-bit level is borderline. The Top-P failure is ~0.65% below threshold. Possible improvements: (a) try 6-bit with 5-bit mins only (asymmetric), (b) use stochastic rounding for the quantization instead of round-to-nearest, (c) add an alternating refinement pass that re-optimizes codes and scales/mins jointly (not just d/dmin). The near-pass result suggests this approach could work with minor refinements.
+
+---
+
 ## q4k-9b-ddfp16 — fp16 d/dmin with LS re-optimization
 
 **Hypothesis:** Storing d/dmin at fp16 precision (vs fp32) saves 0.125 GB; LS re-optimization after rounding absorbs the precision loss.
