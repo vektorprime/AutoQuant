@@ -21,6 +21,37 @@ QK_K_SUB_BLOCKS = 8
 QK_K_SUB_SIZE = QK_K // QK_K_SUB_BLOCKS
 SUPPORTED_FORMATS = {"q4k_affine_v2", "q4k_shared_log8"}
 
+import numpy as np
+
+_HADAMARD_CACHE: dict[tuple[int, int, int], list[torch.Tensor]] = {}
+
+
+def _random_hadamard_np(n: int, seed: int) -> np.ndarray:
+    rng = np.random.RandomState(seed)
+    H = np.array([[1.0]], dtype=np.float32)
+    while H.shape[0] < n:
+        H = np.block([[H, H], [H, -H]]).astype(np.float32)
+    row_signs = (rng.randint(0, 2, size=n) * 2 - 1).astype(np.float32)
+    col_signs = (rng.randint(0, 2, size=n) * 2 - 1).astype(np.float32)
+    H = row_signs[:, None] * H * col_signs[None, :]
+    return H * (1.0 / np.sqrt(n))
+
+
+def _get_hadamard_blocks(
+    in_features: int, block_size: int, seed: int, device: torch.device
+) -> list[torch.Tensor]:
+    n_blocks = in_features // block_size
+    cache_key = (in_features, block_size, seed)
+    if cache_key not in _HADAMARD_CACHE:
+        blocks = []
+        for i in range(n_blocks):
+            H_np = _random_hadamard_np(block_size, seed + i)
+            H_t = torch.from_numpy(H_np.copy()).to(dtype=torch.float32)
+            blocks.append(H_t)
+        _HADAMARD_CACHE[cache_key] = blocks
+    cpu_blocks = _HADAMARD_CACHE[cache_key]
+    return [b.to(device=device, dtype=torch.float32) for b in cpu_blocks]
+
 
 @contextmanager
 def _fallback_init_empty_weights():
@@ -89,6 +120,9 @@ class QuantizedLinear(nn.Module):
         tile_rows: int = 512,
         sm_bits_scale: int = 6,
         sm_bits_min: int = 6,
+        hadamard: bool = False,
+        hadamard_block_size: int = 256,
+        hadamard_seed: int = 42,
     ) -> None:
         super().__init__()
         self.in_features = int(in_features)
@@ -97,6 +131,10 @@ class QuantizedLinear(nn.Module):
         self.tile_rows = int(tile_rows)
         self.sm_bits_scale = sm_bits_scale
         self.sm_bits_min = sm_bits_min
+        self._hadamard = hadamard
+        self._hadamard_block_size = hadamard_block_size
+        self._hadamard_seed = hadamard_seed
+        self._h_blocks: list[torch.Tensor] | None = None
 
         self.register_buffer(
             "quants_packed",
@@ -339,6 +377,21 @@ class QuantizedLinear(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         compute_dtype = inputs.dtype if inputs.is_floating_point() else self.compute_dtype
+
+        if self._hadamard:
+            if self._h_blocks is None:
+                self._h_blocks = _get_hadamard_blocks(
+                    self.in_features, self._hadamard_block_size,
+                    self._hadamard_seed, inputs.device,
+                )
+            inputs = inputs.float()
+            n_blocks = self.in_features // self._hadamard_block_size
+            for i in range(n_blocks):
+                start = i * self._hadamard_block_size
+                end = start + self._hadamard_block_size
+                inputs[..., start:end] = inputs[..., start:end] @ self._h_blocks[i].T
+            inputs = inputs.to(dtype=compute_dtype)
+
         output = torch.empty(
             *inputs.shape[:-1],
             self.out_features,
@@ -516,6 +569,10 @@ def load_quantized_model(
             else:
                 _sm_bits_min = 6
 
+        _hadamard = bool(layer_info.get("hadamard", False) or manifest.get("hadamard", False))
+        _hadamard_block_size = int(layer_info.get("hadamard_block_size", 256))
+        _hadamard_seed = int(layer_info.get("hadamard_seed", 42))
+
         replacement = QuantizedLinear(
             original.in_features,
             original.out_features,
@@ -525,6 +582,9 @@ def load_quantized_model(
             tile_rows=tile_rows,
             sm_bits_scale=_sm_bits_scale,
             sm_bits_min=_sm_bits_min,
+            hadamard=_hadamard,
+            hadamard_block_size=_hadamard_block_size,
+            hadamard_seed=_hadamard_seed,
         )
         _set_child_module(model, name, replacement)
 

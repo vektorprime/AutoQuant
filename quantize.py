@@ -357,6 +357,36 @@ def _delta_encode_scales_mins_9byte(
     return sm_packed, perturbed_scales, perturbed_mins
 
 
+def _random_hadamard(n: int, seed: int) -> np.ndarray:
+    """Random normalized Hadamard matrix: standard Sylvester Hadamard with
+    random diagonal sign flips on rows and columns."""
+    rng = np.random.RandomState(seed)
+    H = np.array([[1.0]], dtype=np.float32)
+    while H.shape[0] < n:
+        H = np.block([[H, H], [H, -H]]).astype(np.float32)
+    row_signs = (rng.randint(0, 2, size=n) * 2 - 1).astype(np.float32)
+    col_signs = (rng.randint(0, 2, size=n) * 2 - 1).astype(np.float32)
+    H = row_signs[:, None] * H * col_signs[None, :]
+    return H * (1.0 / np.sqrt(n))
+
+
+def _apply_hadamard_weights(
+    weights: torch.Tensor,
+    block_size: int,
+    seed: int,
+) -> torch.Tensor:
+    in_features = weights.shape[1]
+    assert in_features % block_size == 0
+    n_blocks = in_features // block_size
+    weights_tr = weights.clone()
+    for i in range(n_blocks):
+        start = i * block_size
+        end = start + block_size
+        H = torch.from_numpy(_random_hadamard(block_size, seed + i)).float()
+        weights_tr[:, start:end] = weights_tr[:, start:end] @ H.T
+    return weights_tr
+
+
 def _encode_q4k(
     layer: nn.Linear,
     scale_dtype: torch.dtype = torch.float32,
@@ -366,6 +396,9 @@ def _encode_q4k(
     sm_bits_min: int = 6,
     sm_bits_scale: int = 6,
     use_scale_delta: bool = False,
+    use_hadamard: bool = False,
+    hadamard_block_size: int = 256,
+    hadamard_seed: int = 42,
 ) -> dict:
     """Encode one Linear weight without mutating the source model.
 
@@ -391,6 +424,9 @@ def _encode_q4k(
       sub-block 0 as reference plus 4-bit signed deltas for sub-blocks 1-7.
       Packs into 9 bytes per superblock.  Must be used with sm_bits_min=5
       (5-bit mins) for correct reconstruction.
+
+    use_hadamard: apply block-diagonal random Hadamard transform to weights
+      before quantization to decorrelate channels (QuaRot-style).
     """
     if scale_dtype not in (torch.float16, torch.float32):
         raise ValueError("Q4_K scale dtype must be float16 or float32")
@@ -410,6 +446,15 @@ def _encode_q4k(
         raise ValueError(
             f"in_features ({in_features}) must be divisible by {QK_K}"
         )
+
+    if use_hadamard:
+        if in_features % hadamard_block_size != 0:
+            raise ValueError(
+                f"in_features ({in_features}) not divisible by hadamard block size "
+                f"({hadamard_block_size})"
+            )
+        weights = _apply_hadamard_weights(weights, hadamard_block_size, hadamard_seed)
+
     n_blocks = in_features // QK_K
     blocks = weights.reshape(
         out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE
@@ -592,6 +637,9 @@ def _encode_q4k(
         "refine_mode": refine_mode,
         "sm_bits_scale": sm_bits_scale,
         "sm_bits_min": sm_bits_min,
+        "hadamard": use_hadamard,
+        "hadamard_block_size": hadamard_block_size if use_hadamard else 0,
+        "hadamard_seed": hadamard_seed if use_hadamard else 0,
     }
 
 
@@ -604,6 +652,9 @@ def _quantize_one_layer_q4k(
     sm_bits_min: int = 6,
     sm_bits_scale: int = 6,
     use_scale_delta: bool = False,
+    use_hadamard: bool = False,
+    hadamard_block_size: int = 256,
+    hadamard_seed: int = 42,
 ) -> dict:
     """Return packed bytes without replacing or mutating the source weight."""
     return _encode_q4k(
@@ -615,6 +666,9 @@ def _quantize_one_layer_q4k(
         sm_bits_min=sm_bits_min,
         sm_bits_scale=sm_bits_scale,
         use_scale_delta=use_scale_delta,
+        use_hadamard=use_hadamard,
+        hadamard_block_size=hadamard_block_size,
+        hadamard_seed=hadamard_seed,
     )
 
 
@@ -809,6 +863,7 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
     total_packed_bytes = 0
     scale_dtypes = set()
     refine_modes = set()
+    hadamards = set()
 
     for name, data in tqdm(meta.items(), desc="Saving packed"):
         if name not in module_map or not isinstance(module_map[name], nn.Linear):
@@ -824,6 +879,8 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
         module = module_map[name]
         scale_dtypes.add(data["scale_dtype"])
         refine_modes.add(data["refine_mode"])
+        hadamard = data.get("hadamard", False)
+        hadamards.add(hadamard)
         layer_manifest[name] = {
             "shape": [int(data["shape"][0]), int(data["shape"][1])],
             "has_bias": module.bias is not None,
@@ -832,6 +889,14 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
             "sm_bits_scale": data.get("sm_bits_scale", 6),
             "sm_bits_min": data.get("sm_bits_min", 6),
         }
+        if hadamard:
+            layer_manifest[name]["hadamard"] = True
+            layer_manifest[name]["hadamard_block_size"] = int(
+                data.get("hadamard_block_size", 256)
+            )
+            layer_manifest[name]["hadamard_seed"] = int(
+                data.get("hadamard_seed", 42)
+            )
 
     if len(scale_dtypes) > 1:
         raise RuntimeError(f"Mixed Q4_K scale dtypes are not supported: {scale_dtypes}")
@@ -888,6 +953,7 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
         "residual_file": residual_name,
         "quantized_layers": layer_manifest,
         "residual_parameters": sorted(residual_state),
+        "hadamard": any(hadamards),
     }
     with open(os.path.join(save_dir, "q4k_manifest.json"), "w") as handle:
         json.dump(manifest, handle, indent=2)
@@ -920,6 +986,8 @@ def quantize_model(
     q4k_sm_bits_min: int = 6,
     q4k_sm_bits_scale: int = 6,
     q4k_scale_delta: bool = False,
+    q4k_hadamard: bool = False,
+    q4k_hadamard_block_size: int = 256,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -929,6 +997,7 @@ def quantize_model(
               if isinstance(m, nn.Linear)]
 
     skipped_small = 0
+    layer_idx = 0
     for name, layer in tqdm(layers, desc="Quantizing"):
         if any(pattern in name for pattern in _NEVER_QUANTIZE):
             skipped_small += 1
@@ -939,6 +1008,7 @@ def quantize_model(
                 logger.warning("Skipping %s: in_features %d not divisible by %d",
                                name, layer.weight.shape[1], QK_K)
                 continue
+            hadamard_seed = abs(hash(name)) % (2**30) if q4k_hadamard else 42
             meta[name] = _quantize_one_layer_q4k(
                 layer,
                 scale_dtype=q4k_scale_dtype,
@@ -948,7 +1018,11 @@ def quantize_model(
                 sm_bits_min=q4k_sm_bits_min,
                 sm_bits_scale=q4k_sm_bits_scale,
                 use_scale_delta=q4k_scale_delta,
+                use_hadamard=q4k_hadamard,
+                hadamard_block_size=q4k_hadamard_block_size,
+                hadamard_seed=hadamard_seed,
             )
+            layer_idx += 1
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
             if groupsize != -1 and layer.weight.shape[1] % layer_gs != 0:
@@ -1066,6 +1140,17 @@ def parse_args():
             "9 bytes per superblock. Requires --q4k-sm-bits-min 5."
         ),
     )
+    parser.add_argument(
+        "--q4k-hadamard",
+        action="store_true",
+        default=False,
+        help=(
+            "Apply block-diagonal random Hadamard transform to weights "
+            "before quantization (QuaRot-style). Decorrelates channels "
+            "for better quantization quality. At inference, the inverse "
+            "transform is applied to activations."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1118,6 +1203,7 @@ def main():
         q4k_sm_bits_min=args.q4k_sm_bits_min,
         q4k_sm_bits_scale=args.q4k_sm_bits_scale,
         q4k_scale_delta=args.q4k_sm_delta,
+        q4k_hadamard=args.q4k_hadamard,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
