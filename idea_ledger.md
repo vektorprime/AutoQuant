@@ -1,5 +1,105 @@
 # Idea Ledger
 
+## q4k-9b-embed6+6 — Embedding quantization with 6+6 precision (near-miss regression)
+
+**Hypothesis:** Quantizing the 2.03 GB embedding table with full 6+6 precision (same as baseline Q4_K) should preserve Top-P matching the no-embedding-quant asym5s4-i3f, while 5+4 linear layers keep the model size advantage.
+**Status:** regression (near-pass — 0.053% below Top-P threshold)
+**KL divergence:** 0.053225  |  **Top-P:** 87.947%  |  **Size:** 4.84 GB
+
+**Implementation:**
+- Added `--q4k-embed-*` CLI flags to quantize.py: separate control of scale_dtype, refine_mode, refine_iters, ddmin_store_dtype, sm_bits_scale, sm_bits_min for embedding layers vs linear layers
+- Extended `quantize_model()` to accept and apply embed-specific quantization parameters
+- Fixed `_save_packed_q4k()`: now allows mixed scale_dtypes and refine_modes between linear and embedding layers (previously raised RuntimeError)
+- Rewrote `QuantizedEmbedding._unpack_scale_min_rows()` in inference.py: now handles all common format combinations (5+4, 6+3, 6+4, 6+5, 6+6, symmetric 5-bit) using explicit `sm_bits_scale`/`sm_bits_min` from the manifest (eliminated broken auto-detection from tensor shape)
+- `QuantizedEmbedding.__init__` now accepts `sm_bits_scale` and `sm_bits_min` params; `load_quantized_model()` passes them from manifest
+- Linear layers: 5-bit scales + 4-bit mins + fp16 d/dmin + alternating LS (3 iters + final)
+- Embedding: 6-bit scales + 6-bit mins + fp16 d/dmin + alternating LS (3 iters)
+
+**Result:**
+Three configurations tested:
+1. Embed legacy_exact: KL 0.053553, Top-P 87.697%
+2. Embed alt 3 iters: KL 0.053225, Top-P 87.947% **(best)**
+3. Embed alt 5 iters: KL 0.053563, Top-P 87.847%
+
+KL is the best of ANY experiment (0.053225), comfortably beating baseline (0.059) and asym5s4-i3f (0.0536). Size at 4.84 GB is 1.43 GB smaller than asym5s4-i3f (6.27 GB) and 1.79 GB smaller than baseline (6.63 GB). But Top-P (87.947%) falls 0.053% below the 88.0% threshold.
+
+The embedding quantization at 4-bit (even with 6+6 scales/mins and 3-iter alternating LS) loses ~0.3% Top-P vs unquantized bf16 embeddings. This is the FIRST LAYER of the model — quantization errors in embeddings propagate through every subsequent attention and FFN layer. The 6+6 format provides baseline-quality scale/min precision, but the 4-bit quants (16 levels) with d/dmin resolution of 1 output row per 256 input features cannot perfectly reconstruct the wide value range across 248K vocabulary embedding rows.
+
+Increasing refinement iterations from 3 to 5 degraded Top-P from 87.947% to 87.847%, following the same pattern seen in linear layers (more alternating iterations don't monotonically improve convergence). The fp16 d/dmin roundtrip + LS re-opt (ddfp16 approach) provides a small additional refinement step compared to pure fp32 storage.
+
+**Lesson:**
+Embedding quantization at 4-bit is fundamentally limited by the first-layer error propagation problem. The 4-bit quants are the bottleneck — 16 levels cannot capture the full dynamic range of embedding vectors across 248K vocabulary tokens. Three viable paths forward:
+1. **Per-row finer quants**: Use 5-bit or 6-bit quants for embeddings specifically (don't touch the linear layers' 4-bit format). The embedding is only ~4M superblocks, so 5-bit quants would add ~250 MB but might close the 0.3% Top-P gap.
+2. **Per-row finer d/dmin**: Use K=1 (no sharing) for embedding d/dmin to give each embedding row independent scale control.
+3. **Embedding normalization**: Pre-normalize embedding rows to unit norm before quantization, store the norm as a per-row scalar. This would reduce the dynamic range variation and make 4-bit quants more effective.
+
+The `QuantizedEmbedding` module with sparse row lookup and the embed-specific CLI flags are reusable components for future experiments. The mixed-quality quantization infrastructure (different bits for different layer types) is a novel capability that enables per-layer-type optimization.
+
+---
+
+## q4k-9b-sym5s-embed — Embedding quantization (regression, near-pass)
+
+**Hypothesis:** Quantizing the 2.03 GB embedding table to 4-bit (5+4 format) saves ~1.5 GB while maintaining quality through iterative LS refinement.
+**Status:** regression (near-pass)
+**KL divergence:** 0.061981  |  **Top-P:** 87.497%  |  **Size:** 4.93 GB
+
+**Implementation:**
+- Added `QuantizedEmbedding` class in inference.py: packed-only embedding layer with sparse row lookup
+- Modified `quantize.py` to detect `nn.Embedding` modules and quantize their [vocab, hidden] weight matrices using the same `_encode_q4k` pipeline
+- QuantizedEmbedding.forward(): sorts token IDs, dequantizes needed rows in batches (max 2048 contiguous rows per batch), individual row dequantization for sparse lookups
+- Embedding stored in packed safetensors alongside Linear layers; manifest has separate "quantized_embeddings" section
+- Residual drops from 2.05 GB to 14.7 MB — almost all residual was the embedding table
+- 5+4 format + fp16 d/dmin for both Linear and Embedding layers
+
+**Result:**
+KL (0.0620) passes the ≤0.065 threshold comfortably, with minimal degradation vs pure 5+4 format (0.0536). However, Top-P (87.50%) falls 0.5% below the 88.0% threshold. The embedding layer is the first layer in the model — quantization errors in embeddings propagate through every subsequent layer. Even small per-weight errors in the embedding table (248K × 4096) accumulate across the 248K vocabulary tokens, affecting the first-layer representations that feed into all subsequent attention and MLP computations.
+
+The 5+4 format (5-bit scales, 4-bit mins) may be too aggressive for embeddings compared to the standard 6+6 format. With 31 scale levels vs 63, the embedding quantization grid is meaningfully coarser. Since Qwen3.5 has 248K vocabulary entries with widely varying embedding magnitudes (common tokens have large norms, rare tokens have small norms), the 5-bit scales struggle to simultaneously capture both large and small magnitudes within the same superblock.
+
+**Lesson:**
+Embedding quantization is a high-leverage compression target (2.03 GB → ~0.54 GB = 73% reduction), but quality is more sensitive than for internal Linear layers. Three paths to close the 0.5% Top-P gap: (1) use 6+6 format for embeddings (adds ~12 MB metadata), (2) use 6+6 format globally (adds ~93 MB total, still well below 6.27 GB threshold), or (3) use per-row bias correction during the LS solve to better handle the wide embedding magnitude range. The `QuantizedEmbedding` module is a reusable component for future experiments.
+
+---
+
+## q4k-9b-sym5s-bias — Symmetric scales + per-superblock bias (regression)
+
+**Hypothesis:** Adding a per-superblock bias term b to the symmetric formulation restores the 2-DOF LS (d, b) and absorbs the offset errors that the pure symmetric approach couldn't handle.
+**Status:** regression
+**KL divergence:** 0.135473  |  **Top-P:** not run  |  **Size:** 6.14 GB
+
+**Implementation:**
+- Modified symmetric path in `_encode_q4k()`: added b (per-superblock bias, stored as fp16)
+- 2×2 LS system solving for (d, b) jointly
+- Storage: 5 bytes scales + 2 bytes d + 2 bytes b = 9 bytes/sb (save 4 vs 13 bytes/sb of 5+4 format)
+- Decode: w = d * s_k * (q - 7.5) + b
+
+**Result:**
+KL (0.1355) showed essentially no improvement over the no-bias version (0.1398). The per-superblock bias corrects superblock-level offset errors but cannot address per-sub-block centering issues. Each sub-block within a superblock has its own weight distribution, and a single bias per superblock applies uniformly to all sub-blocks. The fundamental problem remains: the symmetric formulation with fixed zero-point at 7.5 ties each sub-block's effective range to be centered at d * s_k * 7.5, which cannot adapt to sub-blocks where weight distributions are asymmetric or off-center.
+
+**Lesson:**
+The sub-block offset (min term) is essential — it provides independent per-sub-block centering that neither a fixed zero-point nor a global bias can replace. Adding 4-bit per-sub-block zero-points (instead of fixed 7.5) would give independent offset control while keeping metadata competitive: 5 bytes scales + 4 bytes zero-points + 2 bytes d = 11 bytes/sb. This is a natural extension that preserves the per-sub-block flexibility of the original format.
+
+---
+
+## q4k-9b-sym5s — Symmetric per-sub-block scales, no mins (regression)
+
+**Hypothesis:** Using symmetric quantization around zero (w = d * s_k * (q - 7.5)) eliminates the need for dmin and mins entirely, saving 6 bytes/sb vs 5+4 format.
+**Status:** regression
+**KL divergence:** 0.139802  |  **Top-P:** not run  |  **Size:** 6.08 GB
+
+**Implementation:**
+- Per-sub-block symmetric scale from max absolute value: s_k = max(|min|, |max|) / 7.5
+- d = max(s_k) per superblock; s_k_norm = s_k / d quantized to 5-bit
+- Codes: q = round(w / (d * s_norm) + 7.5), clamped to [0, 15]
+- 1-DOF LS: solve for d only
+- Storage: 5 bytes (8 × 5-bit scales) + 2 bytes (d, fp16) = 7 bytes/sb
+
+**Result:**
+KL (0.1398) is 2.4× worse than the ≤0.065 threshold. The fundamental flaw: with fixed zero-point at 7.5, each sub-block's representable range is [-7.5ds, +7.5ds], always symmetric around 0. LLM weights frequently have non-zero-mean distributions within sub-blocks (e.g., [-0.1, +0.9] or [-0.8, +0.2]). The symmetric formulation forces the representable range to be centered at 0, wasting precision on the unused side. With only 1 DOF (d) in the LS solve, there's no way to compensate for per-sub-block centering errors. This validates the lesson from q4k-9b-dmindrop: independent offset terms per sub-block are necessary for acceptable quality.
+
+**Lesson:**
+Symmetric quantization without per-sub-block offsets is not viable for LLM weights. Any technique that eliminates the min/offset term must provide alternative per-sub-block centering (e.g., sub-block-specific zero-points stored alongside scales). The 2-DOF constraint identified in the architecture notes is not just about superblock LS — it reflects a fundamental requirement for per-sub-block offset flexibility.
+
 ## q4k-9b-hadamard44 — Hadamard + 4-bit scales + 4-bit mins (regression)
 
 **Hypothesis:** Random Hadamard transform decorrelates weights enough to tolerate 4-bit scales (15 levels) instead of 5-bit, saving 1 byte/superblock (8 bytes/sb total).

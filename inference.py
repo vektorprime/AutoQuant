@@ -103,6 +103,219 @@ def _move_real_buffers(module: nn.Module, device: torch.device) -> None:
                 submodule._buffers[name] = buffer.to(device=device)
 
 
+class QuantizedEmbedding(nn.Module):
+    """Embedding layer backed by packed 4-bit weights with sparse row lookup."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        packed_data: dict[str, torch.Tensor],
+        dtype: torch.dtype,
+        symmetric: bool = False,
+        sm_bits_scale: int = 6,
+        sm_bits_min: int = 6,
+    ) -> None:
+        super().__init__()
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.compute_dtype = dtype
+        self._symmetric = symmetric
+        self.sm_bits_scale = sm_bits_scale
+        self.sm_bits_min = sm_bits_min
+
+        self.register_buffer(
+            "quants_packed",
+            packed_data["quants_packed"].to(dtype=torch.uint8),
+            persistent=False,
+        )
+        self.register_buffer(
+            "scales_mins_packed",
+            packed_data["scales_mins_packed"].to(dtype=torch.uint8),
+            persistent=False,
+        )
+        self.register_buffer("d", packed_data["d"], persistent=False)
+        if symmetric:
+            self.register_buffer("dmin", torch.empty(0), persistent=False)
+            if "symmetric_bias" in packed_data:
+                self.register_buffer(
+                    "symmetric_bias", packed_data["symmetric_bias"], persistent=False
+                )
+            else:
+                self.register_buffer("symmetric_bias", torch.empty(0), persistent=False)
+        else:
+            self.register_buffer("dmin", packed_data.get("dmin", packed_data.get("dm8")), persistent=False)
+
+        self.n_blocks = self.embedding_dim // QK_K
+
+    def _unpack_quants_rows(self, begin: int, end: int) -> torch.Tensor:
+        packed = self.quants_packed[begin:end]
+        low = packed & 0x0F
+        high = packed >> 4
+        rows, half = packed.shape
+        values = torch.empty(rows, half * 2, dtype=torch.uint8, device=packed.device)
+        values[:, 0::2] = low
+        values[:, 1::2] = high
+        return values
+
+    def _unpack_scale_min_rows(self, begin: int, end: int):
+        rows = end - begin
+        sm = self.scales_mins_packed[begin:end]
+        sm_last = sm.shape[-1]
+
+        if self._symmetric:
+            s = sm.to(dtype=torch.int64)
+            device = s.device
+            packed_40 = s[:, :, 0].long()
+            packed_40 |= s[:, :, 1].long() << 8
+            packed_40 |= s[:, :, 2].long() << 16
+            packed_40 |= s[:, :, 3].long() << 24
+            packed_40 |= s[:, :, 4].long() << 32
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
+            scales = sc.float() / 31.0
+            minima = torch.zeros(rows, self.n_blocks, 8, dtype=torch.float32, device=device)
+            return scales, minima
+
+        if sm_last == 12:
+            packed = sm.to(dtype=torch.int32)
+            device = packed.device
+            values = torch.zeros(rows, self.n_blocks, QK_K_SUB_BLOCKS, dtype=torch.int32, device=device)
+            for pair in range(4):
+                i = pair * 2
+                byte = pair * 3
+                values[:, :, i] = packed[:, :, byte] | ((packed[:, :, byte + 1] & 0x0F) << 8)
+                values[:, :, i + 1] = (packed[:, :, byte + 1] >> 4) | (packed[:, :, byte + 2] << 4)
+            scales = ((values >> 6) & 0x3F).float() / 63.0
+            minima = (values & 0x3F).float() / 63.0
+            return scales, minima
+
+        sc_byte_count = 4 if self.sm_bits_scale == 4 else (5 if self.sm_bits_scale == 5 else 6)
+        scale_bytes = sm[:, :, :sc_byte_count].to(dtype=torch.int32)
+        min_bytes = sm[:, :, sc_byte_count:].to(dtype=torch.int32)
+        device = scale_bytes.device
+
+        if self.sm_bits_scale == 4:
+            b_s = scale_bytes.to(torch.int64)
+            packed_32 = b_s[:, :, 0].long()
+            packed_32 |= b_s[:, :, 1].long() << 8
+            packed_32 |= b_s[:, :, 2].long() << 16
+            packed_32 |= b_s[:, :, 3].long() << 24
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).to(torch.int32)
+            scales = sc.float() / 15.0
+        elif self.sm_bits_scale == 5:
+            b_s = scale_bytes.to(torch.int64)
+            packed_40_sc = b_s[:, :, 0].long()
+            packed_40_sc |= b_s[:, :, 1].long() << 8
+            packed_40_sc |= b_s[:, :, 2].long() << 16
+            packed_40_sc |= b_s[:, :, 3].long() << 24
+            packed_40_sc |= b_s[:, :, 4].long() << 32
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_40_sc >> (i * 5)) & 0x1F).to(torch.int32)
+            scales = sc.float() / 31.0
+        else:
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            b = scale_bytes
+            sc[:, :, 0] = (b[:, :, 0] & 0x3F)
+            sc[:, :, 1] = ((b[:, :, 0] >> 6) | ((b[:, :, 1] & 0x0F) << 2))
+            sc[:, :, 2] = ((b[:, :, 1] >> 4) | ((b[:, :, 2] & 0x03) << 4))
+            sc[:, :, 3] = (b[:, :, 2] >> 2) & 0x3F
+            sc[:, :, 4] = (b[:, :, 3] & 0x3F)
+            sc[:, :, 5] = ((b[:, :, 3] >> 6) | ((b[:, :, 4] & 0x0F) << 2))
+            sc[:, :, 6] = ((b[:, :, 4] >> 4) | ((b[:, :, 5] & 0x03) << 4))
+            sc[:, :, 7] = (b[:, :, 5] >> 2) & 0x3F
+            scales = sc.float() / 63.0
+
+        min_bytes_last = min_bytes.shape[-1]
+        if min_bytes_last == 5:
+            bm = min_bytes.to(torch.int64)
+            packed_40 = bm[:, :, 0]
+            packed_40 |= bm[:, :, 1] << 8
+            packed_40 |= bm[:, :, 2] << 16
+            packed_40 |= bm[:, :, 3] << 24
+            packed_40 |= bm[:, :, 4] << 32
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
+            minima = mn.float() / 31.0
+        elif min_bytes_last == 3:
+            bm = min_bytes.to(torch.int64)
+            packed_24 = bm[:, :, 0]
+            packed_24 |= bm[:, :, 1] << 8
+            packed_24 |= bm[:, :, 2] << 16
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_24 >> (i * 3)) & 0x7).to(torch.int32)
+            minima = mn.float() / 7.0
+        else:
+            bm = min_bytes.to(torch.int64)
+            packed_32 = bm[:, :, 0]
+            packed_32 |= bm[:, :, 1] << 8
+            packed_32 |= bm[:, :, 2] << 16
+            packed_32 |= bm[:, :, 3] << 24
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).to(torch.int32)
+            minima = mn.float() / 15.0
+
+        return scales, minima
+
+    def _dequantize_rows(self, begin: int, end: int, dtype: torch.dtype) -> torch.Tensor:
+        codes = self._unpack_quants_rows(begin, end).float()
+        scale_norm, min_norm = self._unpack_scale_min_rows(begin, end)
+        d = self.d[begin:end].float()
+        rows = end - begin
+        code_blocks = codes.reshape(rows, self.n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE)
+        if self._symmetric:
+            weights = (
+                (d.unsqueeze(-1) * scale_norm).unsqueeze(-1) * (code_blocks - 7.5)
+            )
+            if self.symmetric_bias.numel() > 0:
+                b = self.symmetric_bias[begin:end].float()
+                weights = weights + b.unsqueeze(-1).unsqueeze(-1)
+        else:
+            dmin = self.dmin[begin:end].float()
+            weights = (
+                (d.unsqueeze(-1) * scale_norm).unsqueeze(-1) * code_blocks
+                - (dmin.unsqueeze(-1) * min_norm).unsqueeze(-1)
+            )
+        return weights.reshape(rows, self.embedding_dim).to(dtype=dtype)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        flat = input_ids.reshape(-1)
+        unique_ids, inverse = flat.unique(sorted=True, return_inverse=True)
+
+        n_unique = len(unique_ids)
+        result = torch.zeros(
+            n_unique, self.embedding_dim,
+            device=input_ids.device, dtype=self.compute_dtype,
+        )
+
+        BATCH = 256
+        MAX_DENSE = 2048
+        for si in range(0, n_unique, BATCH):
+            ei = min(si + BATCH, n_unique)
+            batch_uids = unique_ids[si:ei]
+            init_dense = batch_uids[0].item()
+            end_dense = batch_uids[-1].item() + 1
+
+            if end_dense - init_dense <= MAX_DENSE:
+                full = self._dequantize_rows(init_dense, end_dense, self.compute_dtype)
+                result[si:ei] = full[batch_uids - init_dense]
+            else:
+                for bi, rid in enumerate(batch_uids.tolist()):
+                    result[si + bi] = self._dequantize_rows(
+                        rid, rid + 1, self.compute_dtype
+                    ).squeeze(0)
+
+        output = result[inverse]
+        return output.reshape(*input_ids.shape, self.embedding_dim)
+
+
 class QuantizedLinear(nn.Module):
     """Linear layer backed only by packed 4-bit weights.
 
@@ -123,6 +336,7 @@ class QuantizedLinear(nn.Module):
         hadamard: bool = False,
         hadamard_block_size: int = 256,
         hadamard_seed: int = 42,
+        symmetric: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = int(in_features)
@@ -135,6 +349,7 @@ class QuantizedLinear(nn.Module):
         self._hadamard_block_size = hadamard_block_size
         self._hadamard_seed = hadamard_seed
         self._h_blocks: list[torch.Tensor] | None = None
+        self._symmetric = symmetric
 
         self.register_buffer(
             "quants_packed",
@@ -149,16 +364,29 @@ class QuantizedLinear(nn.Module):
 
         d_key = "d" if "d" in packed_data else "d8"
         dmin_key = "dmin" if "dmin" in packed_data else "dm8"
-        if d_key not in packed_data or dmin_key not in packed_data:
-            raise RuntimeError("Packed layer is missing d/dmin scale tensors")
+        if d_key not in packed_data:
+            raise RuntimeError("Packed layer is missing d scale tensor")
         self.register_buffer("d", packed_data[d_key], persistent=False)
-        self.register_buffer("dmin", packed_data[dmin_key], persistent=False)
-        if not self.d.is_floating_point() or not self.dmin.is_floating_point():
+        if symmetric:
+            self.register_buffer("dmin", torch.empty(0), persistent=False)
+            if "symmetric_bias" in packed_data:
+                self.register_buffer(
+                    "symmetric_bias",
+                    packed_data["symmetric_bias"],
+                    persistent=False,
+                )
+            else:
+                self.register_buffer("symmetric_bias", torch.empty(0), persistent=False)
+        else:
+            if dmin_key not in packed_data:
+                raise RuntimeError("Packed layer is missing dmin scale tensor")
+            self.register_buffer("dmin", packed_data[dmin_key], persistent=False)
+        if not self.d.is_floating_point():
             raise RuntimeError(
                 "d/dmin must be linear floating-point scales. This checkpoint "
                 "looks like an incompatible log8 layout."
             )
-        if self.d.dtype != self.dmin.dtype:
+        if not symmetric and self.d.dtype != self.dmin.dtype:
             raise RuntimeError(
                 f"d and dmin dtype mismatch: {self.d.dtype} versus {self.dmin.dtype}"
             )
@@ -171,14 +399,16 @@ class QuantizedLinear(nn.Module):
 
         expected_quants = (self.out_features, self.in_features // 2)
         sm_shape = tuple(self.scales_mins_packed.shape)
-        if sm_shape[-1] not in (8, 9, 10, 11, 12):
+        if sm_shape[-1] not in (5, 8, 9, 10, 11, 12):
             raise RuntimeError(
-                f"Bad scale/min packed shape {sm_shape}; expected last dim 8, 9, 10, 11, or 12"
+                f"Bad scale/min packed shape {sm_shape}; expected last dim 5 (symmetric), 8, 9, 10, 11, or 12"
             )
+        if sm_shape[-1] == 5 and not self._symmetric:
+            self._symmetric = True
         self._sm_delta = (
-            sm_shape[-1] == 9 and sm_bits_scale == 6 and sm_bits_min == 5
+            sm_shape[-1] == 9 and sm_bits_scale == 6 and sm_bits_min == 5 and not self._symmetric
         )
-        self._sm_asymmetric = sm_shape[-1] in (8, 9, 10, 11)
+        self._sm_asymmetric = sm_shape[-1] in (5, 8, 9, 10, 11)
         expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
@@ -191,11 +421,17 @@ class QuantizedLinear(nn.Module):
                 f"Bad scale/min shape {sm_shape}; "
                 f"expected {expected_sm}"
             )
-        if tuple(self.d.shape) != expected_scale or tuple(self.dmin.shape) != expected_scale:
-            raise RuntimeError(
-                f"Bad d/dmin shape: d={tuple(self.d.shape)}, "
-                f"dmin={tuple(self.dmin.shape)}, expected={expected_scale}"
-            )
+        if self._symmetric:
+            if tuple(self.d.shape) != expected_scale:
+                raise RuntimeError(
+                    f"Bad d shape: d={tuple(self.d.shape)}, expected={expected_scale}"
+                )
+        else:
+            if tuple(self.d.shape) != expected_scale or tuple(self.dmin.shape) != expected_scale:
+                raise RuntimeError(
+                    f"Bad d/dmin shape: d={tuple(self.d.shape)}, "
+                    f"dmin={tuple(self.dmin.shape)}, expected={expected_scale}"
+                )
 
         if has_bias:
             self.bias = nn.Parameter(
@@ -224,6 +460,21 @@ class QuantizedLinear(nn.Module):
         self, begin: int, end: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = end - begin
+        if self._symmetric:
+            sm = self.scales_mins_packed[begin:end].to(dtype=torch.int64)
+            device = sm.device
+            packed_40 = sm[:, :, 0].long()
+            packed_40 |= sm[:, :, 1].long() << 8
+            packed_40 |= sm[:, :, 2].long() << 16
+            packed_40 |= sm[:, :, 3].long() << 24
+            packed_40 |= sm[:, :, 4].long() << 32
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
+            scales = sc.float() / 31.0
+            minima = torch.zeros(rows, self.n_blocks, 8, dtype=torch.float32, device=device)
+            return scales, minima
+
         if self._sm_delta:
             sm = self.scales_mins_packed[begin:end].to(dtype=torch.int64)
             device = sm.device
@@ -362,7 +613,6 @@ class QuantizedLinear(nn.Module):
         codes = self._unpack_quants_rows(begin, end).float()
         scale_norm, min_norm = self._unpack_scale_min_rows(begin, end)
         d = self.d[begin:end].float()
-        dmin = self.dmin[begin:end].float()
 
         rows = end - begin
         code_blocks = codes.reshape(
@@ -371,10 +621,19 @@ class QuantizedLinear(nn.Module):
             QK_K_SUB_BLOCKS,
             QK_K_SUB_SIZE,
         )
-        weights = (
-            (d.unsqueeze(-1) * scale_norm).unsqueeze(-1) * code_blocks
-            - (dmin.unsqueeze(-1) * min_norm).unsqueeze(-1)
-        )
+        if self._symmetric:
+            weights = (
+                (d.unsqueeze(-1) * scale_norm).unsqueeze(-1) * (code_blocks - 7.5)
+            )
+            if self.symmetric_bias.numel() > 0:
+                b = self.symmetric_bias[begin:end].float()
+                weights = weights + b.unsqueeze(-1).unsqueeze(-1)
+        else:
+            dmin = self.dmin[begin:end].float()
+            weights = (
+                (d.unsqueeze(-1) * scale_norm).unsqueeze(-1) * code_blocks
+                - (dmin.unsqueeze(-1) * min_norm).unsqueeze(-1)
+            )
         return weights.reshape(rows, self.in_features).to(dtype=dtype)
 
     def dequantize_full(self, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -483,19 +742,29 @@ def load_quantized_model(
         model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
 
     quantized_layers: dict[str, dict] = manifest["quantized_layers"]
+    quantized_embeddings: dict[str, dict] = manifest.get("quantized_embeddings", {})
     linear_map = {
         name: module
         for name, module in model.named_modules()
         if isinstance(module, nn.Linear)
     }
+    embed_map = {
+        name: module
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Embedding)
+    }
 
     layer_packed: dict[str, dict[str, torch.Tensor]] = {}
+    embed_packed: dict[str, dict[str, torch.Tensor]] = {}
     marker = f".{format_name}."
     for tensor_name, tensor in packed_all.items():
         if marker not in tensor_name:
             raise RuntimeError(f"Unexpected packed tensor name: {tensor_name}")
         layer_name, key = tensor_name.rsplit(marker, 1)
-        layer_packed.setdefault(layer_name, {})[key] = tensor
+        if layer_name in quantized_embeddings:
+            embed_packed.setdefault(layer_name, {})[key] = tensor
+        else:
+            layer_packed.setdefault(layer_name, {})[key] = tensor
 
     expected_layers = set(quantized_layers)
     actual_layers = set(layer_packed)
@@ -504,6 +773,15 @@ def load_quantized_model(
             "Packed layer set does not match manifest: "
             f"missing={sorted(expected_layers - actual_layers)[:20]}, "
             f"unexpected={sorted(actual_layers - expected_layers)[:20]}"
+        )
+
+    expected_embeds = set(quantized_embeddings)
+    actual_embeds = set(embed_packed)
+    if expected_embeds != actual_embeds:
+        raise RuntimeError(
+            "Packed embedding set does not match manifest: "
+            f"missing={sorted(expected_embeds - actual_embeds)[:20]}, "
+            f"unexpected={sorted(actual_embeds - expected_embeds)[:20]}"
         )
 
     required_common = {"quants_packed", "scales_mins_packed"}
@@ -524,8 +802,16 @@ def load_quantized_model(
                 "reinterpret log8 values as linear scales."
             )
         missing_fields = required_common - set(fields)
-        if not ({"d", "dmin"} <= set(fields) or {"d8", "dm8"} <= set(fields)):
-            missing_fields.update({"d/dmin"})
+        is_layer_symmetric = bool(
+            quantized_layers[name].get("symmetric", False)
+            or manifest.get("symmetric", False)
+        )
+        if is_layer_symmetric:
+            if "d" not in fields:
+                missing_fields.add("d")
+        else:
+            if not ({"d", "dmin"} <= set(fields) or {"d8", "dm8"} <= set(fields)):
+                missing_fields.update({"d/dmin"})
         if missing_fields:
             raise RuntimeError(
                 f"Packed layer '{name}' is missing fields: {sorted(missing_fields)}"
@@ -566,21 +852,26 @@ def load_quantized_model(
         layer_info = quantized_layers[name]
         _sm_bits_scale = layer_info.get("sm_bits_scale")
         _sm_bits_min = layer_info.get("sm_bits_min")
+        _symmetric = bool(layer_info.get("symmetric", False) or manifest.get("symmetric", False))
         if _sm_bits_scale is None or _sm_bits_min is None:
-            _sm_bits_scale = 6
-            if sm_last == 12:
-                _sm_bits_min = 6
-            elif sm_last == 11:
-                _sm_bits_min = 5
-            elif sm_last == 10:
-                _sm_bits_min = 4
-            elif sm_last == 9:
-                _sm_bits_min = 4
-            elif sm_last == 8:
-                _sm_bits_scale = 4
-                _sm_bits_min = 4
+            if sm_last == 5 and (_symmetric or manifest.get("symmetric")):
+                _sm_bits_scale = 5
+                _sm_bits_min = 0
             else:
-                _sm_bits_min = 6
+                _sm_bits_scale = 6
+                if sm_last == 12:
+                    _sm_bits_min = 6
+                elif sm_last == 11:
+                    _sm_bits_min = 5
+                elif sm_last == 10:
+                    _sm_bits_min = 4
+                elif sm_last == 9:
+                    _sm_bits_min = 4
+                elif sm_last == 8:
+                    _sm_bits_scale = 4
+                    _sm_bits_min = 4
+                else:
+                    _sm_bits_min = 6
 
         _hadamard = bool(layer_info.get("hadamard", False) or manifest.get("hadamard", False))
         _hadamard_block_size = int(layer_info.get("hadamard_block_size", 256))
@@ -598,6 +889,35 @@ def load_quantized_model(
             hadamard=_hadamard,
             hadamard_block_size=_hadamard_block_size,
             hadamard_seed=_hadamard_seed,
+            symmetric=_symmetric,
+        )
+        _set_child_module(model, name, replacement)
+
+    for name in sorted(expected_embeds):
+        if name not in embed_map:
+            raise RuntimeError(f"Manifest embedding '{name}' is not an nn.Embedding")
+        info = quantized_embeddings[name]
+        fields = embed_packed[name]
+        if "d" not in fields or "quants_packed" not in fields:
+            raise RuntimeError(f"Packed embedding '{name}' is missing required fields")
+        _symmetric = bool(info.get("symmetric", False) or manifest.get("symmetric", False))
+        _embed_sm_bits_scale = info.get("sm_bits_scale", 6)
+        _embed_sm_bits_min = info.get("sm_bits_min", 6)
+        original = embed_map[name]
+        shape = info["shape"]
+        expected_shape = [original.num_embeddings, original.embedding_dim]
+        if list(shape) != expected_shape:
+            raise RuntimeError(
+                f"Shape mismatch for embedding '{name}': manifest={shape}, model={expected_shape}"
+            )
+        replacement = QuantizedEmbedding(
+            original.num_embeddings,
+            original.embedding_dim,
+            fields,
+            dtype=dtype,
+            symmetric=_symmetric,
+            sm_bits_scale=_embed_sm_bits_scale,
+            sm_bits_min=_embed_sm_bits_min,
         )
         _set_child_module(model, name, replacement)
 
