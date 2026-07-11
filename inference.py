@@ -87,12 +87,16 @@ class QuantizedLinear(nn.Module):
         packed_data: dict[str, torch.Tensor],
         dtype: torch.dtype,
         tile_rows: int = 512,
+        sm_bits_scale: int = 6,
+        sm_bits_min: int = 6,
     ) -> None:
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.compute_dtype = dtype
         self.tile_rows = int(tile_rows)
+        self.sm_bits_scale = sm_bits_scale
+        self.sm_bits_min = sm_bits_min
 
         self.register_buffer(
             "quants_packed",
@@ -133,8 +137,10 @@ class QuantizedLinear(nn.Module):
             raise RuntimeError(
                 f"Bad scale/min packed shape {sm_shape}; expected last dim 9, 10, 11, or 12"
             )
+        self._sm_delta = (
+            sm_shape[-1] == 9 and sm_bits_scale == 6 and sm_bits_min == 5
+        )
         self._sm_asymmetric = sm_shape[-1] in (9, 10, 11)
-        self._sm_delta = sm_shape[-1] == 9
         expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
@@ -236,21 +242,34 @@ class QuantizedLinear(nn.Module):
             minima = (values & 0x3F).float() / 63.0
             return scales, minima
 
-        scale_bytes = self.scales_mins_packed[begin:end, :, :6].to(dtype=torch.int32)
-        min_bytes = self.scales_mins_packed[begin:end, :, 6:].to(dtype=torch.int32)
+        sc_byte_count = 5 if self.sm_bits_scale == 5 else 6
+        scale_bytes = self.scales_mins_packed[begin:end, :, :sc_byte_count].to(dtype=torch.int32)
+        min_bytes = self.scales_mins_packed[begin:end, :, sc_byte_count:].to(dtype=torch.int32)
         device = scale_bytes.device
 
-        sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
-        b = scale_bytes
-        sc[:, :, 0] = (b[:, :, 0] & 0x3F)
-        sc[:, :, 1] = ((b[:, :, 0] >> 6) | ((b[:, :, 1] & 0x0F) << 2))
-        sc[:, :, 2] = ((b[:, :, 1] >> 4) | ((b[:, :, 2] & 0x03) << 4))
-        sc[:, :, 3] = (b[:, :, 2] >> 2) & 0x3F
-        sc[:, :, 4] = (b[:, :, 3] & 0x3F)
-        sc[:, :, 5] = ((b[:, :, 3] >> 6) | ((b[:, :, 4] & 0x0F) << 2))
-        sc[:, :, 6] = ((b[:, :, 4] >> 4) | ((b[:, :, 5] & 0x03) << 4))
-        sc[:, :, 7] = (b[:, :, 5] >> 2) & 0x3F
-        scales = sc.float() / 63.0
+        if self.sm_bits_scale == 5:
+            b_s = scale_bytes.to(torch.int64)
+            packed_40_sc = b_s[:, :, 0].long()
+            packed_40_sc |= b_s[:, :, 1].long() << 8
+            packed_40_sc |= b_s[:, :, 2].long() << 16
+            packed_40_sc |= b_s[:, :, 3].long() << 24
+            packed_40_sc |= b_s[:, :, 4].long() << 32
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_40_sc >> (i * 5)) & 0x1F).to(torch.int32)
+            scales = sc.float() / 31.0
+        else:
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            b = scale_bytes
+            sc[:, :, 0] = (b[:, :, 0] & 0x3F)
+            sc[:, :, 1] = ((b[:, :, 0] >> 6) | ((b[:, :, 1] & 0x0F) << 2))
+            sc[:, :, 2] = ((b[:, :, 1] >> 4) | ((b[:, :, 2] & 0x03) << 4))
+            sc[:, :, 3] = (b[:, :, 2] >> 2) & 0x3F
+            sc[:, :, 4] = (b[:, :, 3] & 0x3F)
+            sc[:, :, 5] = ((b[:, :, 3] >> 6) | ((b[:, :, 4] & 0x0F) << 2))
+            sc[:, :, 6] = ((b[:, :, 4] >> 4) | ((b[:, :, 5] & 0x03) << 4))
+            sc[:, :, 7] = (b[:, :, 5] >> 2) & 0x3F
+            scales = sc.float() / 63.0
 
         min_bytes_last = min_bytes.shape[-1]
         if min_bytes_last == 5:
@@ -469,6 +488,25 @@ def load_quantized_model(
         # Version-1 writers hard-coded has_bias=False.  Trust the architecture
         # for those checkpoints so residual Q/K/V biases are not discarded.
         has_bias = architecture_has_bias
+
+        sm_shape = tuple(fields["scales_mins_packed"].shape)
+        sm_last = sm_shape[-1]
+        layer_info = quantized_layers[name]
+        _sm_bits_scale = layer_info.get("sm_bits_scale")
+        _sm_bits_min = layer_info.get("sm_bits_min")
+        if _sm_bits_scale is None or _sm_bits_min is None:
+            _sm_bits_scale = 6
+            if sm_last == 12:
+                _sm_bits_min = 6
+            elif sm_last == 11:
+                _sm_bits_min = 5
+            elif sm_last == 10:
+                _sm_bits_min = 4
+            elif sm_last == 9:
+                _sm_bits_min = 5
+            else:
+                _sm_bits_min = 6
+
         replacement = QuantizedLinear(
             original.in_features,
             original.out_features,
@@ -476,6 +514,8 @@ def load_quantized_model(
             fields,
             dtype=dtype,
             tile_rows=tile_rows,
+            sm_bits_scale=_sm_bits_scale,
+            sm_bits_min=_sm_bits_min,
         )
         _set_child_module(model, name, replacement)
 

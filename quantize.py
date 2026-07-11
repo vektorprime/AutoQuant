@@ -123,7 +123,29 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
     q_flat[:, 1::2] = q_hi
 
     sm_last = sm.shape[-1]
-    if sm_last == 9:
+    sm_bits_scale = packed.get("sm_bits_scale", 6)
+    sm_bits_min = packed.get("sm_bits_min", 6)
+    if sm_last == 9 and sm_bits_scale == 5 and sm_bits_min == 4:
+        sc_bytes = sm[:, :, :5].to(dtype=torch.int64)
+        mn_bytes = sm[:, :, 5:9].to(dtype=torch.int64)
+
+        packed_40_sc = sc_bytes[:, :, 0].long()
+        packed_40_sc |= sc_bytes[:, :, 1].long() << 8
+        packed_40_sc |= sc_bytes[:, :, 2].long() << 16
+        packed_40_sc |= sc_bytes[:, :, 3].long() << 24
+        packed_40_sc |= sc_bytes[:, :, 4].long() << 32
+        sc_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            sc_norm[:, :, i] = ((packed_40_sc >> (i * 5)) & 0x1F).float() / 31.0
+
+        packed_32 = mn_bytes[:, :, 0].long()
+        packed_32 |= mn_bytes[:, :, 1].long() << 8
+        packed_32 |= mn_bytes[:, :, 2].long() << 16
+        packed_32 |= mn_bytes[:, :, 3].long() << 24
+        min_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            min_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
+    elif sm_last == 9:
         s = sm.to(dtype=torch.int64)
         scale_ref = s[:, :, 0] & 0x3F
         min_ref = ((s[:, :, 0] >> 6) & 0x03) << 3
@@ -252,7 +274,7 @@ def _pack_values_4bit(values_8: torch.Tensor) -> torch.Tensor:
 
 
 def _delta_encode_scales_mins_9byte(
-    scales_6bit: torch.Tensor,
+    scales_quant: torch.Tensor,
     mins_nbit: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Delta-encode scales/mins within each superblock using sub-block 0 as reference.
@@ -260,8 +282,8 @@ def _delta_encode_scales_mins_9byte(
     Returns sm_packed [..., 9] uint8, perturbed_scales, perturbed_mins.
     6b scale ref + 5b min ref + 7*4b scale deltas + 7*4b min deltas = 67 bits → 9 bytes.
     """
-    out_f, n_b = scales_6bit.shape[:2]
-    sn = scales_6bit.numpy().astype(np.int16)
+    out_f, n_b = scales_quant.shape[:2]
+    sn = scales_quant.numpy().astype(np.int16)
     mn = mins_nbit.numpy().astype(np.int16)
 
     sf = sn[:, :, 0:1].copy()
@@ -309,6 +331,7 @@ def _encode_q4k(
     refine_iters: int = 3,
     ddmin_store_dtype: torch.dtype | None = None,
     sm_bits_min: int = 6,
+    sm_bits_scale: int = 6,
     use_scale_delta: bool = False,
 ) -> dict:
     """Encode one Linear weight without mutating the source model.
@@ -324,8 +347,12 @@ def _encode_q4k(
       rounding error.  This recovers quality lost from reduced-precision
       metadata storage.
 
-    sm_bits_min: bit width for sub-block mins (default 6).  5 saves 1 byte
-      per superblock.  Scales stay at 6-bit.
+    sm_bits_min: bit width for sub-block mins (default 6).  4 or 5 saves
+      1-2 bytes per superblock.
+
+    sm_bits_scale: bit width for sub-block scales (default 6).  5 saves 1 byte
+      per superblock.  Must pair with alternating LS to absorb the
+      quantization error from coarser multiplicative scales.
 
     use_scale_delta: delta-encode scales and mins within each superblock using
       sub-block 0 as reference plus 4-bit signed deltas for sub-blocks 1-7.
@@ -372,9 +399,9 @@ def _encode_q4k(
         dmin = (-block_min).clamp_min(0.0)
         sub_min_magnitude = (-sub_min).clamp_min(0.0)
 
-    scale_levels = 63
+    scale_levels = (1 << sm_bits_scale) - 1
     min_levels = (1 << sm_bits_min) - 1
-    scales_6bit = torch.clamp(
+    scales_quant = torch.clamp(
         torch.round((d_sub / d.unsqueeze(-1).clamp_min(1e-8)) * scale_levels),
         1,
         scale_levels,
@@ -388,11 +415,11 @@ def _encode_q4k(
     ).to(torch.uint8)
 
     if use_scale_delta:
-        sm_packed, scales_6bit, mins_nbit = _delta_encode_scales_mins_9byte(
-            scales_6bit, mins_nbit,
+        sm_packed, scales_quant, mins_nbit = _delta_encode_scales_mins_9byte(
+            scales_quant, mins_nbit,
         )
 
-    scale_norm = scales_6bit.float() / scale_levels
+    scale_norm = scales_quant.float() / scale_levels
     min_norm = mins_nbit.float() / min_levels
 
     def assign_codes(current_d: torch.Tensor, current_dmin: torch.Tensor) -> torch.Tensor:
@@ -486,8 +513,8 @@ def _encode_q4k(
 
     if use_scale_delta:
         pass
-    elif sm_bits_min == 6:
-        sm_values = (scales_6bit.to(torch.int32) << 6) | mins_nbit.to(torch.int32)
+    elif sm_bits_scale == 6 and sm_bits_min == 6:
+        sm_values = (scales_quant.to(torch.int32) << 6) | mins_nbit.to(torch.int32)
         sm_packed = torch.empty(out_features, n_blocks, 12, dtype=torch.uint8)
         for pair in range(4):
             i = pair * 2
@@ -497,14 +524,22 @@ def _encode_q4k(
             sm_packed[:, :, b] = first & 0xFF
             sm_packed[:, :, b + 1] = (first >> 8) | ((second & 0x0F) << 4)
             sm_packed[:, :, b + 2] = second >> 4
-    elif sm_bits_min == 5:
-        scale_packed = _pack_values_6bit(scales_6bit)
+    elif sm_bits_scale == 6 and sm_bits_min == 5:
+        scale_packed = _pack_values_6bit(scales_quant)
         min_packed = _pack_values_5bit(mins_nbit)
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
-    else:
-        scale_packed = _pack_values_6bit(scales_6bit)
+    elif sm_bits_scale == 6 and sm_bits_min == 4:
+        scale_packed = _pack_values_6bit(scales_quant)
         min_packed = _pack_values_4bit(mins_nbit)
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
+    elif sm_bits_scale == 5 and sm_bits_min == 4:
+        scale_packed = _pack_values_5bit(scales_quant)
+        min_packed = _pack_values_4bit(mins_nbit)
+        sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
+    else:
+        raise ValueError(
+            f"Unsupported scale/min bits: scale={sm_bits_scale} min={sm_bits_min}"
+        )
 
     flat_codes = codes.to(torch.uint8).reshape(out_features, in_features)
     quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
@@ -517,6 +552,8 @@ def _encode_q4k(
         "shape": [out_features, in_features],
         "scale_dtype": str(effective_store_dtype).removeprefix("torch."),
         "refine_mode": refine_mode,
+        "sm_bits_scale": sm_bits_scale,
+        "sm_bits_min": sm_bits_min,
     }
 
 
@@ -524,8 +561,10 @@ def _quantize_one_layer_q4k(
     layer: nn.Linear,
     scale_dtype: torch.dtype = torch.float32,
     refine_mode: str = "legacy_exact",
+    refine_iters: int = 3,
     ddmin_store_dtype: torch.dtype | None = None,
     sm_bits_min: int = 6,
+    sm_bits_scale: int = 6,
     use_scale_delta: bool = False,
 ) -> dict:
     """Return packed bytes without replacing or mutating the source weight."""
@@ -533,8 +572,10 @@ def _quantize_one_layer_q4k(
         layer,
         scale_dtype=scale_dtype,
         refine_mode=refine_mode,
+        refine_iters=refine_iters,
         ddmin_store_dtype=ddmin_store_dtype,
         sm_bits_min=sm_bits_min,
+        sm_bits_scale=sm_bits_scale,
         use_scale_delta=use_scale_delta,
     )
 
@@ -750,6 +791,8 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
             "has_bias": module.bias is not None,
             "scale_dtype": data["scale_dtype"],
             "refine_mode": data["refine_mode"],
+            "sm_bits_scale": data.get("sm_bits_scale", 6),
+            "sm_bits_min": data.get("sm_bits_min", 6),
         }
 
     if len(scale_dtypes) > 1:
@@ -834,8 +877,10 @@ def quantize_model(
     fmt: str = "q2_kmeans",
     q4k_scale_dtype: torch.dtype = torch.float32,
     q4k_refine_mode: str = "legacy_exact",
+    q4k_refine_iters: int = 3,
     q4k_ddmin_store_dtype: torch.dtype | None = None,
     q4k_sm_bits_min: int = 6,
+    q4k_sm_bits_scale: int = 6,
     q4k_scale_delta: bool = False,
 ) -> dict:
     model.eval()
@@ -860,8 +905,10 @@ def quantize_model(
                 layer,
                 scale_dtype=q4k_scale_dtype,
                 refine_mode=q4k_refine_mode,
+                refine_iters=q4k_refine_iters,
                 ddmin_store_dtype=q4k_ddmin_store_dtype,
                 sm_bits_min=q4k_sm_bits_min,
+                sm_bits_scale=q4k_sm_bits_scale,
                 use_scale_delta=q4k_scale_delta,
             )
         else:
@@ -952,6 +999,26 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--q4k-sm-bits-scale",
+        type=int,
+        default=6,
+        choices=[5, 6],
+        help=(
+            "Bit width for sub-block scales. 5 saves 1 byte per superblock "
+            "(5+4 format with 5-bit mins). Must use --q4k-refine-mode alternating "
+            "to absorb coarser multiplicative scale error. Default 6."
+        ),
+    )
+    parser.add_argument(
+        "--q4k-refine-iters",
+        type=int,
+        default=3,
+        help=(
+            "Number of alternating LS iterations (code reassign + d/dmin solve). "
+            "Only used with --q4k-refine-mode alternating. Default 3."
+        ),
+    )
+    parser.add_argument(
         "--q4k-sm-delta",
         action="store_true",
         default=False,
@@ -1008,8 +1075,10 @@ def main():
         fmt=args.format,
         q4k_scale_dtype=q4k_scale_dtype,
         q4k_refine_mode=args.q4k_refine_mode,
+        q4k_refine_iters=args.q4k_refine_iters,
         q4k_ddmin_store_dtype=q4k_ddmin_store_dtype,
         q4k_sm_bits_min=args.q4k_sm_bits_min,
+        q4k_sm_bits_scale=args.q4k_sm_bits_scale,
         q4k_scale_delta=args.q4k_sm_delta,
     )
     logger.info("Quantized %d linear layers.", len(meta))
