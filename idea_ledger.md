@@ -1,5 +1,68 @@
 # Idea Ledger
 
+## q4k-9b-embed5bit-fp32 — 5-bit embedding quants with fp32 d/dmin (regression)
+
+**Hypothesis:** fp16 d/dmin rounding error was hurting 5/6-bit experiments because d values are proportionally smaller with larger maxq; switching to fp32 should recover quality.
+**Status:** regression
+**KL divergence:** 0.052816  |  **Top-P:** 87.747%  |  **Size:** 4.98 GB
+
+**Implementation:**
+- Used `--no-q4k-embed-ddmin-fp16` to force fp32 d/dmin for embeddings
+- Same 5-bit quants (maxq=31) with 6+6 scales/mins, alternating LS 3+f
+- fp32 stores each d/dmin at 4 bytes vs 2 bytes, adding ~16 MB
+
+**Result:**
+KL improved to 0.052816 (best of any experiment, better than all 4-bit variants). But Top-P regressed further to 87.747%, worse than both the 4-bit baseline (87.947%) and 5-bit fp16 (87.847%). The fp16→fp32 change eliminated the rounding error hypothesis as root cause.
+
+Root cause: 5/6-bit quants do NOT improve Top-P over 4-bit for embeddings. The embedding quantization loss (~0.15-0.25% Top-P) is structural — quantization error in the FIRST layer propagates through all 201 subsequent layers. More quants bits reduce per-weight MSE (confirmed: 2-4× improvement in roundtrip accuracy) but do not translate to Top-P gains because the error pattern matters more than error magnitude. Embedding errors at the first layer perturb the input to every downstream layer, so even small per-weight errors accumulate multiplicatively.
+
+**Lesson:**
+The superblock-based quantization (d/dmin per 256 weights with sub-block affine scales) introduces a specific error structure in embeddings that affects argmax decisions regardless of quants precision. The fundamental issue is architectural: the embedding table has 252K independently learned rows with widely varying norms, and superblock quantization groups 256 dimensions per output row. This approach ignores the row-level structure of embeddings. Future experiments should consider: (1) per-row quantization (each embedding row quantized independently, not grouped into superblocks), (2) row-wise norm preservation before/after quantization, or (3) not quantizing embeddings at all and targeting other large tensors (like lm_head).
+
+---
+
+## q4k-9b-embed6bit — 6-bit embedding quants (regression)
+
+**Hypothesis:** 6-bit embedding quants (64 levels) with 2× finer resolution than 5-bit should restore Top-P by further reducing per-weight quantization error.
+**Status:** regression
+**KL divergence:** 0.053279  |  **Top-P:** 87.797%  |  **Size:** 5.09 GB
+
+**Implementation:**
+- Extended `--q4k-embed-quant-bits` choices to include 6
+- Added `_pack_values_6bit()` reuse for quants (8 values → 6 bytes, 48 bits)
+- Added 6-bit unpack paths in `decode_q4k()` and `QuantizedEmbedding._unpack_quants_rows()`
+- 6+6 scales/mins, fp16 d/dmin, alternating LS 3+f
+- Size: 5.09 GB (+129 MB over 5-bit, +253 MB over 4-bit)
+
+**Result:**
+KL (0.053279) is excellent, slightly better than 5-bit (0.053337) but worse than the best 4-bit (0.053225). Top-P (87.797%) is the WORST of any experiment, below both 4-bit (87.947%) and 5-bit (87.847%). The counter-intuitive result — more bits → worse Top-P — confirms that quants precision is NOT the bottleneck for embedding quality.
+
+**Lesson:**
+The monotonic degradation (4-bit > 5-bit > 6-bit in Top-P) despite improving per-weight MSE suggests that the alternating LS optimization interacts differently with different code ranges. With maxq=63, the code assignment produces larger code values that interact differently with the scale_norm/min_norm in LS. The 3-iteration count, optimal for 4-bit, may not be optimal for 5/6-bit. Additionally, the d values become proportionally smaller (range/maxq), making the alternating LS more sensitive to initial conditions. This validates the lesson from embed5bit-fp32: the superblock structure itself is the bottleneck, not the per-weight precision.
+
+---
+
+## q4k-9b-embed5bit — 5-bit embedding quants with fp16 d/dmin (regression)
+
+**Hypothesis:** Adding `--q4k-embed-quant-bits` flag to control embedding quants. 5-bit (32 levels) should halve the quantization step size for embeddings, closing the 0.053% Top-P gap of embed6+6 by capturing the wider dynamic range across 252K vocabulary tokens.
+**Status:** regression
+**KL divergence:** 0.053337  |  **Top-P:** 87.847%  |  **Size:** 4.96 GB
+
+**Implementation:**
+- Added `--q4k-embed-quant-bits` CLI flag (choices: 4,5,6, default 4)
+- `_encode_q4k()` now accepts `quant_bits` parameter; computes `maxq = (1<<quant_bits)-1`
+- For quant_bits=5: quants packed with `_pack_values_5bit()` (8 values → 5 bytes per group)
+- `QuantizedEmbedding._unpack_quants_rows()` branches on `self.quant_bits` for 5-bit unpacking
+- `decode_q4k()` fixed: was broken for 5-bit (tried 4-bit unpack first, now branches before)
+- 6+6 scales/mins, fp16 d/dmin, alternating LS 3+f for embeddings
+- Linear layers: 5+4 fp16 alt 3+f (same as asym5s4-i3f)
+
+**Result:**
+KL (0.053337) is excellent — beats both baseline (0.059) and the asymmet5s4-i3f (0.053596), and is virtually tied with the best embed6+6-alt3 (0.053225). But Top-P (87.847%) regressed vs embed6+6-alt3 (87.947%). 5-bit quants did NOT close the 0.053% gap — they made it slightly worse.
+
+**Lesson:**
+The embedding quantization Top-P loss is structural, not just a matter of code precision. More quants bits (32 vs 16 levels) give 2× better per-weight reconstruction (confirmed by roundtrip tests) but don't improve Top-P because: (1) embedding errors at the first layer propagate multiplicatively through all subsequent layers, (2) the superblock quantization structure (per-256-weight d/dmin) introduces correlated errors across dimensions that disrupt argmax more than independent per-weight noise, and (3) the alternating LS optimization with more code levels may converge to different local optima. Future experiments should target: (1) per-row quantization without superblock grouping, (2) adaptive bit allocation based on embedding row frequency, or (3) post-quantization embedding row normalization to compensate for quantization-induced norm drift.
+
 ## q4k-9b-embed6+6 — Embedding quantization with 6+6 precision (near-miss regression)
 
 **Hypothesis:** Quantizing the 2.03 GB embedding table with full 6+6 precision (same as baseline Q4_K) should preserve Top-P matching the no-embedding-quant asym5s4-i3f, while 5+4 linear layers keep the model size advantage.
