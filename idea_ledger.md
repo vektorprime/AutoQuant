@@ -1,5 +1,28 @@
 # Idea Ledger
 
+## q4k-9b-embednorm — Row-wise L2-norm-preserving embedding quantization (regression)
+
+**Hypothesis:** Preserving per-row L2 norms after Q4_K embedding quantization prevents embedding magnitude distortion that propagates through all downstream attention layers.
+**Status:** regression
+**KL divergence:** 0.062225  |  **Top-P:** 87.797%  |  **Size:** 5.07 GB
+
+**Implementation:**
+- After Q4_K encoding embedding to 4-bit superblocks (6+6 metadata, fp32 d/dmin, alternating LS 3+f), decode back and compute per-row L2 norm ratio (orig_norm / quant_norm)
+- Store one fp16 scale per embedding row (~0.5 MB for 252K vocab × 2 bytes)
+- At inference in QuantizedEmbedding.forward, multiply dequantized rows by their scale factor
+- Clamp ratio to [0.1, 10.0] to prevent extreme rescaling
+- Added `--q4k-embed-norm-preserve` CLI flag
+
+**Result:**
+Both KL and Top-P got WORSE than the baseline without norm-preserve (KL 0.062 vs 0.054-0.059, Top-P 87.80% vs 88.0-88.4%). The norm rescaling amplified existing quantization errors proportionally while also distorting relative embedding vector norms that the attention mechanism relies on. Most fundamentally: the L2 norm within a 4096-dim embedding row is dominated by the cumulative effect of all 16 superblocks, and rescaling at row level cannot fix the structured error within each superblock. The attention layers see specific sub-space patterns, not aggregate norms.
+
+**Root cause:** Norm-preserve operates on a global statistic (row L2 norm) but the damaging error comes from the block-level correlation within each superblock. Multiplying by a scalar changes the embedding vector uniformly, which distorts the relative geometry between embedding vectors in a way that hurts attention more than it helps individual token representations.
+
+**Lesson:**
+Norm-preserving rescaling at the row level is actively harmful for embedding quantization quality. The superblock structure's error pattern (8 sub-blocks of 32 per 256-group) creates localized distortions that cannot be compensated by a single scalar multiplier per row. Future approaches should focus on: (1) rethinking the superblock structure for embeddings specifically (smaller blocks, different grouping), (2) applying transformations that reduce variance within superblocks (e.g., row-wise centering before quantization), or (3) accepting that embeddings need a fundamentally different quantization approach than linear weights (since embeddings feed directly into attention without any pre-processing layer).
+
+---
+
 ## q4k-9b-embed5bit-fp32 — 5-bit embedding quants with fp32 d/dmin (regression)
 
 **Hypothesis:** fp16 d/dmin rounding error was hurting 5/6-bit experiments because d values are proportionally smaller with larger maxq; switching to fp32 should recover quality.

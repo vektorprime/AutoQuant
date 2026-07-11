@@ -27,3 +27,4 @@ timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agre
 2026-07-11T20:00:00Z	q4k-9b-embed6+6	uncommitted	8b98e6d	Embedding quantization (6+6 fp32 legacy_exact) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.053553	87.697	4.5	256	q4k_affine_v2	256	4000	4954	0	15.4
 2026-07-11T20:30:00Z	q4k-9b-embed6+6-alt3	uncommitted	8b98e6d	Embedding quantization (6+6 fp16 ddfp16 alt 3+f) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.053225	87.947	4.5	256	q4k_affine_v2	256	4000	4954	0	14.6
 2026-07-11T21:00:00Z	q4k-9b-embed6+6-alt5	uncommitted	8b98e6d	Embedding quantization (6+6 fp16 ddfp16 alt 5+f) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.053563	87.847	4.5	256	q4k_affine_v2	256	4000	4954	0	14.6
+2026-07-11T22:00:00Z	qwen35-9b-embednorm	5758289	05af040	Row-wise L2-norm-preserving embedding quantization (--q4k-embed-norm-preserve) on Qwen3.5-9B	regression	0.062225	87.797	4	256	q4k_affine_v2	256	4000	5187	0	27
