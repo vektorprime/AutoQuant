@@ -116,6 +116,7 @@ class QuantizedEmbedding(nn.Module):
         sm_bits_scale: int = 6,
         sm_bits_min: int = 6,
         quant_bits: int = 4,
+        embed_norm_preserve: bool = False,
     ) -> None:
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -125,6 +126,7 @@ class QuantizedEmbedding(nn.Module):
         self.sm_bits_scale = sm_bits_scale
         self.sm_bits_min = sm_bits_min
         self.quant_bits = quant_bits
+        self._embed_norm_preserve = embed_norm_preserve
 
         self.register_buffer(
             "quants_packed",
@@ -147,6 +149,15 @@ class QuantizedEmbedding(nn.Module):
                 self.register_buffer("symmetric_bias", torch.empty(0), persistent=False)
         else:
             self.register_buffer("dmin", packed_data.get("dmin", packed_data.get("dm8")), persistent=False)
+
+        if embed_norm_preserve:
+            self.register_buffer(
+                "embed_norm_scale",
+                packed_data["embed_norm_scale"].to(dtype=torch.float16),
+                persistent=False,
+            )
+        else:
+            self.register_buffer("embed_norm_scale", torch.empty(0), persistent=False)
 
         self.n_blocks = self.embedding_dim // QK_K
 
@@ -338,12 +349,18 @@ class QuantizedEmbedding(nn.Module):
 
             if end_dense - init_dense <= MAX_DENSE:
                 full = self._dequantize_rows(init_dense, end_dense, self.compute_dtype)
+                if self._embed_norm_preserve:
+                    scales = self.embed_norm_scale[init_dense:end_dense].to(dtype=self.compute_dtype)
+                    full = full * scales.unsqueeze(-1)
                 result[si:ei] = full[batch_uids - init_dense]
             else:
                 for bi, rid in enumerate(batch_uids.tolist()):
-                    result[si + bi] = self._dequantize_rows(
+                    row = self._dequantize_rows(
                         rid, rid + 1, self.compute_dtype
                     ).squeeze(0)
+                    if self._embed_norm_preserve:
+                        row = row * self.embed_norm_scale[rid].to(dtype=self.compute_dtype)
+                    result[si + bi] = row
 
         output = result[inverse]
         return output.reshape(*input_ids.shape, self.embedding_dim)
@@ -937,6 +954,7 @@ def load_quantized_model(
         _embed_sm_bits_scale = info.get("sm_bits_scale", 6)
         _embed_sm_bits_min = info.get("sm_bits_min", 6)
         _embed_quant_bits = info.get("quant_bits", 4)
+        _embed_norm_preserve = bool(info.get("embed_norm_preserve", False))
         original = embed_map[name]
         shape = info["shape"]
         expected_shape = [original.num_embeddings, original.embedding_dim]
@@ -953,6 +971,7 @@ def load_quantized_model(
             sm_bits_scale=_embed_sm_bits_scale,
             sm_bits_min=_embed_sm_bits_min,
             quant_bits=_embed_quant_bits,
+            embed_norm_preserve=_embed_norm_preserve,
         )
         _set_child_module(model, name, replacement)
 

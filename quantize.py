@@ -1080,6 +1080,11 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
             packed_tensors[f"{prefix}.{key}"] = tensor
             total_packed_bytes += tensor.numel() * tensor.element_size()
 
+        if is_embedding and "embed_norm_scale" in data:
+            ns_tensor = torch.from_numpy(np.ascontiguousarray(data["embed_norm_scale"]))
+            packed_tensors[f"{prefix}.embed_norm_scale"] = ns_tensor
+            total_packed_bytes += ns_tensor.numel() * ns_tensor.element_size()
+
         if is_embedding:
             embed_scale_dtypes.add(data["scale_dtype"])
             embed_refine_modes.add(data["refine_mode"])
@@ -1097,6 +1102,7 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
                 "sm_bits_scale": data.get("sm_bits_scale", 6),
                 "sm_bits_min": data.get("sm_bits_min", 6),
                 "quant_bits": data.get("quant_bits", 4),
+                "embed_norm_preserve": "embed_norm_scale" in data,
             }
             if is_symmetric:
                 embed_manifest[clean_name]["symmetric"] = True
@@ -1229,6 +1235,7 @@ def quantize_model(
     q4k_embed_sm_bits_scale: int | None = None,
     q4k_embed_ddmin_overridden: bool = False,
     q4k_embed_quant_bits: int = 4,
+    q4k_embed_norm_preserve: bool = False,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -1312,6 +1319,14 @@ def quantize_model(
                 use_symmetric=q4k_symmetric,
                 quant_bits=q4k_embed_quant_bits,
             )
+            if q4k_embed_norm_preserve:
+                w_orig = weight.detach().float().cpu()
+                w_q = decode_q4k(data, dtype=torch.float32)
+                orig_norm = w_orig.norm(p=2, dim=-1)
+                q_norm = w_q.norm(p=2, dim=-1)
+                ratio = orig_norm / q_norm.clamp_min(1e-12)
+                ratio = torch.clamp(ratio, 0.1, 10.0)
+                data["embed_norm_scale"] = ratio.to(torch.float16).numpy()
             meta[f"{name}::embedding"] = data
 
     if save_compressed_dir:
@@ -1487,6 +1502,17 @@ def parse_args():
         default=False,
         help="Force embedding d/dmin at fp32 even if --q4k-ddmin-fp16 is set for linear layers.",
     )
+    parser.add_argument(
+        "--q4k-embed-norm-preserve",
+        action="store_true",
+        default=False,
+        help=(
+            "After Q4_K quantizing each embedding row, rescale the entire row "
+            "to match its original L2 norm. Stores one fp16 scale per row "
+            "(~0.5 MB). Preserves token embedding magnitude for the first "
+            "attention layer."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1581,6 +1607,7 @@ def main():
         q4k_embed_sm_bits_scale=embed_sm_bits_scale,
         q4k_embed_ddmin_overridden=embed_ddmin_overridden,
         q4k_embed_quant_bits=args.q4k_embed_quant_bits,
+        q4k_embed_norm_preserve=args.q4k_embed_norm_preserve,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 
