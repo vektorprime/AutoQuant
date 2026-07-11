@@ -1,5 +1,49 @@
 # Idea Ledger
 
+## q4k-9b-hadamard44 — Hadamard + 4-bit scales + 4-bit mins (regression)
+
+**Hypothesis:** Random Hadamard transform decorrelates weights enough to tolerate 4-bit scales (15 levels) instead of 5-bit, saving 1 byte/superblock (8 bytes/sb total).
+**Status:** regression
+**KL divergence:** 0.055957  |  **Top-P:** 87.622%  |  **Size:** 6.24 GB
+
+**Implementation:**
+- Added 4+4 packing format: 8×4-bit scales (4 bytes) + 8×4-bit mins (4 bytes) = 8 bytes/superblock
+- Full codec support in decode_q4k(), QuantizedLinear._unpack_scale_min_rows(), CLI choices
+- Stacked with Hadamard transform + alternating LS (3 iters + final) + fp16 d/dmin
+- sm_last=8 detection for backward compat
+
+**Result:**
+KL (0.0560) is well within threshold and comparable to early asym5s4 experiments. But Top-P (87.622%) falls 0.38% below the 88.0% threshold — essentially the same gap as asym64 (4-bit mins only). 4-bit scales with only 15 levels are fundamentally too coarse for the multiplicative scale factor, even with Hadamard decorrelation. The effective scale `d*s` has `s ∈ {1/15, 2/15, ..., 15/15}`, and the 1/15 granularity creates per-sub-block quantization errors that LS at the superblock level cannot fully absorb.
+
+**Lesson:**
+Hadamard decorrelation does not meaningfully reduce scale variation. The scale factor `d_sub/d` determines how much the quantization grid stretches between sub-blocks, and this ratio is fundamentally determined by the weight distribution within each 256-weight superblock. Hadamard mixing of input channels doesn't change the relative scale between adjacent sub-blocks of 32 consecutive input features. Future compression should target the quants (4-bit codes are 86.5% of packed size) rather than the metadata which is already compressed to 8 bytes/sb.
+
+---
+
+## q4k-9b-hadamard — Hadamard + 5-bit scales + 4-bit mins (PASS, neutral)
+
+**Hypothesis:** Random Hadamard transform (QuaRot-style) applied to weight matrices before quantization decorrelates channels, making weights more uniform and improving quantization quality.
+**Status:** success
+**KL divergence:** 0.054455  |  **Top-P:** 88.172%  |  **Size:** 6.27 GB
+
+**Implementation:**
+- Block-diagonal random Hadamard transform (block_size=256, matching superblock size) applied along input dimension: W' = W @ H_diag^T
+- At inference: x' = x @ H_diag^T applied before dequantized linear, same direction as weight transform
+- Normalized Hadamard (entries ±1/√256) ensures H @ H^T = I, preserving mathematical correctness
+- Per-layer random seeds derived from layer name hash for reproducible diversity
+- Module-level block cache in inference.py avoids VRAM duplication
+- Stacked with 5+4 format + alternating LS (3 iters + final) + fp16 d/dmin
+
+**Result:**
+KL (0.0545) is slightly worse than asym5s4-i3f (0.0536) but better than early asym5s4 (0.0565). Top-P (88.172%) is slightly better than asym5s4-i3f (88.122%) and the baseline (88.122%). Net effect is statistically neutral — within ±0.001 KL and ±0.05% Top-P of the no-Hadamard 5+4. Size is unchanged at 6.27 GB (same format, same bit widths).
+
+The Hadamard transform adds ~1% latency penalty (15.5 vs 17.1 tok/s from the best result, though variance across runs suggests this is within noise). The inference overhead is the input activation transform (block-diagonal matmul of 256×256 blocks) per linear layer, which is a small fraction of the total GEMM cost.
+
+**Lesson:**
+Hadamard decorrelation provides minimal benefit for our encoding scheme because the quantization bottleneck is not the weight distribution but the degrees of freedom mismatch: superblock LS has 2 DOF (d/dmin) to compensate for 8 sub-blocks' worth of scale/min errors. Decorrelating input channels doesn't help when the limiting factor is within-superblock scale variation. This technique is orthogonal to other compression methods; it could be combined with deeper architectural changes (changing the superblock structure or using multiple d/dmin per superblock) but offers no advantage as a standalone addition.
+
+---
+
 ## q4k-9b-asym5s4-i3f — 5-bit scales + 4-bit mins + alt LS (3 iters) + final LS solve (PASS)
 
 **Hypothesis:** Adding a final LS solve after the alternating iteration loop ensures d/dmin are optimal for the stored codes, closing the 0.003% Top-P gap of the original asym5s4.

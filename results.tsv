@@ -1,4 +1,6 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+2026-07-11T09:40:00Z	q4k-9b-hadamard44	0df0e41	c068557	Hadamard + 4-bit scales + 4-bit mins + alt LS (3 iters + final) + fp16 d/dmin (Hadamard decorrelation, 8 bytes/sb) on Qwen3.5-9B	regression	0.055957	87.622	4.5	256	q4k_affine_v2	256	4000	6385	0	15.5
+2026-07-11T09:15:00Z	q4k-9b-hadamard	c068557	f699b90	Hadamard + 5-bit scales + 4-bit mins + alt LS (3 iters + final) + fp16 d/dmin (Hadamard decorrelation) on Qwen3.5-9B	success	0.054455	88.172	4.5	256	q4k_affine_v2	256	4000	6416	0	15.5
 2026-07-11T08:55:00Z	q4k-9b-asym5s4-i3f	24c8eed	636e81f	5-bit scales + 4-bit mins + alternating LS (3 iters) + final LS solve + fp16 d/dmin on Qwen3.5-9B	success	0.053596	88.122	4.5	256	q4k_affine_v2	256	4000	6416	0	17.1
 2026-07-11T08:40:00Z	q4k-9b-asym63	24c8eed	24c8eed	6-bit scales + 3-bit mins + alternating LS (5 iters + final) + fp16 d/dmin on Qwen3.5-9B	regression	0.059057	87.772	4.5	256	q4k_affine_v2	256	4000	6416	0	18.5
 2026-07-11T08:25:00Z	q4k-9b-asym5s4-v2	38662e9	62cc912	5-bit scales + 4-bit mins + alternating LS (5 iters + final LS solve) + fp16 d/dmin on Qwen3.5-9B	regression	0.054997	87.947	4.5	256	q4k_affine_v2	256	4000	6416	0	16.1
