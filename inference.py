@@ -171,14 +171,14 @@ class QuantizedLinear(nn.Module):
 
         expected_quants = (self.out_features, self.in_features // 2)
         sm_shape = tuple(self.scales_mins_packed.shape)
-        if sm_shape[-1] not in (9, 10, 11, 12):
+        if sm_shape[-1] not in (8, 9, 10, 11, 12):
             raise RuntimeError(
-                f"Bad scale/min packed shape {sm_shape}; expected last dim 9, 10, 11, or 12"
+                f"Bad scale/min packed shape {sm_shape}; expected last dim 8, 9, 10, 11, or 12"
             )
         self._sm_delta = (
             sm_shape[-1] == 9 and sm_bits_scale == 6 and sm_bits_min == 5
         )
-        self._sm_asymmetric = sm_shape[-1] in (9, 10, 11)
+        self._sm_asymmetric = sm_shape[-1] in (8, 9, 10, 11)
         expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
@@ -280,12 +280,22 @@ class QuantizedLinear(nn.Module):
             minima = (values & 0x3F).float() / 63.0
             return scales, minima
 
-        sc_byte_count = 5 if self.sm_bits_scale == 5 else 6
+        sc_byte_count = 4 if self.sm_bits_scale == 4 else (5 if self.sm_bits_scale == 5 else 6)
         scale_bytes = self.scales_mins_packed[begin:end, :, :sc_byte_count].to(dtype=torch.int32)
         min_bytes = self.scales_mins_packed[begin:end, :, sc_byte_count:].to(dtype=torch.int32)
         device = scale_bytes.device
 
-        if self.sm_bits_scale == 5:
+        if self.sm_bits_scale == 4:
+            b_s = scale_bytes.to(torch.int64)
+            packed_32 = b_s[:, :, 0].long()
+            packed_32 |= b_s[:, :, 1].long() << 8
+            packed_32 |= b_s[:, :, 2].long() << 16
+            packed_32 |= b_s[:, :, 3].long() << 24
+            sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                sc[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).to(torch.int32)
+            scales = sc.float() / 15.0
+        elif self.sm_bits_scale == 5:
             b_s = scale_bytes.to(torch.int64)
             packed_40_sc = b_s[:, :, 0].long()
             packed_40_sc |= b_s[:, :, 1].long() << 8
@@ -565,6 +575,9 @@ def load_quantized_model(
             elif sm_last == 10:
                 _sm_bits_min = 4
             elif sm_last == 9:
+                _sm_bits_min = 4
+            elif sm_last == 8:
+                _sm_bits_scale = 4
                 _sm_bits_min = 4
             else:
                 _sm_bits_min = 6

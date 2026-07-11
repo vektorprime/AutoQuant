@@ -244,6 +244,23 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
         min_norm = torch.zeros(out_features, n_blocks, 8)
         for i in range(8):
             min_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
+    elif sm_last == 8:
+        sc_bytes = sm[:, :, :4].to(dtype=torch.int32)
+        mn_bytes = sm[:, :, 4:8].to(dtype=torch.int32)
+        packed_32 = sc_bytes[:, :, 0].long()
+        packed_32 |= sc_bytes[:, :, 1].long() << 8
+        packed_32 |= sc_bytes[:, :, 2].long() << 16
+        packed_32 |= sc_bytes[:, :, 3].long() << 24
+        sc_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            sc_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
+        packed_32 = mn_bytes[:, :, 0].long()
+        packed_32 |= mn_bytes[:, :, 1].long() << 8
+        packed_32 |= mn_bytes[:, :, 2].long() << 16
+        packed_32 |= mn_bytes[:, :, 3].long() << 24
+        min_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            min_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
     else:
         raise ValueError(f"Unsupported scales_mins_packed last dim: {sm_last}")
 
@@ -613,6 +630,10 @@ def _encode_q4k(
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
     elif sm_bits_scale == 5 and sm_bits_min == 4:
         scale_packed = _pack_values_5bit(scales_quant)
+        min_packed = _pack_values_4bit(mins_nbit)
+        sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
+    elif sm_bits_scale == 4 and sm_bits_min == 4:
+        scale_packed = _pack_values_4bit(scales_quant)
         min_packed = _pack_values_4bit(mins_nbit)
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
     elif sm_bits_scale == 6 and sm_bits_min == 3:
@@ -1114,10 +1135,11 @@ def parse_args():
         "--q4k-sm-bits-scale",
         type=int,
         default=6,
-        choices=[5, 6],
+        choices=[4, 5, 6],
         help=(
             "Bit width for sub-block scales. 5 saves 1 byte per superblock "
-            "(5+4 format with 5-bit mins). Must use --q4k-refine-mode alternating "
+            "(5+4 format with 4-bit mins). 4 saves 2 bytes (4+4 format). "
+            "Must use --q4k-refine-mode alternating "
             "to absorb coarser multiplicative scale error. Default 6."
         ),
     )
