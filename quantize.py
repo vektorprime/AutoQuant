@@ -148,6 +148,7 @@ def _encode_q4k(
     scale_dtype: torch.dtype = torch.float32,
     refine_mode: str = "legacy_exact",
     refine_iters: int = 3,
+    ddmin_store_dtype: torch.dtype | None = None,
 ) -> dict:
     """Encode one Linear weight without mutating the source model.
 
@@ -156,9 +157,19 @@ def _encode_q4k(
         are assigned once, then d/dmin are solved with those codes held fixed.
       * alternating: alternate code assignment and least-squares d/dmin solves.
       * none: min/max initialization only.
+
+    ddmin_store_dtype: if set and lower-precision than scale_dtype, d/dmin are
+      rounded to this dtype and codes + LS are re-optimized to absorb the
+      rounding error.  This recovers quality lost from reduced-precision
+      metadata storage.
     """
     if scale_dtype not in (torch.float16, torch.float32):
         raise ValueError("Q4_K scale dtype must be float16 or float32")
+    if (ddmin_store_dtype is not None
+            and ddmin_store_dtype not in (torch.float16, torch.float32)):
+        raise ValueError(
+            "ddmin_store_dtype must be float16 or float32"
+        )
     if refine_mode not in {"legacy_exact", "alternating", "none"}:
         raise ValueError(
             "refine_mode must be one of: legacy_exact, alternating, none"
@@ -278,8 +289,23 @@ def _encode_q4k(
             d, dmin = solve_scales(codes, d, dmin, legacy=False)
             codes = assign_codes(d, dmin)
 
-    d_stored = d.to(scale_dtype).contiguous()
-    dmin_stored = dmin.to(scale_dtype).contiguous()
+    effective_store_dtype = (
+        ddmin_store_dtype if ddmin_store_dtype is not None else scale_dtype
+    )
+    if effective_store_dtype != scale_dtype and effective_store_dtype == torch.float16:
+        d_rounded = d.to(torch.float16).to(torch.float32)
+        dmin_rounded = dmin.to(torch.float16).to(torch.float32)
+        codes = assign_codes(d_rounded, dmin_rounded)
+        if refine_mode != "none":
+            d, dmin = solve_scales(codes, d_rounded, dmin_rounded,
+                                   legacy=(refine_mode == "legacy_exact"))
+        else:
+            d, dmin = d_rounded, dmin_rounded
+        d_stored = d.to(torch.float16).contiguous()
+        dmin_stored = dmin.to(torch.float16).contiguous()
+    else:
+        d_stored = d.to(scale_dtype).contiguous()
+        dmin_stored = dmin.to(scale_dtype).contiguous()
 
     sm_values = (scales_6bit.to(torch.int32) << 6) | mins_6bit.to(torch.int32)
     sm_packed = torch.empty(out_features, n_blocks, 12, dtype=torch.uint8)
@@ -301,7 +327,7 @@ def _encode_q4k(
         "dmin": dmin_stored.numpy(),
         "scales_mins_packed": sm_packed.numpy(),
         "shape": [out_features, in_features],
-        "scale_dtype": str(scale_dtype).removeprefix("torch."),
+        "scale_dtype": str(effective_store_dtype).removeprefix("torch."),
         "refine_mode": refine_mode,
     }
 
@@ -310,12 +336,14 @@ def _quantize_one_layer_q4k(
     layer: nn.Linear,
     scale_dtype: torch.dtype = torch.float32,
     refine_mode: str = "legacy_exact",
+    ddmin_store_dtype: torch.dtype | None = None,
 ) -> dict:
     """Return packed bytes without replacing or mutating the source weight."""
     return _encode_q4k(
         layer,
         scale_dtype=scale_dtype,
         refine_mode=refine_mode,
+        ddmin_store_dtype=ddmin_store_dtype,
     )
 
 
@@ -614,6 +642,7 @@ def quantize_model(
     fmt: str = "q2_kmeans",
     q4k_scale_dtype: torch.dtype = torch.float32,
     q4k_refine_mode: str = "legacy_exact",
+    q4k_ddmin_store_dtype: torch.dtype | None = None,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -637,6 +666,7 @@ def quantize_model(
                 layer,
                 scale_dtype=q4k_scale_dtype,
                 refine_mode=q4k_refine_mode,
+                ddmin_store_dtype=q4k_ddmin_store_dtype,
             )
         else:
             layer_gs = _get_layer_groupsize(name, groupsize)
@@ -706,6 +736,15 @@ def parse_args():
             "quantizer; alternating reassigns codes after each LS solve."
         ),
     )
+    parser.add_argument(
+        "--q4k-ddmin-fp16",
+        action="store_true",
+        default=False,
+        help=(
+            "Store per-superblock d/dmin at fp16 precision, using LS "
+            "re-optimization to absorb the rounding error.  Saves ~0.125 GB."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -743,6 +782,7 @@ def main():
     logger.info("Quantizing  format=%s  bits=%d", args.format,
                 4 if args.format == "q4_k" else args.bits)
     q4k_scale_dtype = getattr(torch, args.q4k_scale_dtype)
+    q4k_ddmin_store_dtype = torch.float16 if args.q4k_ddmin_fp16 else None
     meta = quantize_model(
         model,
         bits=args.bits,
@@ -752,6 +792,7 @@ def main():
         fmt=args.format,
         q4k_scale_dtype=q4k_scale_dtype,
         q4k_refine_mode=args.q4k_refine_mode,
+        q4k_ddmin_store_dtype=q4k_ddmin_store_dtype,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 

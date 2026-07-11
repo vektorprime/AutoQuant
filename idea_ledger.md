@@ -1,5 +1,26 @@
 # Idea Ledger
 
+## q4k-9b-ddfp16 — fp16 d/dmin with LS re-optimization
+
+**Hypothesis:** Storing d/dmin at fp16 precision (vs fp32) saves 0.125 GB; LS re-optimization after rounding absorbs the precision loss.
+**Status:** success
+**KL divergence:** 0.058364  |  **Top-P:** 88.197%  |  **Size:** 6.51 GB
+
+**Implementation:**
+- Added `ddmin_store_dtype` parameter to `_encode_q4k()` (quantize.py)
+- After the existing LS refinement: round d/dmin to fp16, reassign codes with rounded values, re-run LS solve with new codes (legacy_exact path)
+- Store final d/dmin as fp16 (2 bytes each vs 4 bytes each)
+- `--q4k-ddmin-fp16` CLI flag in quantize.py
+- No inference.py changes needed (`.float()` casts handle fp16→fp32 conversion)
+
+**Result:**
+Both KL and Top-P slightly IMPROVED over baseline (KL 0.058364 vs 0.058838, Top-P 88.197% vs 88.122%). The fp16 rounding error is negligible (~0.05% relative), and the extra LS re-solve iteration effectively serves as additional refinement. Size reduced from 6.63 GB to 6.51 GB (0.12 GB savings).
+
+**Lesson:**
+LS-based refinement can absorb metadata storage precision loss when applied after rounding. This is a general technique applicable to any quantization scheme that uses least-squares optimization. The key insight: codes adapt to the stored (rounded) d/dmin, so the reconstruction is consistent with the actual stored values. This technique could be stacked with other compression ideas (e.g., shared d/dmin with smaller K, or delta-encoded scales/mins).
+
+---
+
 ## q4k-9b-fp16embed — Explicit bf16 embedding storage for residual
 
 **Hypothesis:** Storing embed_tokens and lm_head at half-precision in residual.safetensors saves space vs fp32 while preserving quality since the model natively runs in bf16.
