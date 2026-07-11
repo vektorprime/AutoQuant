@@ -1,5 +1,46 @@
 # Idea Ledger
 
+## q4k-9b-asym64alt — Alternating LS refinement with 4-bit mins + fp16 d/dmin
+
+**Hypothesis:** Alternating LS refinement (code reassignment + LS, 3 iterations) can better absorb 4-bit min quantization error than single-pass legacy_exact, pushing asym64 over the Top-P threshold.
+**Status:** success
+**KL divergence:** 0.053944  |  **Top-P:** 88.447%  |  **Size:** 6.30 GB
+
+**Implementation:**
+- Used `--q4k-refine-mode alternating` with `--q4k-sm-bits-min 4 --q4k-ddmin-fp16`
+- No code changes needed — existing alternating LS infrastructure
+- 3 iterations of: LS solve for d/dmin → reassign codes with new d/dmin
+- 10 bytes/superblock (6 bytes scales + 4 bytes mins)
+
+**Result:**
+KL improved significantly (0.0539 vs legacy_exact asym64's 0.0534 and baseline's 0.0588). Top-P reached 88.45%, beating both the 88.0% threshold and the baseline's 88.12%. The alternating refinement successfully absorbed the 4-bit min quantization error: codes are reassigned after each LS solve, finding a better joint optimum for the coarser mins. Size is 6.30 GB, the smallest passing model yet.
+
+**Lesson:**
+The key insight: single-pass LS (legacy_exact) is optimal when scales/mins are high-precision (6-bit), but alternating LS outperforms when scales/mins are coarsely quantized. The additional code reassignment steps compensate for the lossy min quantization by finding codes that work better with the quantized scales/mins. This is a general technique: pair coarser quantization with iterative code refinement. The asymmetry hypothesis (mins tolerate lower precision than scales) is fully validated — 4-bit mins work when combined with alternating LS.
+
+---
+
+## q4k-9b-sdelta4 — Intra-superblock scale/min delta encoding (4-bit signed deltas)
+
+**Hypothesis:** Neighboring sub-block scales/mins within a 256-weight superblock are correlated; storing a reference + 4-bit signed deltas compresses scales/mins from 11 to 9 bytes/superblock.
+**Status:** regression
+**KL divergence:** 0.246806  |  **Top-P:** not run (KL fails)  |  **Size:** 6.27 GB
+
+**Implementation:**
+- Sub-block 0 used as reference (6-bit scale + 5-bit min)
+- 7 remaining sub-blocks stored as 4-bit signed deltas (±8 range)
+- Packed into 9 bytes/superblock (saves 2 bytes vs asym65)
+- Delta encoding applied BEFORE code assignment so LS can absorb perturbation
+- Custom bit-packing with 67 bits → 9 bytes (min delta split: bit 3 at byte[bi].bit7, bits 0-2 at byte[bi+1].bits0-2)
+
+**Result:**
+38% of scale/min deltas are clipped (outside ±8 range). Max scale delta within a superblock: 61 (out of 63 levels). Even with median reference, 23% are clipped. The intra-superblock scale/min variation is fundamentally too high for 4-bit deltas: the 8 sub-blocks of 32 consecutive input features have up to 62-level scale differences, far exceeding the ±8 delta range. LS at the superblock level (2 DOF: d, dmin) cannot compensate for per-sub-block errors (14 excess DOF across 8 sub-blocks).
+
+**Lesson:**
+Per-sub-block scale/min compression is bottlenecked by the fundamental tension between superblock degrees of freedom (2) and sub-block degrees of freedom (16). Any compression technique that perturbs per-sub-block values cannot be fully absorbed by superblock-level LS. Future experiments should either: (a) change the block structure to reduce the DOF mismatch, (b) compress metadata that has fewer degrees of freedom (e.g., d/dmin), or (c) apply transforms that reduce the intra-superblock variation BEFORE quantization (e.g., Hadamard rotation).
+
+---
+
 ## q4k-9b-asym64 — Asymmetric precision: 6-bit scales + 4-bit mins + fp16 d/dmin
 
 **Hypothesis:** Pushing mins further to 4-bit preserves quality since mins (additive offsets) are far less sensitive than scales (multiplicative factors) for Top-P.

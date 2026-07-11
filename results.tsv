@@ -10,3 +10,4 @@ timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agre
 2026-07-11T00:00:00Z	q4k-9b-cb8	uncommitted	b146aa1	Codebook-based scale/min encoding (8-bit, per-layer, L1 snap) on Qwen3.5-9B	regression	0.074226	86.947	4.5	256	q4k_affine_v2	256	4000	6360	0	51.9
 2026-07-11T04:00:00Z	q4k-9b-ddfp16	uncommitted	6416bf3	fp16 d/dmin with LS re-optimization on Qwen3.5-9B	success	0.058364	88.197	4.5	256	q4k_affine_v2	256	4000	6510	0	25.3
 2026-07-11T04:30:00Z	q4k-9b-sdelta4	0af21c8	f759c63	Intra-superblock scale/min delta encoding (4-bit signed deltas, 9 bytes/sb) + fp16 d/dmin + 5-bit mins on Qwen3.5-9B	regression	0.246806	not run (KL fails)	4.5	256	q4k_affine_v2	256	4000	6416	0	11.7
+2026-07-11T05:26:00Z	q4k-9b-asym64alt	3995fb4	f759c63	Asymmetric 4-bit mins + fp16 d/dmin + alternating LS refinement (3 iters) on Qwen3.5-9B	success	0.053944	88.447	4.5	256	q4k_affine_v2	256	4000	6447	0	17.7
