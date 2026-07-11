@@ -1,5 +1,26 @@
 # Idea Ledger
 
+## q4k-9b-cb8 — Codebook-based scale/min encoding (8-bit, per-layer)
+
+**Hypothesis:** Replacing 12-byte packed scale/min pairs with an 8-bit index into a layer-level codebook of 256 most common (scale,min) pairs saves ~0.12 GB while preserving quality through LS compensation.
+**Status:** regression
+**KL divergence:** 0.074  |  **Top-P:** 86.95%  |  **Size:** 6.36 GB
+
+**Implementation:**
+- `_codebook_encode_scales()` in quantize.py: collects all (scale,min) pairs across all output channels, builds frequency histogram, selects top-256 pairs as codebook, snaps each sub-block to nearest codebook entry via L1 distance
+- Codebook encoding happens BEFORE code assignment and LS refinement, so snapped values govern both
+- Decoder (`inference.py`): loads `scales_mins_cb` [1, 256, 2] uint8 and `scales_mins_idx` [out_c, n_blocks, 8] uint8, looks up scale/min from codebook
+- per-layer codebook (cb_K=1), 8-bit indices (1 byte per sub-block)
+- Storage: 8 bytes per superblock vs baseline 12 → 33% savings on scale/min storage
+
+**Result:**
+KL regressed from 0.059 to 0.074 (+26%), top-P from 88.12% to 86.95%. With only 256 codebook entries covering ~12% of the ~2100 unique (scale,min) pairs per layer, most sub-blocks get snapped to a different pair. The L1-distance snapping introduces per-sub-block scale/min errors of 1-3 units. LS refinement operates at the superblock level (d/dmin are per-superblock) and cannot compensate for per-sub-block relative errors across the 8 sub-blocks. The cumulative effect across 201 layers degrades output quality significantly.
+
+**Lesson:**
+Codebook-based scale/min encoding with per-layer global codebook and 256 entries introduces too much per-sub-block error. Improving coverage would require either (a) more entries (wider indices, reducing storage savings) or (b) per-group codebooks (increasing codebook overhead). Neither preserves the 33% storage savings target. Future experiments should consider techniques that preserve per-sub-block precision, such as delta encoding from a reference pair within each superblock.
+
+---
+
 ## q4k-9b-dshare32 — Shared d/dmin K=32
 
 **Hypothesis:** Sharing d/dmin across K=32 output channels with 4-bit per-channel multiplicative scale factors preserves quality while saving ~0.19 GB.

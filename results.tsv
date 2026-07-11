@@ -1,3 +1,4 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
 2026-07-10T17:22:00Z	q4k-9b-baseline	ab53eaa	ab53eaa	Q4_K baseline (legacy_exact, fp32 scales) on Qwen3.5-9B (packed-only loader)	success	0.058838	88.122	4.5	256	q4k_affine_v2	256	4000	6630	0	28.4
 2026-07-11T00:00:00Z	q4k-9b-dshare32	87eebe4	ec64775	Shared d/dmin K=32 with 4-bit per-channel scale factors on Qwen3.5-9B	regression	0.176744	78.020	4.5	256	q4k_affine_v2_dshare	256	4000	6424	0	28.0
+2026-07-11T00:00:00Z	q4k-9b-cb8	uncommitted	b146aa1	Codebook-based scale/min encoding (8-bit, per-layer, L1 snap) on Qwen3.5-9B	regression	0.074226	86.947	4.5	256	q4k_affine_v2	256	4000	6360	0	51.9
