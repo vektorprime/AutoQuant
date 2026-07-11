@@ -145,6 +145,27 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
         min_norm = torch.zeros(out_features, n_blocks, 8)
         for i in range(8):
             min_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
+    elif sm_last == 9 and sm_bits_scale == 6 and sm_bits_min == 3:
+        sc_bytes = sm[:, :, :6].to(dtype=torch.int32)
+        mn_bytes = sm[:, :, 6:9].to(dtype=torch.int64)
+
+        sc_norm = torch.zeros(out_features, n_blocks, 8)
+        b = sc_bytes
+        sc_norm[:, :, 0] = (b[:, :, 0] & 0x3F).float() / 63.0
+        sc_norm[:, :, 1] = ((b[:, :, 0] >> 6) | ((b[:, :, 1] & 0x0F) << 2)).float() / 63.0
+        sc_norm[:, :, 2] = ((b[:, :, 1] >> 4) | ((b[:, :, 2] & 0x03) << 4)).float() / 63.0
+        sc_norm[:, :, 3] = ((b[:, :, 2] >> 2) & 0x3F).float() / 63.0
+        sc_norm[:, :, 4] = (b[:, :, 3] & 0x3F).float() / 63.0
+        sc_norm[:, :, 5] = ((b[:, :, 3] >> 6) | ((b[:, :, 4] & 0x0F) << 2)).float() / 63.0
+        sc_norm[:, :, 6] = ((b[:, :, 4] >> 4) | ((b[:, :, 5] & 0x03) << 4)).float() / 63.0
+        sc_norm[:, :, 7] = ((b[:, :, 5] >> 2) & 0x3F).float() / 63.0
+
+        packed_24 = mn_bytes[:, :, 0].long()
+        packed_24 |= mn_bytes[:, :, 1].long() << 8
+        packed_24 |= mn_bytes[:, :, 2].long() << 16
+        min_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            min_norm[:, :, i] = ((packed_24 >> (i * 3)) & 0x7).float() / 7.0
     elif sm_last == 9:
         s = sm.to(dtype=torch.int64)
         scale_ref = s[:, :, 0] & 0x3F
@@ -270,6 +291,18 @@ def _pack_values_4bit(values_8: torch.Tensor) -> torch.Tensor:
     packed = torch.zeros(*values_8.shape[:-1], 4, dtype=torch.uint8)
     for i in range(4):
         packed[..., i] = ((packed_32 >> (i * 8)) & 0xFF).to(torch.uint8)
+    return packed
+
+
+def _pack_values_3bit(values_8: torch.Tensor) -> torch.Tensor:
+    """Pack 8 3-bit values (..., 8) into 3 bytes (..., 3)."""
+    v = values_8.to(torch.int64)
+    packed_24 = v[..., 0]
+    for i in range(1, 8):
+        packed_24 = packed_24 | (v[..., i] << (i * 3))
+    packed = torch.zeros(*values_8.shape[:-1], 3, dtype=torch.uint8)
+    for i in range(3):
+        packed[..., i] = ((packed_24 >> (i * 8)) & 0xFF).to(torch.uint8)
     return packed
 
 
@@ -536,6 +569,10 @@ def _encode_q4k(
     elif sm_bits_scale == 5 and sm_bits_min == 4:
         scale_packed = _pack_values_5bit(scales_quant)
         min_packed = _pack_values_4bit(mins_nbit)
+        sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
+    elif sm_bits_scale == 6 and sm_bits_min == 3:
+        scale_packed = _pack_values_6bit(scales_quant)
+        min_packed = _pack_values_3bit(mins_nbit)
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
     else:
         raise ValueError(
@@ -993,9 +1030,9 @@ def parse_args():
         "--q4k-sm-bits-min",
         type=int,
         default=6,
-        choices=[4, 5, 6],
+        choices=[3, 4, 5, 6],
         help=(
-            "Bit width for sub-block mins. 4 or 5 saves 1-2 bytes per "
+            "Bit width for sub-block mins. 3 or 4 saves 2-3 bytes per "
             "superblock while keeping scales at 6-bit. Default 6 (standard)."
         ),
     )

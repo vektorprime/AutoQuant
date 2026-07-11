@@ -283,6 +283,15 @@ class QuantizedLinear(nn.Module):
             for i in range(8):
                 mn[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
             minima = mn.float() / 31.0
+        elif min_bytes_last == 3:
+            bm = min_bytes.to(torch.int64)
+            packed_24 = bm[:, :, 0]
+            packed_24 |= bm[:, :, 1] << 8
+            packed_24 |= bm[:, :, 2] << 16
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_24 >> (i * 3)) & 0x7).to(torch.int32)
+            minima = mn.float() / 7.0
         else:
             bm = min_bytes.to(torch.int64)
             packed_32 = bm[:, :, 0]
@@ -503,7 +512,7 @@ def load_quantized_model(
             elif sm_last == 10:
                 _sm_bits_min = 4
             elif sm_last == 9:
-                _sm_bits_min = 5
+                _sm_bits_min = 4
             else:
                 _sm_bits_min = 6
 
