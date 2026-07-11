@@ -122,11 +122,43 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
     out_features, in_features = _normalise_shape(packed["shape"])
     n_blocks = in_features // QK_K
 
-    q_lo = quants_packed & 0x0F
-    q_hi = quants_packed >> 4
-    q_flat = torch.empty(out_features, in_features, dtype=torch.uint8)
-    q_flat[:, 0::2] = q_lo
-    q_flat[:, 1::2] = q_hi
+    quant_bits = packed.get("quant_bits", 4)
+    if quant_bits == 6:
+        packed_quants = torch.as_tensor(packed["quants_packed"], dtype=torch.uint8)
+        n_groups = packed_quants.shape[1] // 6
+        reshaped = packed_quants.reshape(out_features, n_groups, 6)
+        b_pack = reshaped.to(dtype=torch.int64)
+        q_flat = torch.empty(out_features, in_features, dtype=torch.uint8)
+        for gi in range(n_groups):
+            b0 = b_pack[:, gi, 0]; b1 = b_pack[:, gi, 1]; b2 = b_pack[:, gi, 2]
+            b3 = b_pack[:, gi, 3]; b4 = b_pack[:, gi, 4]; b5 = b_pack[:, gi, 5]
+            q_flat[:, gi * 8 + 0] = (b0 & 0x3F)
+            q_flat[:, gi * 8 + 1] = ((b0 >> 6) | ((b1 & 0x0F) << 2))
+            q_flat[:, gi * 8 + 2] = ((b1 >> 4) | ((b2 & 0x03) << 4))
+            q_flat[:, gi * 8 + 3] = (b2 >> 2) & 0x3F
+            q_flat[:, gi * 8 + 4] = (b3 & 0x3F)
+            q_flat[:, gi * 8 + 5] = ((b3 >> 6) | ((b4 & 0x0F) << 2))
+            q_flat[:, gi * 8 + 6] = ((b4 >> 4) | ((b5 & 0x03) << 4))
+            q_flat[:, gi * 8 + 7] = (b5 >> 2) & 0x3F
+    elif quant_bits == 5:
+        packed_quants = torch.as_tensor(packed["quants_packed"], dtype=torch.uint8)
+        n_groups = packed_quants.shape[1] // 5
+        reshaped = packed_quants.reshape(out_features, n_groups, 5)
+        b_pack = reshaped.to(dtype=torch.int64)
+        packed_40 = b_pack[:, :, 0].long()
+        packed_40 |= b_pack[:, :, 1].long() << 8
+        packed_40 |= b_pack[:, :, 2].long() << 16
+        packed_40 |= b_pack[:, :, 3].long() << 24
+        packed_40 |= b_pack[:, :, 4].long() << 32
+        q_flat = torch.zeros(out_features, in_features, dtype=torch.uint8)
+        for i in range(8):
+            q_flat[:, i::8] = ((packed_40 >> (i * 5)) & 0x1F)
+    else:
+        q_lo = quants_packed & 0x0F
+        q_hi = quants_packed >> 4
+        q_flat = torch.empty(out_features, in_features, dtype=torch.uint8)
+        q_flat[:, 0::2] = q_lo
+        q_flat[:, 1::2] = q_hi
 
     sm_last = sm.shape[-1]
     sm_bits_scale = packed.get("sm_bits_scale", 6)
@@ -442,6 +474,7 @@ def _encode_q4k(
     hadamard_block_size: int = 256,
     hadamard_seed: int = 42,
     use_symmetric: bool = False,
+    quant_bits: int = 4,
 ) -> dict:
     """Encode one Linear weight without mutating the source model.
 
@@ -487,6 +520,9 @@ def _encode_q4k(
             "refine_mode must be one of: legacy_exact, alternating, none"
         )
 
+    maxq = (1 << quant_bits) - 1
+    if quant_bits not in (4, 5, 6):
+        raise ValueError(f"quant_bits must be 4, 5, or 6, got {quant_bits}")
     weights = layer.weight.detach().float().cpu() if isinstance(layer, nn.Linear) else layer.detach().float().cpu()
     out_features, in_features = weights.shape
     if in_features % QK_K != 0:
@@ -512,12 +548,13 @@ def _encode_q4k(
     block_min = sub_min.amin(dim=-1)
     block_max = sub_max.amax(dim=-1)
 
+    half_maxq = maxq / 2.0
     if use_symmetric:
         sub_abs_max = torch.maximum(sub_max.abs(), sub_min.abs())
         block_abs_max = sub_abs_max.amax(dim=-1)
 
-        d = (block_abs_max / 7.5).clamp_min(1e-8)
-        d_sub = (sub_abs_max / 7.5).clamp_min(1e-8)
+        d = (block_abs_max / half_maxq).clamp_min(1e-8)
+        d_sub = (sub_abs_max / half_maxq).clamp_min(1e-8)
 
         sym_bits = 5
         scale_levels = (1 << sym_bits) - 1
@@ -536,9 +573,9 @@ def _encode_q4k(
                 current_d.unsqueeze(-1).unsqueeze(-1) * scale_norm.unsqueeze(-1)
             ).clamp_min(1e-8)
             return torch.clamp(
-                torch.round((blocks - current_b.unsqueeze(-1).unsqueeze(-1)) / effective_scale + 7.5),
+                torch.round((blocks - current_b.unsqueeze(-1).unsqueeze(-1)) / effective_scale + half_maxq),
                 0,
-                15,
+                maxq,
             )
 
         codes = assign_codes(d, b)
@@ -549,7 +586,7 @@ def _encode_q4k(
             current_d: torch.Tensor,
             current_b: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            centered = fixed_codes.float() - 7.5
+            centered = fixed_codes.float() - half_maxq
             scale_codes = (scale_norm.unsqueeze(-1) * centered.reshape(
                 out_features, n_blocks, QK_K_SUB_BLOCKS, QK_K_SUB_SIZE
             )).flatten(start_dim=2)
@@ -584,7 +621,14 @@ def _encode_q4k(
         sm_packed = _pack_values_5bit(scales_quant)
 
         flat_codes = codes.to(torch.uint8).reshape(out_features, in_features)
-        quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
+        if quant_bits == 6:
+            codes_reshaped = flat_codes.reshape(out_features, -1, 8)
+            quants_packed = _pack_values_6bit(codes_reshaped).reshape(out_features, -1)
+        elif quant_bits == 5:
+            codes_reshaped = flat_codes.reshape(out_features, -1, 8)
+            quants_packed = _pack_values_5bit(codes_reshaped).reshape(out_features, -1)
+        else:
+            quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
 
         return {
             "quants_packed": quants_packed.numpy(),
@@ -600,10 +644,11 @@ def _encode_q4k(
             "hadamard": use_hadamard,
             "hadamard_block_size": hadamard_block_size if use_hadamard else 0,
             "hadamard_seed": hadamard_seed if use_hadamard else 0,
+            "quant_bits": quant_bits,
         }
 
-    d = ((block_max - block_min) / 15.0).clamp_min(1e-8)
-    d_sub = ((sub_max - sub_min) / 15.0).clamp_min(1e-8)
+    d = ((block_max - block_min) / float(maxq)).clamp_min(1e-8)
+    d_sub = ((sub_max - sub_min) / float(maxq)).clamp_min(1e-8)
 
     if refine_mode == "legacy_exact":
         dmin = block_min.abs().clamp_min(1e-8)
@@ -646,7 +691,7 @@ def _encode_q4k(
                 / effective_scale.unsqueeze(-1)
             ),
             0,
-            15,
+            maxq,
         )
 
     codes = assign_codes_asym(d, dmin)
@@ -761,7 +806,14 @@ def _encode_q4k(
         )
 
     flat_codes = codes.to(torch.uint8).reshape(out_features, in_features)
-    quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
+    if quant_bits == 6:
+        codes_reshaped = flat_codes.reshape(out_features, -1, 8)
+        quants_packed = _pack_values_6bit(codes_reshaped).reshape(out_features, -1)
+    elif quant_bits == 5:
+        codes_reshaped = flat_codes.reshape(out_features, -1, 8)
+        quants_packed = _pack_values_5bit(codes_reshaped).reshape(out_features, -1)
+    else:
+        quants_packed = flat_codes[:, 0::2] | (flat_codes[:, 1::2] << 4)
 
     return {
         "quants_packed": quants_packed.numpy(),
@@ -777,6 +829,7 @@ def _encode_q4k(
         "hadamard": use_hadamard,
         "hadamard_block_size": hadamard_block_size if use_hadamard else 0,
         "hadamard_seed": hadamard_seed if use_hadamard else 0,
+        "quant_bits": quant_bits,
     }
 
 
@@ -793,6 +846,7 @@ def _quantize_one_layer_q4k(
     hadamard_block_size: int = 256,
     hadamard_seed: int = 42,
     use_symmetric: bool = False,
+    quant_bits: int = 4,
 ) -> dict:
     """Return packed bytes without replacing or mutating the source weight."""
     return _encode_q4k(
@@ -808,6 +862,7 @@ def _quantize_one_layer_q4k(
         hadamard_block_size=hadamard_block_size,
         hadamard_seed=hadamard_seed,
         use_symmetric=use_symmetric,
+        quant_bits=quant_bits,
     )
 
 
@@ -1041,6 +1096,7 @@ def _save_packed_q4k(meta: dict, save_dir: str, model: nn.Module) -> int:
                 "refine_mode": data["refine_mode"],
                 "sm_bits_scale": data.get("sm_bits_scale", 6),
                 "sm_bits_min": data.get("sm_bits_min", 6),
+                "quant_bits": data.get("quant_bits", 4),
             }
             if is_symmetric:
                 embed_manifest[clean_name]["symmetric"] = True
@@ -1172,6 +1228,7 @@ def quantize_model(
     q4k_embed_sm_bits_min: int | None = None,
     q4k_embed_sm_bits_scale: int | None = None,
     q4k_embed_ddmin_overridden: bool = False,
+    q4k_embed_quant_bits: int = 4,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -1253,6 +1310,7 @@ def quantize_model(
                 use_scale_delta=False,
                 use_hadamard=False,
                 use_symmetric=q4k_symmetric,
+                quant_bits=q4k_embed_quant_bits,
             )
             meta[f"{name}::embedding"] = data
 
@@ -1417,6 +1475,13 @@ def parse_args():
         help="Store embedding d/dmin at fp16 (default: same as --q4k-ddmin-fp16). Use --no-q4k-embed-ddmin-fp16 to force fp32.",
     )
     parser.add_argument(
+        "--q4k-embed-quant-bits",
+        type=int,
+        default=4,
+        choices=[4, 5, 6],
+        help="Bit width for embedding weight quants. 5-bit uses 5 bytes per 8 values, 6-bit uses 6 bytes per 8 values. Default 4.",
+    )
+    parser.add_argument(
         "--no-q4k-embed-ddmin-fp16",
         action="store_true",
         default=False,
@@ -1515,6 +1580,7 @@ def main():
         q4k_embed_sm_bits_min=embed_sm_bits_min,
         q4k_embed_sm_bits_scale=embed_sm_bits_scale,
         q4k_embed_ddmin_overridden=embed_ddmin_overridden,
+        q4k_embed_quant_bits=args.q4k_embed_quant_bits,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 

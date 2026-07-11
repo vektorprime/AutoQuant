@@ -115,6 +115,7 @@ class QuantizedEmbedding(nn.Module):
         symmetric: bool = False,
         sm_bits_scale: int = 6,
         sm_bits_min: int = 6,
+        quant_bits: int = 4,
     ) -> None:
         super().__init__()
         self.num_embeddings = int(num_embeddings)
@@ -123,6 +124,7 @@ class QuantizedEmbedding(nn.Module):
         self._symmetric = symmetric
         self.sm_bits_scale = sm_bits_scale
         self.sm_bits_min = sm_bits_min
+        self.quant_bits = quant_bits
 
         self.register_buffer(
             "quants_packed",
@@ -150,6 +152,37 @@ class QuantizedEmbedding(nn.Module):
 
     def _unpack_quants_rows(self, begin: int, end: int) -> torch.Tensor:
         packed = self.quants_packed[begin:end]
+        if self.quant_bits == 6:
+            rows = end - begin
+            n_groups = packed.shape[1] // 6
+            reshaped = packed.reshape(rows, n_groups, 6)
+            device = packed.device
+            b = reshaped
+            b0 = b[:, :, 0]; b1 = b[:, :, 1]; b2 = b[:, :, 2]
+            b3 = b[:, :, 3]; b4 = b[:, :, 4]; b5 = b[:, :, 5]
+            values = torch.empty(rows, n_groups, 8, dtype=torch.uint8, device=device)
+            values[:, :, 0] = (b0 & 0x3F)
+            values[:, :, 1] = ((b0 >> 6) | ((b1 & 0x0F) << 2))
+            values[:, :, 2] = ((b1 >> 4) | ((b2 & 0x03) << 4))
+            values[:, :, 3] = (b2 >> 2) & 0x3F
+            values[:, :, 4] = (b3 & 0x3F)
+            values[:, :, 5] = ((b3 >> 6) | ((b4 & 0x0F) << 2))
+            values[:, :, 6] = ((b4 >> 4) | ((b5 & 0x03) << 4))
+            values[:, :, 7] = (b5 >> 2) & 0x3F
+            return values.reshape(rows, n_groups * 8)
+        if self.quant_bits == 5:
+            rows = end - begin
+            n_groups = packed.shape[1] // 5
+            reshaped = packed.reshape(rows, n_groups, 5).to(dtype=torch.int64)
+            packed_40 = reshaped[:, :, 0].long()
+            packed_40 |= reshaped[:, :, 1].long() << 8
+            packed_40 |= reshaped[:, :, 2].long() << 16
+            packed_40 |= reshaped[:, :, 3].long() << 24
+            packed_40 |= reshaped[:, :, 4].long() << 32
+            values = torch.empty(rows, n_groups, 8, dtype=torch.uint8, device=packed.device)
+            for i in range(8):
+                values[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.uint8)
+            return values.reshape(rows, n_groups * 8)
         low = packed & 0x0F
         high = packed >> 4
         rows, half = packed.shape
@@ -903,6 +936,7 @@ def load_quantized_model(
         _symmetric = bool(info.get("symmetric", False) or manifest.get("symmetric", False))
         _embed_sm_bits_scale = info.get("sm_bits_scale", 6)
         _embed_sm_bits_min = info.get("sm_bits_min", 6)
+        _embed_quant_bits = info.get("quant_bits", 4)
         original = embed_map[name]
         shape = info["shape"]
         expected_shape = [original.num_embeddings, original.embedding_dim]
@@ -918,6 +952,7 @@ def load_quantized_model(
             symmetric=_symmetric,
             sm_bits_scale=_embed_sm_bits_scale,
             sm_bits_min=_embed_sm_bits_min,
+            quant_bits=_embed_quant_bits,
         )
         _set_child_module(model, name, replacement)
 
