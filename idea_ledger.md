@@ -1,5 +1,47 @@
 # Idea Ledger
 
+## q4k-9b-asym64 — Asymmetric precision: 6-bit scales + 4-bit mins + fp16 d/dmin
+
+**Hypothesis:** Pushing mins further to 4-bit preserves quality since mins (additive offsets) are far less sensitive than scales (multiplicative factors) for Top-P.
+**Status:** regression (near-pass)
+**KL divergence:** 0.053406  |  **Top-P:** 87.597%  |  **Size:** 6.45 GB
+
+**Implementation:**
+- Extended `sm_bits_min` choices to include 4 (8×4-bit mins in 4 bytes + 8×6-bit scales in 6 bytes = 10 bytes/superblock)
+- Added `_pack_values_4bit()` for 8×4-bit → 4 bytes packing
+- Updated `decode_q4k()` and `QuantizedLinear._unpack_scale_min_rows()` with sm_last=10 branch
+- Shape validation updated to accept last dim 10, 11, or 12
+- 4-bit mins use 15 levels (vs 31 for 5-bit, 63 for 6-bit)
+- Stacked with --q4k-ddmin-fp16 for cumulative savings
+
+**Result:**
+Top-P regressed from 88.17% (asym65) to 87.60% (-0.57%), below the 88.0% threshold by 0.4 percentage points. KL actually IMPROVED significantly (0.0597→0.0534), suggesting coarser mins act as regularization. The near-pass at 6.45 GB (saves 31 MB vs asym65) suggests 4-bit mins are borderline viable; further quality improvements (e.g., stochastic rounding, per-layer bit allocation) might push it over the threshold.
+
+**Lesson:**
+Mins at 4-bit precision are just below the quality threshold for Top-P. The asymmetric hypothesis (mins tolerate lower precision than scales) holds directionally but has limits. The KL improvement suggests that coarser mins may actually help distribution matching by smoothing outliers. Future experiments should consider per-layer adaptive min precision (4-bit for deep layers, 5-bit for early layers) or non-linear encoding that preserves more precision where it matters.
+
+---
+
+## q4k-9b-dmindrop — Per-superblock dmin elimination
+
+**Hypothesis:** dmin can be derived from d via learned per-channel factor alpha, saving half the d/dmin storage while LS re-optimization absorbs the constraint.
+**Status:** regression
+**KL divergence:** 0.108213  |  **Top-P:** 83.396%  |  **Size:** 6.42 GB
+
+**Implementation:**
+- After LS solve: compute per-channel alpha = median(dmin/d), set dmin = alpha*d
+- Reassign codes with constrained dmin, solve for d only (single-parameter LS)
+- Store dmin_alphas as per-output-channel tensor instead of per-superblock dmin
+- QuantizedLinear loads dmin_alphas and computes dmin = alpha * d at inference time
+
+**Result:**
+Both per-layer and per-channel alpha approaches failed catastrophically (KL +84%, Top-P -4.8%). The d-only LS cannot compensate for the dmin constraint because dmin and d appear in the reconstruction as `d*(s*q - alpha*m)` — changing d scales both the scale and min terms proportionally, so the relative error cannot be corrected. The dmin/d ratio varies significantly even within the same output channel across superblocks.
+
+**Lesson:**
+The dmin elimination approach is fundamentally flawed for this encoding scheme. d and dmin represent independent degrees of freedom (scale range and offset), and constraining one as a fixed multiple of the other destroys reconstruction quality regardless of LS refinement. The min term needs per-superblock freedom. Future experiments aiming to compress d/dmin metadata should use delta encoding or shared codebooks rather than elimination.
+
+---
+
 ## q4k-9b-asym65 — Asymmetric precision: 6-bit scales + 5-bit mins + fp16 d/dmin
 
 **Hypothesis:** Scales multiply codes (affecting ranking = Top-P) while mins add offsets (affecting distribution bias = KL). Reducing mins to 5-bit while keeping scales at 6-bit preserves Top-P better than symmetric 5-bit reduction.

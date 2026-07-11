@@ -154,6 +154,26 @@ def decode_q4k(packed: dict, dtype: torch.dtype = torch.float32) -> torch.Tensor
         min_norm = torch.zeros(out_features, n_blocks, 8)
         for i in range(8):
             min_norm[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).float() / 31.0
+    elif sm_last == 10:
+        sc_bytes = sm[:, :, :6].to(dtype=torch.int32)
+        mn_bytes = sm[:, :, 6:10].to(dtype=torch.int32)
+        sc_norm = torch.zeros(out_features, n_blocks, 8)
+        sc_norm[:, :, 0] = (sc_bytes[:, :, 0] & 0x3F).float() / 63.0
+        sc_norm[:, :, 1] = ((sc_bytes[:, :, 0] >> 6) | ((sc_bytes[:, :, 1] & 0x0F) << 2)).float() / 63.0
+        sc_norm[:, :, 2] = ((sc_bytes[:, :, 1] >> 4) | ((sc_bytes[:, :, 2] & 0x03) << 4)).float() / 63.0
+        sc_norm[:, :, 3] = ((sc_bytes[:, :, 2] >> 2) & 0x3F).float() / 63.0
+        sc_norm[:, :, 4] = (sc_bytes[:, :, 3] & 0x3F).float() / 63.0
+        sc_norm[:, :, 5] = ((sc_bytes[:, :, 3] >> 6) | ((sc_bytes[:, :, 4] & 0x0F) << 2)).float() / 63.0
+        sc_norm[:, :, 6] = ((sc_bytes[:, :, 4] >> 4) | ((sc_bytes[:, :, 5] & 0x03) << 4)).float() / 63.0
+        sc_norm[:, :, 7] = ((sc_bytes[:, :, 5] >> 2) & 0x3F).float() / 63.0
+
+        packed_32 = mn_bytes[:, :, 0].long()
+        packed_32 |= mn_bytes[:, :, 1].long() << 8
+        packed_32 |= mn_bytes[:, :, 2].long() << 16
+        packed_32 |= mn_bytes[:, :, 3].long() << 24
+        min_norm = torch.zeros(out_features, n_blocks, 8)
+        for i in range(8):
+            min_norm[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).float() / 15.0
     else:
         raise ValueError(f"Unsupported scales_mins_packed last dim: {sm_last}")
 
@@ -189,6 +209,18 @@ def _pack_values_5bit(values_8: torch.Tensor) -> torch.Tensor:
     packed = torch.zeros(*values_8.shape[:-1], 5, dtype=torch.uint8)
     for i in range(5):
         packed[..., i] = ((packed_40 >> (i * 8)) & 0xFF).to(torch.uint8)
+    return packed
+
+
+def _pack_values_4bit(values_8: torch.Tensor) -> torch.Tensor:
+    """Pack 8 4-bit values (..., 8) into 4 bytes (..., 4)."""
+    v = values_8.to(torch.int64)
+    packed_32 = v[..., 0]
+    for i in range(1, 8):
+        packed_32 = packed_32 | (v[..., i] << (i * 4))
+    packed = torch.zeros(*values_8.shape[:-1], 4, dtype=torch.uint8)
+    for i in range(4):
+        packed[..., i] = ((packed_32 >> (i * 8)) & 0xFF).to(torch.uint8)
     return packed
 
 
@@ -263,6 +295,7 @@ def _encode_q4k(
         1,
         scale_levels,
     ).to(torch.uint8)
+    scale_norm = scales_6bit.float() / scale_levels
     mins_nbit = torch.clamp(
         torch.round(
             (sub_min_magnitude / dmin.unsqueeze(-1).clamp_min(1e-8)) * min_levels
@@ -270,7 +303,6 @@ def _encode_q4k(
         0,
         min_levels,
     ).to(torch.uint8)
-    scale_norm = scales_6bit.float() / scale_levels
     min_norm = mins_nbit.float() / min_levels
 
     def assign_codes(current_d: torch.Tensor, current_dmin: torch.Tensor) -> torch.Tensor:
@@ -373,9 +405,13 @@ def _encode_q4k(
             sm_packed[:, :, b] = first & 0xFF
             sm_packed[:, :, b + 1] = (first >> 8) | ((second & 0x0F) << 4)
             sm_packed[:, :, b + 2] = second >> 4
-    else:
+    elif sm_bits_min == 5:
         scale_packed = _pack_values_6bit(scales_6bit)
         min_packed = _pack_values_5bit(mins_nbit)
+        sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
+    else:
+        scale_packed = _pack_values_6bit(scales_6bit)
+        min_packed = _pack_values_4bit(mins_nbit)
         sm_packed = torch.cat([scale_packed, min_packed], dim=-1)
 
     flat_codes = codes.to(torch.uint8).reshape(out_features, in_features)
@@ -813,10 +849,10 @@ def parse_args():
         "--q4k-sm-bits-min",
         type=int,
         default=6,
-        choices=[5, 6],
+        choices=[4, 5, 6],
         help=(
-            "Bit width for sub-block mins. 5 saves 1 byte per superblock "
-            "while keeping scales at 6-bit. Default 6 (standard)."
+            "Bit width for sub-block mins. 4 or 5 saves 1-2 bytes per "
+            "superblock while keeping scales at 6-bit. Default 6 (standard)."
         ),
     )
     return parser.parse_args()

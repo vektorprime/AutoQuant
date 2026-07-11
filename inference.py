@@ -129,11 +129,11 @@ class QuantizedLinear(nn.Module):
 
         expected_quants = (self.out_features, self.in_features // 2)
         sm_shape = tuple(self.scales_mins_packed.shape)
-        if sm_shape[-1] not in (11, 12):
+        if sm_shape[-1] not in (10, 11, 12):
             raise RuntimeError(
-                f"Bad scale/min packed shape {sm_shape}; expected last dim 11 or 12"
+                f"Bad scale/min packed shape {sm_shape}; expected last dim 10, 11, or 12"
             )
-        self._sm_asymmetric = sm_shape[-1] == 11
+        self._sm_asymmetric = sm_shape[-1] in (10, 11)
         expected_sm = (self.out_features, self.n_blocks, sm_shape[-1])
         expected_scale = (self.out_features, self.n_blocks)
         if tuple(self.quants_packed.shape) != expected_quants:
@@ -204,7 +204,7 @@ class QuantizedLinear(nn.Module):
             return scales, minima
 
         scale_bytes = self.scales_mins_packed[begin:end, :, :6].to(dtype=torch.int32)
-        min_bytes = self.scales_mins_packed[begin:end, :, 6:11].to(dtype=torch.int32)
+        min_bytes = self.scales_mins_packed[begin:end, :, 6:].to(dtype=torch.int32)
         device = scale_bytes.device
 
         sc = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
@@ -219,16 +219,28 @@ class QuantizedLinear(nn.Module):
         sc[:, :, 7] = (b[:, :, 5] >> 2) & 0x3F
         scales = sc.float() / 63.0
 
-        bm = min_bytes.to(torch.int64)
-        packed_40 = bm[:, :, 0]
-        packed_40 |= bm[:, :, 1] << 8
-        packed_40 |= bm[:, :, 2] << 16
-        packed_40 |= bm[:, :, 3] << 24
-        packed_40 |= bm[:, :, 4] << 32
-        mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
-        for i in range(8):
-            mn[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
-        minima = mn.float() / 31.0
+        min_bytes_last = min_bytes.shape[-1]
+        if min_bytes_last == 5:
+            bm = min_bytes.to(torch.int64)
+            packed_40 = bm[:, :, 0]
+            packed_40 |= bm[:, :, 1] << 8
+            packed_40 |= bm[:, :, 2] << 16
+            packed_40 |= bm[:, :, 3] << 24
+            packed_40 |= bm[:, :, 4] << 32
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_40 >> (i * 5)) & 0x1F).to(torch.int32)
+            minima = mn.float() / 31.0
+        else:
+            bm = min_bytes.to(torch.int64)
+            packed_32 = bm[:, :, 0]
+            packed_32 |= bm[:, :, 1] << 8
+            packed_32 |= bm[:, :, 2] << 16
+            packed_32 |= bm[:, :, 3] << 24
+            mn = torch.empty(rows, self.n_blocks, 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                mn[:, :, i] = ((packed_32 >> (i * 4)) & 0x0F).to(torch.int32)
+            minima = mn.float() / 15.0
 
         return scales, minima
 
