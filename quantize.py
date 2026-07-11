@@ -492,6 +492,7 @@ def _encode_q4k(
         for _ in range(max(0, refine_iters)):
             d, dmin = solve_scales(codes, d, dmin, legacy=False)
             codes = assign_codes(d, dmin)
+        d, dmin = solve_scales(codes, d, dmin, legacy=False)
 
     effective_store_dtype = (
         ddmin_store_dtype if ddmin_store_dtype is not None else scale_dtype
