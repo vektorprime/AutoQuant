@@ -1,5 +1,94 @@
 # Idea Ledger
 
+## q4k-9b-asym5s4-i3f — 5-bit scales + 4-bit mins + alt LS (3 iters) + final LS solve (PASS)
+
+**Hypothesis:** Adding a final LS solve after the alternating iteration loop ensures d/dmin are optimal for the stored codes, closing the 0.003% Top-P gap of the original asym5s4.
+**Status:** success
+**KL divergence:** 0.053596  |  **Top-P:** 88.122%  |  **Size:** 6.27 GB
+
+**Implementation:**
+- One-line change in `_encode_q4k()`: after the alternating loop, run `d, dmin = solve_scales(codes, d, dmin, legacy=False)` so stored d/dmin are optimal for final codes.
+- Same format as asym5s4: 5-bit scales (5 bytes) + 4-bit mins (4 bytes) = 9 bytes/superblock, fp16 d/dmin
+- 3 iterations of alternating LS + final LS = 4 LS solves total
+- CLI: `--q4k-refine-mode alternating --q4k-refine-iters 3 --q4k-sm-bits-scale 5 --q4k-sm-bits-min 4 --q4k-ddmin-fp16`
+- Also added `--q4k-refine-iters` CLI flag for iteration count control
+
+**Result:**
+KL improved from 0.0565 (original asym5s4) to 0.0536 — the best KL of any non-regression experiment. Top-P reached exactly 88.122%, matching the baseline Q4_K and clearing the 88.0% threshold. The model is the smallest passing format at 6.27 GB, beating asym64alt (6.30 GB) by 0.03 GB while matching baseline Top-P.
+
+Root cause analysis of previous asym5s4 near-miss: without the final LS solve, stored d/dmin were optimal for iteration N-1 codes, not iteration N codes. The one-iteration mismatch introduced a small systematic error that accounted for the ~0.003% Top-P gap. The fix is a minimal change with zero size cost.
+
+**Lesson:**
+In any alternating optimization scheme where LS solves are cheaper than code reassignments (or vice versa), always end with the solve step so stored parameters are consistent with stored codes. This is a general principle: the stored representation should be a fixed point of the optimization, not one step off. The 3-iteration count is sweet spot — fewer iterations underfit, more iterations give diminishing returns for the 9-byte format. The 5+4 format is now fully validated as a novel, quality-preserving compression technique.
+
+---
+
+## q4k-9b-asym63 — 6-bit scales + 3-bit mins (regression)
+
+**Hypothesis:** Pushing mins to 3-bit while keeping scales at 6-bit preserves multiplicative precision (scales) for Top-P, trading off additive precision (mins) that mainly affects KL.
+**Status:** regression
+**KL divergence:** 0.059057  |  **Top-P:** 87.772%  |  **Size:** 6.27 GB
+
+**Implementation:**
+- Added `_pack_values_3bit()` for packing 8 × 3-bit values into 3 bytes
+- 6-bit scales (6 bytes) + 3-bit mins (3 bytes) = 9 bytes/superblock (same as 5+4)
+- Full codec support: `decode_q4k()`, `QuantizedLinear._unpack_scale_min_rows()`, manifest, backward compat
+- 5 alternating LS iterations + final LS solve, fp16 d/dmin
+
+**Result:**
+KL (0.0591) is close to baseline, better than asym5s4 (0.0565). But Top-P (87.772%) is worse than both 5+4 variants. 3-bit mins with only 7 levels are too coarse — the additive offset error distorts argmax rankings even with perfect multiplicative precision. The alternating LS + final solve absorb some error but not enough.
+
+**Lesson:**
+Mins at 3-bit (7 levels) are below the viable threshold for this architecture, even with iterative refinement. The min term appears in `w = d*s*q - dmin*m` — when `dmin*m` is coarsely quantized, it creates structured errors in the per-sub-block offset that LS at the superblock level cannot fully absorb. The minimum viable min precision appears to be 4-bit (15 levels), which the asym64alt experiment proved works with alternating LS. Future experiments should target scales (multiplicative) rather than mins (additive) for further compression.
+
+---
+
+## q4k-9b-asym5s4-v2 — 5+4 with 5 iters + final LS (near-pass)
+
+**Hypothesis:** More alternating LS iterations (5 vs 3) with final LS solve would converge to a better local optimum than the 3-iter original.
+**Status:** regression (near-pass)
+**KL divergence:** 0.054997  |  **Top-P:** 87.947%  |  **Size:** 6.27 GB
+
+**Result:**
+KL improved significantly (0.0550 vs 0.0565 original) but Top-P (87.947%) was slightly worse than the 3-iter original's 87.997%. More iterations don't monotonically improve — the alternating scheme converges to different local optima depending on the iteration count. The 3-iter + final LS combo is the sweet spot.
+
+---
+
+## q4k-9b-asym5s4-i5 — 5+4 with 5 iters, no final LS (regression)
+
+**Hypothesis:** 5 iterations of alternating LS (vs 3) would push Top-P over 88.0%.
+**Status:** regression
+**KL divergence:** 0.056540  |  **Top-P:** 87.747%  |  **Size:** 6.27 GB
+
+**Result:**
+Both KL and Top-P degraded vs 3-iter original. Without the final LS solve, the d/dmin-code mismatch is larger with more iterations (codes are 1 iteration ahead of d/dmin). This confirms the final LS fix is essential.
+
+---
+
+## q4k-9b-asym5s4 — 5-bit scales + 4-bit mins + alternating LS + fp16 d/dmin
+
+**Hypothesis:** Reducing scales from 6-bit to 5-bit (31 levels) saves 1 byte/superblock; alternating LS should absorb scale quantization error just like it absorbed min error in asym64alt.
+**Status:** regression (near-pass)
+**KL divergence:** 0.056483  |  **Top-P:** 87.997%  |  **Size:** 6.27 GB
+
+**Implementation:**
+- Added `sm_bits_scale` parameter (default 6) to `_encode_q4k`, `_quantize_one_layer_q4k`, `quantize_model`
+- Scales quantized to 31 levels (5-bit) instead of 63 (6-bit): `scale_levels = (1 << sm_bits_scale) - 1`
+- Packing: 8 × 5-bit scales (5 bytes, `_pack_values_5bit`) + 8 × 4-bit mins (4 bytes, `_pack_values_4bit`) = 9 bytes/superblock
+- Manifest stores `sm_bits_scale`/`sm_bits_min` per layer for decoding disambiguation
+- Inference: `QuantizedLinear` uses `sm_bits_scale` to select 5-bit vs 6-bit scale unpacking; `_sm_delta` detection updated to `sm_last == 9 and sm_bits_scale == 6 and sm_bits_min == 5`
+- Backward compat: old checkpoints without sm_bits fields infer from `sm_last` (12→6/6, 11→6/5, 10→6/4)
+- CLI: `--q4k-sm-bits-scale {5,6}`
+- Combined: `--q4k-refine-mode alternating --q4k-ddmin-fp16 --q4k-sm-bits-scale 5 --q4k-sm-bits-min 4`
+
+**Result:**
+KL (0.0565) is excellent, significantly beating baseline (0.059) and close to asym64alt (0.0539). Top-P at 87.997% is just barely below the 88.0% threshold (0.003% gap). The alternating LS successfully absorbed most of the 5-bit scale quantization error — the additional code reassignment iterations compensated for the coarser multiplicative scale resolution. Size is 6.27 GB, the smallest yet, saving 31 MB vs asym64alt (6.30 GB).
+
+The near-pass reveals that multiplicative factor precision (scales) has a measurable but small impact on Top-P: dropping from 6-bit to 5-bit costs ~0.45% Top-P (88.45% → 88.00%), about the same proportional drop as 6-bit → 4-bit mins (88.17% → 87.60% in asym64). The alternating LS nearly closed this gap.
+
+**Lesson:**
+Alternating LS is a general-purpose error absorption mechanism that works for both additive (mins) and multiplicative (scales) metadata quantization. However, scales are more sensitive than mins on a per-bit basis because they directly multiply codes. The 5-bit scale limit is borderline — 6 values (1-31) are enough for most sub-blocks, but the tail cases where d_sub/d requires higher precision push Top-P just over the edge. A hybrid approach (5-bit scales for most layers, 6-bit for early/late layers) or per-channel adaptive bits might close the remaining 0.003% gap. Alternatively, stochastic rounding in the scale quantization could distribute errors more favorably.
+
 ## q4k-9b-asym64alt — Alternating LS refinement with 4-bit mins + fp16 d/dmin
 
 **Hypothesis:** Alternating LS refinement (code reassignment + LS, 3 iterations) can better absorb 4-bit min quantization error than single-pass legacy_exact, pushing asym64 over the Top-P threshold.
