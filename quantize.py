@@ -475,6 +475,7 @@ def _encode_q4k(
     hadamard_seed: int = 42,
     use_symmetric: bool = False,
     quant_bits: int = 4,
+    act_stats: torch.Tensor | None = None,
 ) -> dict:
     """Encode one Linear weight without mutating the source model.
 
@@ -700,18 +701,33 @@ def _encode_q4k(
         -1, -1, -1, QK_K_SUB_SIZE
     ).flatten(start_dim=2)
 
+    act_w: torch.Tensor | None = None
+    if act_stats is not None:
+        act_w = act_stats.float().reshape(1, n_blocks, QK_K).clamp_min(1e-12)
+        act_w = act_w.sqrt()
+
+    def _weighted(tensor: torch.Tensor) -> torch.Tensor:
+        if act_w is None:
+            return tensor
+        return tensor * act_w
+
     def solve_scales(
         fixed_codes: torch.Tensor,
         current_d: torch.Tensor,
         current_dmin: torch.Tensor,
         legacy: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        scale_codes = (scale_norm.unsqueeze(-1) * fixed_codes).flatten(start_dim=2)
+        scale_codes = _weighted(
+            (scale_norm.unsqueeze(-1) * fixed_codes).flatten(start_dim=2)
+        )
+        weighted_expanded_min = _weighted(expanded_min)
+        weighted_flat_weights = _weighted(flat_weights)
+
         scale_sq = (scale_codes * scale_codes).sum(dim=-1)
-        min_sq = (expanded_min * expanded_min).sum(dim=-1)
-        cross = (scale_codes * expanded_min).sum(dim=-1)
-        weight_scale = (flat_weights * scale_codes).sum(dim=-1)
-        weight_min = (flat_weights * expanded_min).sum(dim=-1)
+        min_sq = (weighted_expanded_min * weighted_expanded_min).sum(dim=-1)
+        cross = (scale_codes * weighted_expanded_min).sum(dim=-1)
+        weight_scale = (weighted_flat_weights * scale_codes).sum(dim=-1)
+        weight_min = (weighted_flat_weights * weighted_expanded_min).sum(dim=-1)
         determinant = scale_sq * min_sq - cross * cross
 
         if legacy:
@@ -847,6 +863,7 @@ def _quantize_one_layer_q4k(
     hadamard_seed: int = 42,
     use_symmetric: bool = False,
     quant_bits: int = 4,
+    act_stats: torch.Tensor | None = None,
 ) -> dict:
     """Return packed bytes without replacing or mutating the source weight."""
     return _encode_q4k(
@@ -863,6 +880,7 @@ def _quantize_one_layer_q4k(
         hadamard_seed=hadamard_seed,
         use_symmetric=use_symmetric,
         quant_bits=quant_bits,
+        act_stats=act_stats,
     )
 
 
@@ -1236,6 +1254,7 @@ def quantize_model(
     q4k_embed_ddmin_overridden: bool = False,
     q4k_embed_quant_bits: int = 4,
     q4k_embed_norm_preserve: bool = False,
+    q4k_act_aware: bool = False,
 ) -> dict:
     model.eval()
     model.cpu()
@@ -1260,6 +1279,9 @@ def quantize_model(
                                name, layer.weight.shape[1], QK_K)
                 continue
             hadamard_seed = abs(hash(name)) % (2**30) if q4k_hadamard else 42
+            layer_act = (
+                act_stats.get(name) if (q4k_act_aware and act_stats is not None) else None
+            )
             meta[name] = _quantize_one_layer_q4k(
                 layer,
                 scale_dtype=q4k_scale_dtype,
@@ -1273,6 +1295,7 @@ def quantize_model(
                 hadamard_block_size=q4k_hadamard_block_size,
                 hadamard_seed=hadamard_seed,
                 use_symmetric=q4k_symmetric,
+                act_stats=layer_act,
             )
             layer_idx += 1
         else:
@@ -1513,6 +1536,17 @@ def parse_args():
             "attention layer."
         ),
     )
+    parser.add_argument(
+        "--q4k-act-aware",
+        action="store_true",
+        default=False,
+        help=(
+            "Weight LS refinement by per-channel activation variance from "
+            "calibration data. Channels with high activation get more precision. "
+            "Requires calibration data collection (auto-collected on GPU when "
+            "format is q4_k)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1530,7 +1564,7 @@ def main():
         args.model, torch_dtype=dtype, low_cpu_mem_usage=True)
 
     act_stats = None
-    if args.format == "q2_kmeans":
+    if args.format == "q2_kmeans" or (args.format == "q4_k" and args.q4k_act_aware):
         if args.calibration_cache and os.path.exists(args.calibration_cache):
             logger.info("Loading cached calibration: %s", args.calibration_cache)
             cached = np.load(args.calibration_cache, allow_pickle=True)
@@ -1608,6 +1642,7 @@ def main():
         q4k_embed_ddmin_overridden=embed_ddmin_overridden,
         q4k_embed_quant_bits=args.q4k_embed_quant_bits,
         q4k_embed_norm_preserve=args.q4k_embed_norm_preserve,
+        q4k_act_aware=args.q4k_act_aware,
     )
     logger.info("Quantized %d linear layers.", len(meta))
 

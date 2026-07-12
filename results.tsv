@@ -1,4 +1,5 @@
 timestamp	exp_id	code_sha	parent_sha	description	status	kl_divergence	top_p_agreement	bits	groupsize	format	context_length	max_tokens	size_mb	peak_vram_mb	tokens_per_sec
+2026-07-11T19:35:00Z	q4k-9b-actaw44	47e551d	705f321	Activation-aware LS (sqrt act var weighting) on Qwen3.5-9B	success	0.031695	90.598	4	256	q4k_affine_v2	256	4000	5047	18562	17.4
 2026-07-11T15:00:00Z	q4k-9b-embed5bit-fp32	a751cd2	46ac112	Embedding 5-bit quants (6+6 fp32) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.052816	87.747	4.5	256	q4k_affine_v2	256	4000	5097	0	16.1
 2026-07-11T14:30:00Z	q4k-9b-embed6bit	a751cd2	46ac112	Embedding 6-bit quants (6+6 fp16 ddfp16) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.053279	87.797	4.5	256	q4k_affine_v2	256	4000	5208	0	15.6
 2026-07-11T14:00:00Z	q4k-9b-embed5bit	a751cd2	46ac112	Embedding 5-bit quants (6+6 fp16 ddfp16) + Linear (5+4 fp16 alt 3+f) on Qwen3.5-9B	regression	0.053337	87.847	4.5	256	q4k_affine_v2	256	4000	5081	0	16.5

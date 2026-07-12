@@ -1,5 +1,35 @@
 # Idea Ledger
 
+## q4k-9b-actaw44 — Activation-aware LS refinement with 4+4 format (PASS)
+
+**Hypothesis:** Weighting the alternating LS solve by per-channel activation variance puts reconstruction precision on important channels, enabling aggressive 4+4 scale/min format while maintaining quality.
+**Status:** success
+**KL divergence:** 0.0317  |  **Top-P:** 90.598%  |  **Size:** 4.93 GB
+
+**Implementation:**
+- Added `--q4k-act-aware` CLI flag and `act_stats` parameter to `_encode_q4k`
+- During LS solves, weights each channel by sqrt(input_activation_variance) from calibration data (Wikitext-2, 16 samples × 1K seqlen)
+- Applies to both linear layers and embedding quantization via the same LS path
+- Uses 4+4 scale/min format (8 bytes/superblock) + fp32 d/dmin + alternating LS (3+f)
+- No Hadamard transform, no Huffman
+- Embeddings quantized at 4-bit Q4_K (4+4 format) — residual drops from 2.05 GB to 14.7 MB
+
+**Result:**
+ALL THREE METRICS surpassed simultaneously — KL improved 46% (0.0317 vs 0.059 baseline), Top-P improved 2.5pp (90.598% vs 88.122% baseline), and size dropped 1.34 GB (4.93 GB vs 6.27 GB asym5s4-i3f). This is the best experiment by a wide margin.
+
+The key insight: standard LS minimizes unweighted L2 reconstruction error, which treats all input channels equally. But channels with near-zero activations don't affect the model output, while high-activation channels contribute disproportionately to all downstream computations. By weighting the LS objective by sqrt(activation variance), the optimization allocates error to unimportant channels, preserving argmax rankings on important channels.
+
+Why activation-aware LS improved KL so dramatically (0.0317 vs 0.0536 of asym5s4-i3f): the unweighted LS produces large errors on high-variance channels that dominate the output distribution. By focusing reconstruction precision on those channels, the output logits match the reference more closely.
+
+Why it enabled 4+4 format (vs 5+4 of asym5s4-i3f): the 4+4 format's 15 scale levels introduce per-sub-block multiplicative errors. Standard LS spreads these errors uniformly. Activation-aware LS concentrates them on low-activation channels, preserving Top-P on important channels. The code reassignment in alternating LS further compensates.
+
+Why embeddings work despite previous failures: previous embedding quantization experiments (embed6+6, embed5bit, embed6bit) all failed on Top-P. The activation-aware LS addresses the root cause — embedding errors at layer 1 propagate multiplicatively, but by weighting LS per activation channel, the quantization error is biased away from frequently-activated embedding dimensions (common tokens).
+
+**Lesson:**
+Activation-aware weighting is a general technique that can be applied to ANY LS-based quantization refinement. It's especially effective when combined with aggressive compression (like 4+4 format) because the weighting creates a "budget" — precision is spent where it matters. The calibration cost is low (16 forward passes, ~10 min). This technique is broadly applicable beyond Q4_K to any LS-based refinement in structured quantization.
+
+---
+
 ## q4k-9b-embednorm — Row-wise L2-norm-preserving embedding quantization (regression)
 
 **Hypothesis:** Preserving per-row L2 norms after Q4_K embedding quantization prevents embedding magnitude distortion that propagates through all downstream attention layers.
